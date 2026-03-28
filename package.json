@@ -1,0 +1,12 @@
+{
+  "name": "polybot-fullstack",
+  "private": true,
+  "version": "1.0.0",
+  "workspaces": ["frontend", "server", "bot"],
+  "scripts": {
+    "dev": "npx concurrently \"npm run dev:server\" \"npm run dev:frontend\"",
+    "dev:frontend": "npm --workspace frontend run dev",
+    "dev:server": "npm --workspace server run dev",
+    "build": "npm --workspace frontend run build && npm --workspace server run build"
+  }
+}
