@@ -1,0 +1,6 @@
+httpx>=0.27.0
+tenacity>=8.2.0
+python-dotenv>=1.0.0
+# Live CLOB orders:
+py-clob-client>=0.34.0
+eth-account>=0.11.0

@@ -1,0 +1,7 @@
+{
+  "TRADE_ASSETS": { "BTC": true },
+  "MIN_EDGE": 0.3,
+  "MIN_SIGNAL_CONF": 95,
+  "MAX_SLIPPAGE_PCT": 0.5,
+  "REQUIRE_MOMENTUM_SIGNAL_AGREE": true
+}

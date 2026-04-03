@@ -1,1 +1,1 @@
-{"root":["./src/app.tsx","./src/api.ts","./src/clobmetamask.ts","./src/csvexport.ts","./src/main.tsx","./src/types.ts","./src/constants/signaturetype.ts"],"version":"5.9.3"}
+{"root":["./src/app.tsx","./src/errorboundary.tsx","./src/api.ts","./src/branding.ts","./src/clobmetamask.ts","./src/copyproui.tsx","./src/csvexport.ts","./src/main.tsx","./src/polysnipescreens.tsx","./src/snipeui.tsx","./src/types.ts","./src/constants/signaturetype.ts"],"errors":true,"version":"5.9.3"}
