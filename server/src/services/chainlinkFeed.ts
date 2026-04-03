@@ -1,5 +1,5 @@
 import { ethers } from "ethers";
-import { resolvePolygonRpcUrl } from "./rpcEnv.js";
+import { polygonRpcUrlLooksPlaceholder } from "./rpcEnv.js";
 
 // AggregatorV3Interface (latestRoundData + decimals) ABI.
 const AGGREGATOR_V3_ABI = [
@@ -8,13 +8,20 @@ const AGGREGATOR_V3_ABI = [
 ] as const;
 
 // Chainlink AggregatorV3Interface feed addresses on Polygon mainnet.
-// Extend this map later with additional assets (must match getLatestUsdPrice() asset symbols).
 const CHAINLINK_FEED_BY_ASSET: Record<string, { feedAddress: string }> = {
   BTC: { feedAddress: "0xc907E116054Ad103354f2D350FD2514433D57F6f" },
   ETH: { feedAddress: "0xF9680D99D6C9589E2A93A78A04A279E509205945" },
   SOL: { feedAddress: "0x10C8264C0935b3B9870013e057f330Ff3e9C56dC" },
   XRP: { feedAddress: "0x785ba89291f676b5386652eB12b30cF361020694" }
 };
+
+/** Public Polygon HTTPS JSON-RPC when no env candidate passes health check. */
+const PUBLIC_POLYGON_RPC_FALLBACK = "https://rpc.ankr.com/polygon";
+
+/** Strict resolution order (same precedence as rpcEnv.resolvePolygonRpcUrl). */
+const RPC_ENV_KEYS = ["POLYGON_RPC_PROXY_URL", "PROXY_URL", "POLYGON_RPC_URL", "RPC_URL"] as const;
+
+const BOOT_TEST_ASSETS = ["BTC", "ETH", "SOL", "XRP"] as const;
 
 export type ChainlinkUsdPriceTick = {
   asset: string;
@@ -24,7 +31,20 @@ export type ChainlinkUsdPriceTick = {
   rawAnswer: string;
 };
 
+function maskRpcUrlForLog(url: string): string {
+  try {
+    const u = new URL(url);
+    const m = u.pathname.match(/^\/v2\/([^/]+)$/i);
+    if (m && m[1]) u.pathname = "/v2/***";
+    return u.toString();
+  } catch {
+    return url.length > 64 ? `${url.slice(0, 64)}…` : url;
+  }
+}
+
 export class ChainlinkFeedService {
+  /** Cached working JSON-RPC endpoint after `initializeRpc()` (env or public fallback). */
+  rpcUrl: string | null = null;
   private provider: ethers.JsonRpcProvider | null = null;
   private decimalsByFeed = new Map<string, number>();
   private contractByFeed = new Map<string, ethers.Contract>();
@@ -32,26 +52,141 @@ export class ChainlinkFeedService {
   private lastByAsset = new Map<string, { tick: ChainlinkUsdPriceTick; fetchedAtMs: number }>();
   private lastFailByAsset = new Map<string, number>();
   private connectedLogged = false;
+  private initPromise: Promise<void> | null = null;
+  private rpcInitComplete = false;
+
+  /**
+   * Production-safe RPC validation on boot (non-blocking).
+   * Kicks off `initializeRpc()` once: priority resolve → health check → optional public fallback → 4-asset probe.
+   */
+  validateOnStartup() {
+    if (!this.initPromise) {
+      this.initPromise = this.performRpcInitialization();
+    }
+  }
+
+  private async ensureInitialized(): Promise<void> {
+    if (!this.initPromise) {
+      this.initPromise = this.performRpcInitialization();
+    }
+    await this.initPromise;
+  }
+
+  private async validateRpc(rpcUrl: string): Promise<boolean> {
+    try {
+      const provider = new ethers.JsonRpcProvider(rpcUrl);
+      await provider.getBlockNumber();
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Resolve + validate Polygon RPC (env order, then public fallback). Idempotent; safe to await on every boot.
+   */
+  public async initializeRpc(): Promise<void> {
+    await this.ensureInitialized();
+  }
+
+  /**
+   * After RPC is ready, probe all four feeds via `getLatestUsdPrice` (boot confirmation; failures logged, no throw).
+   */
+  public async testStartupConnectivity(): Promise<void> {
+    await this.ensureInitialized();
+    console.log("[CHAINLINK] Startup test: running (BTC, ETH, SOL, XRP) …");
+    const parts: string[] = [];
+    for (const asset of BOOT_TEST_ASSETS) {
+      const tick = await this.getLatestUsdPrice(asset, { silent: true });
+      const ok = tick != null && Number.isFinite(tick.price) && tick.price > 0;
+      console.log(`[CHAINLINK] Startup test: ${asset}=${ok ? "✓" : "✗"}`);
+      parts.push(`${asset}=${ok ? "✓" : "✗"}`);
+    }
+    console.log(`[CHAINLINK] Startup test: ${parts.join(" ")}`);
+    console.log("[CHAINLINK] Boot: Chainlink connectivity checks complete.");
+  }
+
+  /**
+   * Resolves RPC in strict env order, validates each with `getBlockNumber`, falls back to Ankr public if needed,
+   * caches `this.rpcUrl` / `this.provider`, logs clearly.
+   */
+  private async performRpcInitialization(): Promise<void> {
+    if (this.rpcInitComplete) return;
+    try {
+      console.log(
+        `[CHAINLINK][RPC] resolving (order=${RPC_ENV_KEYS.join(" → ")}; fallback=${maskRpcUrlForLog(PUBLIC_POLYGON_RPC_FALLBACK)})`
+      );
+
+      let selected: { url: string; source: string } | null = null;
+
+      for (const envKey of RPC_ENV_KEYS) {
+        const raw = (process.env[envKey] ?? "").trim();
+        if (!raw) continue;
+        if (polygonRpcUrlLooksPlaceholder(raw)) {
+          console.warn(`[CHAINLINK][RPC] skip ${envKey}: placeholder URL`);
+          continue;
+        }
+        console.log(`[CHAINLINK][RPC] health check ${envKey} → ${maskRpcUrlForLog(raw)}`);
+        const ok = await this.validateRpc(raw);
+        if (ok) {
+          selected = { url: raw, source: envKey };
+          break;
+        }
+        console.warn(`[CHAINLINK][WARN] ${envKey} failed health check (getBlockNumber)`);
+      }
+
+      if (!selected) {
+        console.warn("[CHAINLINK][RPC] no env RPC passed health check — trying public fallback");
+        const ok = await this.validateRpc(PUBLIC_POLYGON_RPC_FALLBACK);
+        if (ok) {
+          selected = { url: PUBLIC_POLYGON_RPC_FALLBACK, source: "PUBLIC_FALLBACK_ANKR" };
+        } else {
+          console.warn(
+            `[CHAINLINK][WARN] public fallback failed health check: ${maskRpcUrlForLog(PUBLIC_POLYGON_RPC_FALLBACK)}`
+          );
+        }
+      }
+
+      if (!selected) {
+        console.warn(
+          "[CHAINLINK][WARN] no working Polygon RPC (env + public fallback). Chainlink reads will return null until RPC is fixed."
+        );
+        this.rpcUrl = null;
+        this.provider = null;
+        this.connectedLogged = true;
+        return;
+      }
+
+      this.rpcUrl = selected.url;
+      this.provider = new ethers.JsonRpcProvider(selected.url);
+      this.connectedLogged = true;
+      console.log(`[CHAINLINK] Using RPC: ${maskRpcUrlForLog(selected.url)} (source=${selected.source})`);
+      console.log("[CHAINLINK] feed connected (on-chain AggregatorV3Interface).");
+    } catch (e) {
+      console.warn(`[CHAINLINK][WARN] initializeRpc error: ${e instanceof Error ? e.message : String(e)}`);
+      this.rpcUrl = null;
+      this.provider = null;
+      this.connectedLogged = true;
+    } finally {
+      this.rpcInitComplete = true;
+    }
+  }
 
   private staleMaxMs(): number {
-    const n =
-      Number(process.env.CHAINLINK_MAX_STALE_MS ?? process.env.RTDS_MAX_STALE_MS ?? 8000);
-    return Number.isFinite(n) ? Math.max(500, n) : 8000;
+    const raw = process.env.CHAINLINK_MAX_STALE_MS;
+    const parsed = Number(raw);
+    if (raw !== undefined && raw !== "" && Number.isFinite(parsed) && parsed > 0) {
+      return Math.max(500, parsed);
+    }
+    return 120_000;
   }
 
   private cacheMs(): number {
-    // Prevent hammering JSON-RPC: engine refresh loop is already ~4s.
     const n = Number(process.env.CHAINLINK_FEED_CACHE_MS ?? 2500);
     return Number.isFinite(n) && n >= 300 ? n : 2500;
   }
 
   private resolveProvider(): ethers.JsonRpcProvider | null {
-    if (this.provider) return this.provider;
-    // For production-safety, require an explicit, non-placeholder RPC URL.
-    // Public fallbacks may require API keys and cause repeated unauthorized errors.
-    const rpcUrl = resolvePolygonRpcUrl();
-    if (!rpcUrl) return null;
-    this.provider = new ethers.JsonRpcProvider(rpcUrl);
     return this.provider;
   }
 
@@ -64,15 +199,20 @@ export class ChainlinkFeedService {
     if (this.connectedLogged) return;
     const p = this.resolveProvider();
     if (!p) {
-      console.warn("[CHAINLINK] feed connection skipped: missing RPC URL in env (POLYGON_RPC_URL/RPC_URL).");
+      console.warn("[CHAINLINK][WARN] feed connection skipped: missing/invalid Polygon RPC URL (POLYGON_RPC_URL/RPC_URL).");
       this.connectedLogged = true;
       return;
     }
     this.connectedLogged = true;
-    console.log("[CHAINLINK] feed connected (on-chain BTC/USD via AggregatorV3Interface).");
+    console.log("[CHAINLINK] feed connected (on-chain AggregatorV3Interface).");
   }
 
-  async getLatestUsdPrice(asset: string): Promise<ChainlinkUsdPriceTick | null> {
+  async getLatestUsdPrice(
+    asset: string,
+    opts?: { silent?: boolean }
+  ): Promise<ChainlinkUsdPriceTick | null> {
+    await this.ensureInitialized();
+
     const a = asset.trim().toUpperCase();
     const feed = this.getFeed(a);
     if (!feed) return null;
@@ -80,6 +220,8 @@ export class ChainlinkFeedService {
     this.ensureConnectedLogged();
     const p = this.resolveProvider();
     if (!p) return null;
+
+    const silent = opts?.silent === true;
 
     const cached = this.lastByAsset.get(a);
     const now = Date.now();
@@ -123,7 +265,6 @@ export class ChainlinkFeedService {
           bigint
         ];
 
-        // updatedAt is uint256 timestamp; typically seconds.
         let updatedAtMs = Number(updatedAtRaw);
         if (!Number.isFinite(updatedAtMs) || updatedAtMs <= 0) {
           this.lastFailByAsset.set(a, now);
@@ -139,11 +280,13 @@ export class ChainlinkFeedService {
         }
 
         const ageMs = now - updatedAtMs;
-        console.log(
-          `[CHAINLINK] latest ${a}/USD price=$${price.toFixed(2)} updatedAt=${new Date(updatedAtMs).toISOString()} roundId=${roundId.toString()}`
-        );
+        if (!silent) {
+          console.log(
+            `[CHAINLINK] latest ${a}/USD price=$${price.toFixed(2)} updatedAt=${new Date(updatedAtMs).toISOString()} roundId=${roundId.toString()}`
+          );
+        }
 
-        if (ageMs > this.staleMaxMs()) {
+        if (!silent && ageMs > this.staleMaxMs()) {
           console.warn(
             `[CHAINLINK] stale feed ${a}/USD ageMs=${ageMs} > ${this.staleMaxMs()} (updatedAt=${new Date(updatedAtMs).toISOString()})`
           );
@@ -160,9 +303,11 @@ export class ChainlinkFeedService {
         return tick;
       } catch (e) {
         this.lastFailByAsset.set(a, now);
-        console.warn(
-          `[CHAINLINK] failed latest ${a}/USD: ${e instanceof Error ? e.message : String(e)}`
-        );
+        if (!silent) {
+          console.warn(
+            `[CHAINLINK] failed latest ${a}/USD: ${e instanceof Error ? e.message : String(e)}`
+          );
+        }
         return null;
       }
     })();
@@ -176,4 +321,3 @@ export class ChainlinkFeedService {
     }
   }
 }
-

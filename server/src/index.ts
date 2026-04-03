@@ -7,6 +7,8 @@ import { fileURLToPath } from "node:url";
 import { createApiRouter } from "./routes/api.js";
 import { TradingEngine } from "./services/engine.js";
 import { AuthService } from "./services/auth.js";
+import { TradeLogger } from "./services/tradeLogger.js";
+import spotPolyLag from "../../src/strategies/spotPolyLag.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -18,12 +20,15 @@ const WS_PORT = Number(process.env.WS_PORT ?? 4001);
 const app = express();
 const engine = new TradingEngine();
 const auth = new AuthService();
+const tradeLogger = new TradeLogger();
+const seenSettled = new Set<string>();
+const strategyRegistry = ["momentum", "lag_snipe", "spot_poly_lag"];
 
 app.use(cors());
 app.use(express.json());
 app.use(
   "/api",
-  createApiRouter(engine, auth, (payload) => send({ type: "inspection", payload }))
+  createApiRouter(engine, auth, tradeLogger, (payload) => send({ type: "inspection", payload }))
 );
 
 /** Avoid 404 confusion: API has no HTML; point users to the Vite app. */
@@ -66,9 +71,35 @@ engine.onStatus = (data) => send({ type: "status", payload: data });
 engine.onLog = (data) => send({ type: "log", payload: data });
 engine.onBetLog = (data) => send({ type: "betLog", payload: data });
 
-engine.init().then(() => {
+void (async () => {
+  // Force Chainlink RPC resolve + 4-asset probe before wallet/markets (always logs on clean boot).
+  try {
+    await engine.bootChainlink();
+  } catch (e) {
+    console.error("[BOOT] Chainlink boot error:", e);
+  }
+  await Promise.all([engine.init(), tradeLogger.init()]);
+  void spotPolyLag.connect_binance_ob?.().catch((e: unknown) => {
+    console.error("[SPL] Binance OB startup failed:", e);
+  });
+  console.log(`[SPL] Strategy registry: ${strategyRegistry.join(", ")}`);
+  setInterval(() => {
+    const trades = engine.getTrades();
+    for (const t of trades) {
+      if (t.status !== "WIN" && t.status !== "LOSS") continue;
+      const key = `${t.id}:${t.status}:${Number(t.pnl ?? 0).toFixed(4)}`;
+      if (seenSettled.has(key)) continue;
+      seenSettled.add(key);
+      void tradeLogger.recordSettledTrade(t).catch((e) => {
+        console.error("trade log persist failed", e);
+      });
+    }
+  }, 2500);
   app.listen(PORT, () => {
     console.log(`API running on :${PORT}`);
     console.log(`WS running on :${WS_PORT}`);
   });
+})().catch((e) => {
+  console.error("Fatal server startup:", e);
+  process.exitCode = 1;
 });

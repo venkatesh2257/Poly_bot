@@ -519,10 +519,15 @@ export class WalletService {
 
   async getMarkets(limit = 20): Promise<MarketOption[]> {
     if (!this.client) {
-      return [
-        { tokenID: "sim-btc-up", label: "BTC 5s UP", outcome: "UP" },
-        { tokenID: "sim-btc-down", label: "BTC 5s DOWN", outcome: "DOWN" }
-      ];
+      // Simulation fallback (no CLOB keys / no live client):
+      // expose the same 4 majors so UI + manual selection are not BTC-only.
+      const assets: Array<"BTC" | "ETH" | "SOL" | "XRP"> = ["BTC", "ETH", "SOL", "XRP"];
+      const out: MarketOption[] = [];
+      for (const a of assets) {
+        out.push({ tokenID: `sim-${a.toLowerCase()}-up`, label: `${a} 5s UP`, outcome: "UP" });
+        out.push({ tokenID: `sim-${a.toLowerCase()}-down`, label: `${a} 5s DOWN`, outcome: "DOWN" });
+      }
+      return out.slice(0, limit);
     }
     const res: any = await this.client.getSimplifiedMarkets().catch(() => null);
     const data = Array.isArray(res?.data) ? res.data : Array.isArray(res) ? res : [];

@@ -2,6 +2,7 @@ import { Router } from "express";
 import { TradingEngine } from "../services/engine.js";
 import { AuthService } from "../services/auth.js";
 import { PolymarketPublicService } from "../services/polymarket.js";
+import { TradeLogger } from "../services/tradeLogger.js";
 
 export type InspectionPayload = {
   ts: number;
@@ -23,19 +24,26 @@ function shouldInspectApiPath(path: string, method: string): boolean {
         "/market/select",
         "/mode",
         "/execution/external",
+        "/risk-settings",
+        "/risk-settings/persist-env",
+        "/entry-strategy",
+        "/lag-snipe",
+        "/spot-poly-lag",
+        "/asset-auto-trade",
         "/auth/password-login",
         "/auth/verify"
       ].includes(p))
   ) {
     return true;
   }
-  if (method === "GET" && p.startsWith("/polymarket/clob/")) return true;
+  if (method === "GET" && (p.startsWith("/polymarket/clob/") || p === "/ping")) return true;
   return false;
 }
 
 export function createApiRouter(
   engine: TradingEngine,
   auth: AuthService,
+  tradeLogger: TradeLogger,
   broadcastInspection?: (payload: InspectionPayload) => void
 ) {
   const router = Router();
@@ -156,6 +164,26 @@ export function createApiRouter(
     return res.json({ ok: result.ok, mode: engine.status().mode, reason: result.reason });
   });
 
+  /**
+   * Alias for execution-mode toggle.
+   * Body: { simulation: boolean } where true = SIMULATION (paper), false = LIVE (real CLOB).
+   */
+  router.post("/config", async (req, res) => {
+    const token = getBearerToken(req.headers.authorization);
+    const session = auth.getSession(token);
+    if (!session) return res.status(401).json({ ok: false, reason: "Login required" });
+    if (session.authType === "wallet" && !isWalletAuthorized(session.address)) {
+      return res.status(403).json({ ok: false, reason: "Logged in wallet not allowed" });
+    }
+    const simulation = req.body?.simulation;
+    if (typeof simulation !== "boolean") {
+      return res.status(400).json({ ok: false, reason: "config.simulation must be boolean" });
+    }
+    const mode = simulation ? "SIMULATION" : "LIVE";
+    const result = await engine.setMode(mode);
+    return res.json({ ok: result.ok, mode: engine.status().mode, reason: result.reason });
+  });
+
   // When enabled, the engine will generate pending trades + execution phases,
   // but it will not post any LIVE orders itself (browser wallet is expected to execute).
   router.post("/execution/external", async (req, res) => {
@@ -171,10 +199,172 @@ export function createApiRouter(
     return res.json({ ok: true, enabled });
   });
 
+  router.get("/ping", async (_req, res) => {
+    try {
+      const payload = await engine.runConnectivityPings();
+      return res.json(payload);
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      return res.status(500).json({ error: msg, ts: Date.now(), results: [] });
+    }
+  });
+
   router.get("/status", (_req, res) => res.json(engine.status()));
   router.get("/trading-state", (_req, res) => res.json(engine.getTradingState()));
+
+  router.post("/risk-settings", (req, res) => {
+    const token = getBearerToken(req.headers.authorization);
+    const session = auth.getSession(token);
+    if (!session) return res.status(401).json({ ok: false, reason: "Login required" });
+    if (session.authType === "wallet" && !isWalletAuthorized(session.address)) {
+      return res.status(403).json({ ok: false, reason: "Logged in wallet not allowed" });
+    }
+    const body = req.body ?? {};
+    const reset = Boolean(body.reset);
+    const num = (v: unknown) => (typeof v === "number" && Number.isFinite(v) ? v : undefined);
+    const out = engine.setRiskSettings({
+      reset,
+      entryUsd: num(body.entryUsd),
+      minTrade: num(body.minTrade),
+      maxTrade: num(body.maxTrade),
+      stopLossUsd: num(body.stopLossUsd),
+      cooldownMs: num(body.cooldownMs)
+    });
+    if (!out.ok) return res.status(400).json(out);
+    return res.json(out);
+  });
+
+  router.post("/risk-settings/persist-env", async (req, res) => {
+    const token = getBearerToken(req.headers.authorization);
+    const session = auth.getSession(token);
+    if (!session) return res.status(401).json({ ok: false, reason: "Login required" });
+    if (session.authType === "wallet" && !isWalletAuthorized(session.address)) {
+      return res.status(403).json({ ok: false, reason: "Logged in wallet not allowed" });
+    }
+    const body = req.body ?? {};
+    const num = (v: unknown) => (typeof v === "number" && Number.isFinite(v) ? v : undefined);
+    const entryUsd = num(body.entryUsd);
+    const minTrade = num(body.minTrade);
+    const maxTrade = num(body.maxTrade);
+    const stopLossUsd = num(body.stopLossUsd);
+    const cooldownMs = num(body.cooldownMs);
+    if (
+      entryUsd === undefined ||
+      minTrade === undefined ||
+      maxTrade === undefined ||
+      stopLossUsd === undefined ||
+      cooldownMs === undefined
+    ) {
+      return res.status(400).json({
+        ok: false,
+        reason: "All of entryUsd, minTrade, maxTrade, stopLossUsd, cooldownMs are required"
+      });
+    }
+    const out = await engine.persistRiskSettingsToEnv({
+      entryUsd,
+      minTrade,
+      maxTrade,
+      stopLossUsd,
+      cooldownMs
+    });
+    if (!out.ok) return res.status(400).json(out);
+    return res.json(out);
+  });
+
+  router.post("/entry-strategy", (req, res) => {
+    const token = getBearerToken(req.headers.authorization);
+    const session = auth.getSession(token);
+    if (!session) return res.status(401).json({ ok: false, reason: "Login required" });
+    if (session.authType === "wallet" && !isWalletAuthorized(session.address)) {
+      return res.status(403).json({ ok: false, reason: "Logged in wallet not allowed" });
+    }
+    const body = req.body ?? {};
+    const reset = Boolean(body.reset);
+    const strategy = typeof body.strategy === "string" ? body.strategy : undefined;
+    const out = engine.setEntryStrategy({ reset, strategy });
+    if (!out.ok) return res.status(400).json(out);
+    return res.json(out);
+  });
+
+  router.post("/lag-snipe", (req, res) => {
+    const token = getBearerToken(req.headers.authorization);
+    const session = auth.getSession(token);
+    if (!session) return res.status(401).json({ ok: false, reason: "Login required" });
+    if (session.authType === "wallet" && !isWalletAuthorized(session.address)) {
+      return res.status(403).json({ ok: false, reason: "Logged in wallet not allowed" });
+    }
+    const enabled = Boolean(req.body?.enabled);
+    const out = engine.setLagSnipe(enabled);
+    return res.json(out);
+  });
+
+  router.post("/spot-poly-lag", (req, res) => {
+    const token = getBearerToken(req.headers.authorization);
+    const session = auth.getSession(token);
+    if (!session) return res.status(401).json({ ok: false, reason: "Login required" });
+    if (session.authType === "wallet" && !isWalletAuthorized(session.address)) {
+      return res.status(403).json({ ok: false, reason: "Logged in wallet not allowed" });
+    }
+    const enabled = Boolean(req.body?.enabled);
+    const out = engine.setEntryStrategy({ strategy: enabled ? "spot_poly_lag" : "momentum" });
+    if (!out.ok) return res.status(400).json(out);
+    return res.json({
+      ok: true,
+      spotPolyLagEnabled: out.entryStrategy.effective === "spot_poly_lag",
+      entryStrategy: out.entryStrategy
+    });
+  });
+
+  router.post("/asset-auto-trade", (req, res) => {
+    const token = getBearerToken(req.headers.authorization);
+    const session = auth.getSession(token);
+    if (!session) return res.status(401).json({ ok: false, reason: "Login required" });
+    if (session.authType === "wallet" && !isWalletAuthorized(session.address)) {
+      return res.status(403).json({ ok: false, reason: "Logged in wallet not allowed" });
+    }
+    const body = req.body ?? {};
+    const asset = typeof body.asset === "string" ? body.asset : "";
+    const enabled = body.enabled;
+    if (!asset || typeof enabled !== "boolean") {
+      return res.status(400).json({ ok: false, reason: "Body must include asset (string) and enabled (boolean)" });
+    }
+    const out = engine.setAssetAutoTradeEnabled(asset, enabled);
+    if (!out.ok) return res.status(400).json(out);
+    return res.json(out);
+  });
+
   router.get("/bet-logs", (_req, res) => res.json(engine.getBetLogs()));
+  router.get("/paper-trade-history", (_req, res) => res.json(engine.getBotTradeHistory()));
   router.get("/trades", (_req, res) => res.json(engine.getTrades()));
+  router.get("/trade-log/query", async (req, res) => {
+    const q = req.query as Record<string, string | undefined>;
+    const fromMs = q.from ? Date.parse(q.from) : undefined;
+    const toMs = q.to ? Date.parse(q.to) : undefined;
+    const rows = await tradeLogger.query({
+      fromMs: Number.isFinite(fromMs) ? fromMs : undefined,
+      toMs: Number.isFinite(toMs) ? toMs : undefined,
+      asset: q.asset,
+      strategy: q.strategy,
+      session: q.session === "AM" || q.session === "PM" || q.session === "24h" ? q.session : "24h"
+    });
+    return res.json({ rows, stats: tradeLogger.summarize(rows) });
+  });
+  router.get("/trade-log/export.csv", async (req, res) => {
+    const q = req.query as Record<string, string | undefined>;
+    const fromMs = q.from ? Date.parse(q.from) : undefined;
+    const toMs = q.to ? Date.parse(q.to) : undefined;
+    const rows = await tradeLogger.query({
+      fromMs: Number.isFinite(fromMs) ? fromMs : undefined,
+      toMs: Number.isFinite(toMs) ? toMs : undefined,
+      asset: q.asset,
+      strategy: q.strategy,
+      session: q.session === "AM" || q.session === "PM" || q.session === "24h" ? q.session : "24h"
+    });
+    const csv = tradeLogger.toCsv(rows);
+    res.setHeader("Content-Type", "text/csv; charset=utf-8");
+    res.setHeader("Content-Disposition", "attachment; filename=trade-log-export.csv");
+    return res.send(csv);
+  });
   router.get("/wallet", async (_req, res) => res.json(await engine.getWalletSummary()));
   router.get("/markets", (_req, res) => res.json(engine.getMarkets()));
   router.get("/insights", (_req, res) => res.json(engine.getInsights()));
@@ -183,7 +373,21 @@ export function createApiRouter(
   router.get("/polymarket/gamma/search", async (req, res) => res.json(await poly.gammaSearch(req.query as any)));
   router.get("/polymarket/gamma/tags", async (req, res) => res.json(await poly.gammaTags(req.query as any)));
   router.get("/polymarket/data/positions", async (req, res) => res.json(await poly.dataPositions(req.query as any)));
-  router.get("/polymarket/data/activity", async (req, res) => res.json(await poly.dataActivity(req.query as any)));
+  router.get("/polymarket/data/activity", async (req, res) => {
+    const user = req.query.user;
+    if (typeof user !== "string" || !/^0x[a-fA-F0-9]{40}$/i.test(user.trim())) {
+      return res.status(400).json({
+        error: "Missing or invalid user",
+        reason: "Polymarket Data API /activity requires user=<proxy wallet 0x…> (e.g. CLOB_FUNDER_ADDRESS)."
+      });
+    }
+    try {
+      return res.json(await poly.dataActivity(req.query as any));
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      return res.status(502).json({ error: msg });
+    }
+  });
   router.get("/polymarket/data/trades", async (req, res) => res.json(await poly.dataTrades(req.query as any)));
   router.get("/polymarket/data/holders", async (req, res) => res.json(await poly.dataHolders(req.query as any)));
   router.get("/polymarket/clob/book", async (req, res) => {

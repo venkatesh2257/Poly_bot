@@ -214,6 +214,8 @@ export interface TradingState {
   updownWindows: Array<{
     asset: string;
     slug: string;
+    /** Alias for `slug` (useful for per-asset UI even when temporary). */
+    activeMarketSlug?: string | null;
     label: string;
     upMid?: number | null;
     downMid?: number | null;
@@ -227,6 +229,8 @@ export interface TradingState {
     oracleSpotUsd?: number | null;
     /** Age of the oracle tick used for `oracleSpotUsd` (ms). */
     oracleAgeMs?: number | null;
+    /** Data source for `oracleSpotUsd`. */
+    oracleSource?: "chainlink" | "rtds" | "cache" | null;
     /** Gamma eventMetadata or RTDS snapshot at window open. */
     priceToBeatUsd?: number | null;
     diffUsd?: number | null;

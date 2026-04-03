@@ -4,10 +4,14 @@ import type {
   AuthVerifyResponse,
   BetLogEntry,
   BotStatus,
+  EntryStrategyState,
+  RiskSettingsSnapshot,
+  TradeLogQueryResponse,
   TradingState,
   Insights,
   MarketOption,
   Mode,
+  PingResponse,
   PolymarketAccountSummary,
   PasswordLoginResponse,
   Trade,
@@ -43,11 +47,66 @@ export const api = {
   start: () => request<{ ok: true }>("/start", { method: "POST" }),
   stop: () => request<{ ok: true }>("/stop", { method: "POST" }),
   status: () => request<BotStatus>("/status"),
+  ping: () => request<PingResponse>("/ping"),
   tradingState: () => request<TradingState>("/trading-state"),
+  setRiskSettings: (body: {
+    reset?: boolean;
+    entryUsd?: number;
+    minTrade?: number;
+    maxTrade?: number;
+    stopLossUsd?: number;
+    cooldownMs?: number;
+  }) =>
+    request<{ ok: true; riskSettings: RiskSettingsSnapshot }>("/risk-settings", {
+      method: "POST",
+      body: JSON.stringify(body)
+    }),
+  /** Writes `server/.env` (ENTRY_USD, MIN_TRADE, MAX_TRADE, STOP_LOSS, COOLDOWN_MS) and clears runtime overrides. */
+  persistRiskSettingsToEnv: (body: {
+    entryUsd: number;
+    minTrade: number;
+    maxTrade: number;
+    stopLossUsd: number;
+    cooldownMs: number;
+  }) =>
+    request<{ ok: true; riskSettings: RiskSettingsSnapshot }>("/risk-settings/persist-env", {
+      method: "POST",
+      body: JSON.stringify(body)
+    }),
+  setEntryStrategy: (body: { reset?: boolean; strategy?: string }) =>
+    request<{ ok: true; entryStrategy: EntryStrategyState }>("/entry-strategy", {
+      method: "POST",
+      body: JSON.stringify(body)
+    }),
+  setLagSnipe: (enabled: boolean) =>
+    request<{ ok: true; lagSnipeEnabled: boolean; banner?: string }>("/lag-snipe", {
+      method: "POST",
+      body: JSON.stringify({ enabled })
+    }),
+  setSpotPolyLag: (enabled: boolean) =>
+    request<{ ok: true; spotPolyLagEnabled: boolean; entryStrategy: EntryStrategyState }>("/spot-poly-lag", {
+      method: "POST",
+      body: JSON.stringify({ enabled })
+    }),
+  /** Per-asset auto-trade on/off (only symbols in UPDOWN_ASSETS). Manual trades unaffected. */
+  setAssetAutoTrade: (asset: string, enabled: boolean) =>
+    request<{ ok: true; assetAutoTradeEnabled: Record<string, boolean> }>("/asset-auto-trade", {
+      method: "POST",
+      body: JSON.stringify({ asset, enabled })
+    }),
   setMode: (mode: Mode) =>
     request<{ ok: boolean; mode: Mode; reason?: string }>("/mode", {
       method: "POST",
       body: JSON.stringify({ mode })
+    }),
+  /**
+   * Alias for execution-mode toggle.
+   * Body: { simulation: boolean } where true = SIMULATION (paper), false = LIVE (real CLOB).
+   */
+  setConfig: (body: { simulation: boolean }) =>
+    request<{ ok: boolean; mode: Mode; reason?: string }>("/config", {
+      method: "POST",
+      body: JSON.stringify(body)
     }),
   setExternalExecution: (enabled: boolean) =>
     request<{ ok: boolean; enabled: boolean }>("/execution/external", {
@@ -115,6 +174,36 @@ export const api = {
       method: "POST",
       body: JSON.stringify({ orderId })
     }),
+  tradeLogQuery: (q: {
+    from?: string;
+    to?: string;
+    asset?: string;
+    strategy?: string;
+    session?: "24h" | "AM" | "PM";
+  }) => {
+    const params = new URLSearchParams();
+    if (q.from) params.set("from", q.from);
+    if (q.to) params.set("to", q.to);
+    if (q.asset) params.set("asset", q.asset);
+    if (q.strategy) params.set("strategy", q.strategy);
+    if (q.session) params.set("session", q.session);
+    return request<TradeLogQueryResponse>(`/trade-log/query?${params.toString()}`);
+  },
+  tradeLogExportUrl: (q: {
+    from?: string;
+    to?: string;
+    asset?: string;
+    strategy?: string;
+    session?: "24h" | "AM" | "PM";
+  }) => {
+    const params = new URLSearchParams();
+    if (q.from) params.set("from", q.from);
+    if (q.to) params.set("to", q.to);
+    if (q.asset) params.set("asset", q.asset);
+    if (q.strategy) params.set("strategy", q.strategy);
+    if (q.session) params.set("session", q.session);
+    return `${API_BASE}/trade-log/export.csv?${params.toString()}`;
+  },
   polymarketConnect: async (): Promise<PolymarketAccountSummary> => {
     const [wallet, balanceAllowanceRaw, openOrders, userTrades] = await Promise.all([
       request<WalletSummary>("/wallet"),

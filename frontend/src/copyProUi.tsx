@@ -344,6 +344,7 @@ export function SnipeAssetCardsRow(props: {
   updownWindows?: Array<{
     asset: string;
     slug: string;
+    activeMarketSlug?: string | null;
     label: string;
     upMid?: number | null;
     downMid?: number | null;
@@ -354,6 +355,7 @@ export function SnipeAssetCardsRow(props: {
     oddsSource?: "gamma" | "clob" | null;
     oracleSpotUsd?: number | null;
     oracleAgeMs?: number | null;
+    oracleSource?: "chainlink" | "rtds" | "cache" | null;
     priceToBeatUsd?: number | null;
     diffUsd?: number | null;
     secondsToExpiry?: number | null;
@@ -433,6 +435,17 @@ export function SnipeAssetCardsRow(props: {
         { k: "Price to beat", v: ptb != null ? `$${fmtUsd(ptb)}` : "—" },
         { k: `Spot ${sym}`, v: spot != null ? `$${fmtUsd(spot)}` : "—" },
         { k: "Oracle age", v: oracleAgeMs != null ? `${Math.max(0, Math.round(oracleAgeMs / 1000))}s` : "—" },
+        {
+          k: "Oracle source",
+          v:
+            win.oracleSource === "chainlink"
+              ? "Chainlink"
+              : win.oracleSource === "rtds"
+                ? "RTDS"
+                : win.oracleSource === "cache"
+                  ? "Cache"
+                  : "—"
+        },
         {
           k: "Diff",
           v:

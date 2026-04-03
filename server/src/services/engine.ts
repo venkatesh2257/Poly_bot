@@ -217,7 +217,16 @@ export class TradingEngine {
   private autoTradeSlotRotation = 0;
   private stopLossTriggered = false;
   private noTradeSignals = 0;
-  private markets: MarketOption[] = [{ tokenID: "sim-btc-up", label: "BTC 5s UP", outcome: "UP" }];
+  private markets: MarketOption[] = [
+    { tokenID: "sim-btc-up", label: "BTC 5s UP", outcome: "UP" },
+    { tokenID: "sim-btc-down", label: "BTC 5s DOWN", outcome: "DOWN" },
+    { tokenID: "sim-eth-up", label: "ETH 5s UP", outcome: "UP" },
+    { tokenID: "sim-eth-down", label: "ETH 5s DOWN", outcome: "DOWN" },
+    { tokenID: "sim-sol-up", label: "SOL 5s UP", outcome: "UP" },
+    { tokenID: "sim-sol-down", label: "SOL 5s DOWN", outcome: "DOWN" },
+    { tokenID: "sim-xrp-up", label: "XRP 5s UP", outcome: "UP" },
+    { tokenID: "sim-xrp-down", label: "XRP 5s DOWN", outcome: "DOWN" }
+  ];
   private selectedMarket: MarketOption = this.markets[0];
   private marketContext: MarketContext = {
     tokenID: "sim-btc-up",
@@ -245,6 +254,13 @@ export class TradingEngine {
   /** Tracks 5m window (Gamma slug time or local 5m bucket in SIM). */
   private lastTrackedWindowKey: string | null = null;
   private btcTargetUsd: number | null = null;
+  /** Rate-limited runtime health logging (RTDS/oracle/cache + positions). */
+  private lastRuntimeHealthLogMs: number | null = null;
+  /** When Chainlink never yields a fresh tick, remind about RPC env vars. */
+  private chainlinkMissingStreak = 0;
+  private lastChainlinkRpcReminderMs: number | null = null;
+  /** Throttle `[ORACLE][SOURCE]` logs: only when source/reason/window changes (not every book refresh). */
+  private lastOracleSourceLogKeyByAsset = new Map<string, string>();
   /** Per UPDOWN asset: window key + spot at first tick in that window (BONE_LATENCY on non-BTC). */
   private spotWindowByAsset = new Map<string, { windowKey: string; openUsd: number }>();
   private lastSpotUsdByAsset = new Map<string, number>();
@@ -253,7 +269,7 @@ export class TradingEngine {
   private polymarketRtds = new PolymarketRtdsFeed();
   /** On-chain Chainlink BTC/USD (authoritative) oracle + staleness protection. */
   private chainlinkFeed = new ChainlinkFeedService();
-  /** Cached latest Chainlink tick; used as “oracle spot” for BTC-only logic. */
+  /** Cached latest Chainlink tick; used as “oracle spot” for multi-asset strike/oracle. */
   private chainlinkUsdByAsset = new Map<string, ChainlinkUsdPriceTick>();
   private gammaDisplayByAsset = new Map<
     string,
@@ -345,19 +361,28 @@ export class TradingEngine {
     return null;
   }
 
+  /** On-chain `updatedAt` age tolerance — do not inherit RTDS_MAX_STALE_MS. */
   private chainlinkStaleMs(): number {
-    const n = envNum("CHAINLINK_MAX_STALE_MS", envNum("RTDS_MAX_STALE_MS", 8000));
-    return Number.isFinite(n) ? Math.max(500, n) : 8000;
+    const raw = process.env.CHAINLINK_MAX_STALE_MS;
+    const parsed = Number(raw);
+    if (raw !== undefined && raw !== "" && Number.isFinite(parsed) && parsed > 0) {
+      return Math.max(500, parsed);
+    }
+    return 120_000;
   }
 
   private oracleSpotUsdForAsset(asset: string): number | null {
     const a = this.chainlinkAsset(asset);
     if (a) {
       const tick = this.chainlinkUsdByAsset.get(a);
-      if (tick && Number.isFinite(tick.price) && tick.price > 0) return tick.price;
+      const staleMs = this.chainlinkStaleMs();
+      if (tick && Number.isFinite(tick.price) && tick.price > 0) {
+        const ageMs = Date.now() - tick.updatedAt;
+        if (Number.isFinite(ageMs) && ageMs <= staleMs) return tick.price;
+      }
       // If Chainlink tick is missing/stale, fall back to RTDS spot.
       const rtdsSpot = this.polymarketRtds.getUsdForAsset(asset);
-      if (rtdsSpot != null) return rtdsSpot;
+      if (rtdsSpot != null && Number.isFinite(rtdsSpot) && rtdsSpot > 0) return rtdsSpot;
       const spotAnchor = this.lastSpotUsdByAsset.get(a);
       return spotAnchor != null && Number.isFinite(spotAnchor) && spotAnchor > 0 ? spotAnchor : null;
     }
@@ -368,17 +393,95 @@ export class TradingEngine {
     const a = this.chainlinkAsset(asset);
     if (a) {
       const tick = this.chainlinkUsdByAsset.get(a);
-      if (tick && Number.isFinite(tick.updatedAt)) return Math.max(0, Date.now() - tick.updatedAt);
+      const staleMs = this.chainlinkStaleMs();
+      if (tick && Number.isFinite(tick.updatedAt)) {
+        const ageMs = Math.max(0, Date.now() - tick.updatedAt);
+        if (Number.isFinite(ageMs) && ageMs <= staleMs) return ageMs;
+      }
       // If Chainlink tick is missing/stale, fall back to RTDS age.
       return this.polymarketRtds.getAgeMsForAsset(asset);
     }
     return this.polymarketRtds.getAgeMsForAsset(asset);
   }
 
+  /** Full oracle attribution for UI + throttled `[ORACLE][SOURCE]` logs. */
+  private oracleSourceMetaForAsset(asset: string): {
+    source: "chainlink" | "rtds" | "cache" | null;
+    reason?: string;
+    ageMs: number | null;
+  } {
+    const a = asset.trim().toUpperCase();
+    const chain = this.chainlinkAsset(a);
+    const staleMs = this.chainlinkStaleMs();
+    const rtdsOk = () => {
+      const s = this.polymarketRtds.getUsdForAsset(asset);
+      return s != null && Number.isFinite(s) && s > 0;
+    };
+    const cacheOk = () => {
+      if (!chain) return false;
+      const s = this.lastSpotUsdByAsset.get(chain);
+      return s != null && Number.isFinite(s) && s > 0;
+    };
+    if (chain) {
+      const tick = this.chainlinkUsdByAsset.get(chain);
+      if (tick && Number.isFinite(tick.price) && tick.price > 0) {
+        const ageMs = Math.max(0, Date.now() - tick.updatedAt);
+        if (Number.isFinite(ageMs) && ageMs <= staleMs) {
+          return { source: "chainlink", ageMs };
+        }
+        if (rtdsOk()) {
+          return {
+            source: "rtds",
+            reason: "chainlink_stale",
+            ageMs: this.polymarketRtds.getAgeMsForAsset(asset)
+          };
+        }
+        if (cacheOk()) {
+          return { source: "cache", reason: "chainlink_stale_and_rtds_missing", ageMs: null };
+        }
+        return { source: null, reason: "chainlink_stale", ageMs: null };
+      }
+      if (rtdsOk()) {
+        return {
+          source: "rtds",
+          reason: "chainlink_missing",
+          ageMs: this.polymarketRtds.getAgeMsForAsset(asset)
+        };
+      }
+      if (cacheOk()) {
+        return { source: "cache", reason: "chainlink_missing_and_rtds_missing", ageMs: null };
+      }
+      return { source: null, reason: "chainlink_missing", ageMs: null };
+    }
+    if (rtdsOk()) return { source: "rtds", ageMs: this.polymarketRtds.getAgeMsForAsset(asset) };
+    return { source: null, ageMs: null };
+  }
+
+  /** Data source for `oracleSpotUsd` (used for UI + runtime transparency). */
+  private oracleSourceForAsset(asset: string): "chainlink" | "rtds" | "cache" | null {
+    return this.oracleSourceMetaForAsset(asset).source;
+  }
+
   private oracleStaleMsForAsset(asset: string): number {
     const a = this.chainlinkAsset(asset);
     if (a) return this.chainlinkStaleMs();
     return Math.max(500, envNum("RTDS_MAX_STALE_MS", 8000));
+  }
+
+  /** Logs `[ORACLE][SOURCE]` only when window or source/reason changes (not every refresh). */
+  private logOracleSourceIfChanged(chainlinkAssetsToPoll: string[]) {
+    const windowKey = this.currentWindowKey();
+    for (const asset of chainlinkAssetsToPoll) {
+      const meta = this.oracleSourceMetaForAsset(asset);
+      const logKey = `${windowKey}|${meta.source ?? "null"}|${meta.reason ?? ""}`;
+      if (this.lastOracleSourceLogKeyByAsset.get(asset) === logKey) continue;
+      this.lastOracleSourceLogKeyByAsset.set(asset, logKey);
+      const parts: string[] = [`[ORACLE][SOURCE] asset=${asset} source=${meta.source ?? "null"}`];
+      if (meta.reason) parts.push(`reason=${meta.reason}`);
+      else if (meta.source === "chainlink" && meta.ageMs != null) parts.push(`ageMs=${Math.round(meta.ageMs)}`);
+      else if (meta.source === "rtds" && meta.ageMs != null) parts.push(`ageMs=${Math.round(meta.ageMs)}`);
+      console.log(parts.join(" "));
+    }
   }
 
   /** Poll Coinbase/Binance for each configured UPDOWN symbol (parallel); anchors BONE_LATENCY per asset. */
@@ -1458,7 +1561,9 @@ export class TradingEngine {
       const g = this.gammaDisplayByAsset.get(w.asset);
       const slot = snapByAsset.get(w.asset);
       const spot = this.oracleSpotUsdForAsset(w.asset);
-      const oracleAgeMs = this.oracleAgeMsForAsset(w.asset);
+      const meta = this.oracleSourceMetaForAsset(w.asset);
+      const oracleSource = meta.source;
+      const oracleAgeMs = meta.ageMs ?? this.oracleAgeMsForAsset(w.asset);
       const ptbMap = this.priceToBeatByAsset.get(w.asset);
       const ptbGamma = g?.priceToBeat;
       const isChainlink = this.chainlinkAsset(w.asset) != null;
@@ -1483,6 +1588,7 @@ export class TradingEngine {
       return {
         asset: w.asset,
         slug: w.slug,
+        activeMarketSlug: w.slug,
         label: w.label,
         upMid,
         downMid,
@@ -1493,6 +1599,7 @@ export class TradingEngine {
         oddsSource: g ? "gamma" : snap ? "clob" : null,
         oracleSpotUsd: spot ?? null,
         oracleAgeMs: oracleAgeMs ?? null,
+        oracleSource: oracleSource ?? null,
         priceToBeatUsd: ptb,
         diffUsd: spot != null && ptb != null ? spot - ptb : null,
         secondsToExpiry
@@ -1964,6 +2071,79 @@ export class TradingEngine {
     this.resolveTrade(tradeId);
   }
 
+  /** Guardrails for safe multi-asset auto-trading (per-asset values must exist + be usable). */
+  private autoTradeSkipReasonForActiveAsset(): string | null {
+    const assetRaw = this.wallet.getActiveDiscoveredAsset();
+    const slug = this.wallet.getActiveDiscoveredSlug();
+    const asset = assetRaw ? assetRaw.trim().toUpperCase() : null;
+
+    if (!asset || !slug) return "missing_active_market";
+    if (!this.selectedMarket?.tokenID || this.selectedMarket.tokenID === "unknown") return "missing_active_market";
+
+    const ptb = this.priceToBeatByAsset.get(asset);
+    if (ptb == null || !Number.isFinite(ptb) || ptb <= 0) return "missing_price_to_beat";
+
+    const spot = this.oracleSpotUsdForAsset(asset);
+    if (spot == null || !Number.isFinite(spot) || spot <= 0) return "missing_oracle_spot";
+
+    const ageMs = this.oracleAgeMsForAsset(asset);
+    const staleMs = this.oracleStaleMsForAsset(asset);
+    if (ageMs != null && Number.isFinite(ageMs) && ageMs > staleMs) {
+      // If oracle is too old and we have no alternative spot fallback, skip cleanly.
+      const rtdsSpot = this.polymarketRtds.getUsdForAsset(asset);
+      const cacheSpot = this.lastSpotUsdByAsset.get(asset);
+      const hasFallbackSpot =
+        (rtdsSpot != null && Number.isFinite(rtdsSpot) && rtdsSpot > 0) ||
+        (cacheSpot != null && Number.isFinite(cacheSpot) && cacheSpot > 0);
+      if (!hasFallbackSpot) return "oracle_stale_no_fallback";
+    }
+
+    return null;
+  }
+
+  private maybeLogRuntimeHealth() {
+    const minMs = envNum("RUNTIME_HEALTH_LOG_MS", 20_000);
+    const now = Date.now();
+    if (this.lastRuntimeHealthLogMs != null && now - this.lastRuntimeHealthLogMs < minMs) return;
+    this.lastRuntimeHealthLogMs = now;
+
+    const assets = ["BTC", "ETH", "SOL", "XRP"] as const;
+    const rtdsConnected = this.polymarketRtds.isSocketOpen();
+    const bookAgeSec =
+      this.lastBookRefreshMs != null ? Math.max(0, Math.round((now - this.lastBookRefreshMs) / 1000)) : null;
+
+    const pending = this.trades.filter((t) => t.status === "PENDING").length;
+    const finished = this.trades.filter((t) => t.status !== "PENDING" && !t.paper?.missed);
+    const wins = finished.filter((t) => t.status === "WIN").length;
+    const losses = finished.filter((t) => t.status === "LOSS").length;
+
+    const oracleAges = assets
+      .map((a) => {
+        const ageMs = this.oracleAgeMsForAsset(a);
+        return Number.isFinite(ageMs ?? NaN) ? `${a}:${ageMs}` : `${a}:—`;
+      })
+      .join(" ");
+
+    const rtdsAges = assets
+      .map((a) => {
+        const ageMs = this.polymarketRtds.getAgeMsForAsset(a);
+        return Number.isFinite(ageMs ?? NaN) ? `${a}:${ageMs}` : `${a}:—`;
+      })
+      .join(" ");
+
+    const oracleSources = assets
+      .map((a) => {
+        const src = this.oracleSourceForAsset(a);
+        return `${a}:${src ?? "—"}`;
+      })
+      .join(" ");
+
+    this.log(
+      "SIGNAL",
+      `[HEALTH] rtds=${rtdsConnected ? "OK" : "OFF"} bookAgeSec=${bookAgeSec ?? "—"} pos pending=${pending} wins=${wins} losses=${losses} cache/oracleAgeMs {${oracleAges}} rtdsAgeMs {${rtdsAges}} oracleSource {${oracleSources}}`
+    );
+  }
+
   onMarket?: (data: MarketWsPayload) => void;
   onPrediction?: (data: Prediction) => void;
   onTrades?: (data: Trade[]) => void;
@@ -1985,6 +2165,7 @@ export class TradingEngine {
       return;
     }
     if (this.bookRefreshInFlight) return;
+    this.maybeLogRuntimeHealth();
     const n = this.wallet.getDiscoveredSlotCount();
     try {
       if (this.lagSnipeEnabled) {
@@ -2012,14 +2193,26 @@ export class TradingEngine {
           this.selectedMarket = { tokenID: sel.tokenID, label: sel.label, outcome: "AUTO" };
         }
       }
+
+      const skipReason = this.autoTradeSkipReasonForActiveAsset();
+      if (skipReason) {
+        const asset = this.wallet.getActiveDiscoveredAsset() ?? "?";
+        this.log("SIGNAL", `[AUTO][SKIP] asset=${asset} reason=${skipReason}`);
+        return;
+      }
+
       const choice = this.chooseDirectionalEntry();
+      if (choice.reason.startsWith("OLA_SKIP:") || choice.reason.startsWith("LAG_SNIPE_SKIP:")) {
+        const asset = this.wallet.getActiveDiscoveredAsset() ?? "?";
+        const r = choice.reason.startsWith("OLA_SKIP:") ? "ola_skip" : "lag_snipe_skip";
+        this.log("SIGNAL", `[AUTO][SKIP] asset=${asset} reason=${r} detail=${choice.reason}`);
+        return;
+      }
+
       this.log(
         "SIGNAL",
         `[AUTO] asset=${this.wallet.getActiveDiscoveredAsset() ?? "?"} dir=${choice.direction} ${choice.reason}`
       );
-      if (choice.reason.startsWith("OLA_SKIP:") || choice.reason.startsWith("LAG_SNIPE_SKIP:")) {
-        return;
-      }
       const direction = choice.direction;
       /** OLA ignores global NO_TRADE from chart/volatility — entries follow oracle+book snipe only. */
       if (
@@ -2063,6 +2256,22 @@ export class TradingEngine {
     }
   }
 
+  /**
+   * Run before wallet/markets init so Chainlink RPC + 4-asset probe always log on every server boot.
+   * (Also safe to call once from `init()` if entry point does not await it.)
+   */
+  async bootChainlink(): Promise<void> {
+    try {
+      await this.chainlinkFeed.initializeRpc();
+      await this.chainlinkFeed.testStartupConnectivity();
+      console.log("[BOOT] Chainlink: initialized");
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      console.error(`[BOOT] Chainlink failed: ${msg}`);
+      console.warn("[BOOT] Chainlink: continuing without on-chain feeds (RTDS/cache may still apply).");
+    }
+  }
+
   async init() {
     const autoStart = String(process.env.AUTO_START_BOT ?? "true").toLowerCase() === "true";
     await this.wallet.init();
@@ -2086,6 +2295,26 @@ export class TradingEngine {
     this.log(
       "SIGNAL",
       `Engine initialized in ${this.wallet.getMode()} mode (ENTRY_STRATEGY=${eff}${this.entryStrategyRuntime ? ` override=${this.entryStrategyRuntime}` : ""}, ${stratNote}, UPDOWN_5M=${updAssets})`
+    );
+
+    const execMode = this.wallet.getMode();
+    this.log(
+      "SIGNAL",
+      `Execution: ${execMode === "LIVE" ? "LIVE (real USDC)" : "SIMULATION (paper)"}`
+    );
+    console.log(
+      `[EXECUTION] Execution: ${execMode === "LIVE" ? "LIVE (real USDC)" : "SIMULATION (paper)"}`
+    );
+    this.log(
+      "SIGNAL",
+      `[BOOT][CHECKLIST] mode=${execMode} simBalance=$${START_BALANCE} rtdsConnected=${
+        this.polymarketRtds.isSocketOpen() ? "yes" : "no"
+      } updownAssetsConfigured=${this.wallet.getUpdownAssetsConfigured().join(", ")}`
+    );
+    console.log(
+      `[BOOT][CHECKLIST] mode=${execMode} simBalance=$${START_BALANCE} rtdsConnected=${
+        this.polymarketRtds.isSocketOpen() ? "yes" : "no"
+      } updownAssetsConfigured=${this.wallet.getUpdownAssetsConfigured().join(", ")}`
     );
     const boneActive = ["BONE_HIGH_CONF", "BONE_EQ", "BONE_LONGSHOT", "BONE_LATENCY"].filter((k) => boneEnvTrue(k));
     if (boneActive.length) {
@@ -2225,43 +2454,67 @@ export class TradingEngine {
               )
             ]);
 
-            // Fetch Chainlink for strike/oracle windows when any chainlink-asset window bumps.
+            // Per-asset window starts (for strike bump detection).
             const windowStartByChainlinkAsset = new Map<string, number>();
-            let anyChainlinkWindowBumped = false;
             for (const { s } of gammaResults) {
               const assetUpper = s.asset.trim().toUpperCase();
               if (!chainlinkSet.has(assetUpper)) continue;
               const ws = s.windowStartSec;
               if (ws == null) continue;
               windowStartByChainlinkAsset.set(assetUpper, ws);
-              const prevWs = this.oracleWindowTrackedByAsset.get(assetUpper);
-              if (prevWs !== ws) anyChainlinkWindowBumped = true;
             }
 
+            // Poll Chainlink every book refresh for active UPDOWN slots — not only on 5m window bumps (otherwise
+            // chainlinkUsdByAsset stays empty and UI shows RTDS/cache despite a working RPC).
+            const chainlinkAssetsToPoll = chainlinkAssets.filter((a) =>
+              slots.some((s) => s.asset.trim().toUpperCase() === a)
+            );
+            const shouldPollChainlink = slots.length > 0 && chainlinkAssetsToPoll.length > 0;
+
             const chainlinkTicksByAsset = new Map<string, ChainlinkUsdPriceTick>();
-            if (anyChainlinkWindowBumped) {
+            if (shouldPollChainlink) {
+              const staleMs = this.chainlinkStaleMs();
+              let anyFreshChainlinkTick = false;
               const ticks = await Promise.all(
-                chainlinkAssets
-                  .filter((a) => windowStartByChainlinkAsset.has(a))
-                  .map((a) => this.chainlinkFeed.getLatestUsdPrice(a))
+                chainlinkAssetsToPoll.map((a) => this.chainlinkFeed.getLatestUsdPrice(a))
               );
-              // Map results back by asset symbol.
-              const filteredAssets = chainlinkAssets.filter((a) => windowStartByChainlinkAsset.has(a));
-              for (let i = 0; i < filteredAssets.length; i++) {
-                const asset = filteredAssets[i];
+              for (let i = 0; i < chainlinkAssetsToPoll.length; i++) {
                 const tick = ticks[i];
-                if (tick) chainlinkTicksByAsset.set(asset, tick);
+                if (tick) chainlinkTicksByAsset.set(chainlinkAssetsToPoll[i], tick);
               }
               // Always keep oracle spot + age from Chainlink only when it's fresh.
               for (const [asset, tick] of chainlinkTicksByAsset.entries()) {
                 const ageMs = Date.now() - tick.updatedAt;
-                if (ageMs <= this.chainlinkStaleMs()) this.chainlinkUsdByAsset.set(asset, tick);
+                if (ageMs <= staleMs) {
+                  anyFreshChainlinkTick = true;
+                  this.chainlinkUsdByAsset.set(asset, tick);
+                }
                 else this.chainlinkUsdByAsset.delete(asset);
               }
-              // If we couldn't read a tick for a chainlink asset, don't keep an older stale tick around.
-              for (const a of chainlinkAssets.filter((x) => windowStartByChainlinkAsset.has(x))) {
+              // If we couldn't read a tick for a polled asset, don't keep an older stale tick around.
+              for (const a of chainlinkAssetsToPoll) {
                 if (!chainlinkTicksByAsset.has(a)) this.chainlinkUsdByAsset.delete(a);
               }
+
+              // Production guardrail: if Chainlink never yields a fresh tick, remind about RPC placeholders.
+              if (!anyFreshChainlinkTick) {
+                this.chainlinkMissingStreak += 1;
+                const now = Date.now();
+                if (
+                  this.chainlinkMissingStreak >= 3 &&
+                  (this.lastChainlinkRpcReminderMs == null || now - this.lastChainlinkRpcReminderMs > 60_000)
+                ) {
+                  this.lastChainlinkRpcReminderMs = now;
+                  this.log(
+                    "SIGNAL",
+                    `[RPC][REMINDER] Chainlink ticks are missing/stale (fallback likely active). Set a real Polygon RPC URL in POLYGON_RPC_URL or RPC_URL (no YOUR_KEY/YOUR_PROXY_URL placeholders). Current window starts may still trade using RTDS/cache.`
+                  );
+                }
+              } else {
+                this.chainlinkMissingStreak = 0;
+              }
+
+              this.logOracleSourceIfChanged(chainlinkAssetsToPoll);
             }
 
             this.multiSlotBooks = Object.fromEntries(entries);
@@ -2298,7 +2551,9 @@ export class TradingEngine {
                       this.oracleWindowTrackedByAsset.set(assetUpper, ws);
                       this.log(
                         "SIGNAL",
-                        `[CHAINLINK] strike captured asset=${assetUpper} windowSec=${ws} price=$${tick.price.toFixed(2)}`
+                        `[CHAINLINK] strike captured asset=${assetUpper} windowSec=${ws} price=$${tick.price.toFixed(
+                          2
+                        )} source=chainlink`
                       );
                       // Ensure oracle spot uses Chainlink for this asset during the window.
                       this.chainlinkUsdByAsset.set(assetUpper, tick);
@@ -2307,6 +2562,9 @@ export class TradingEngine {
                       const spotAnchor = this.lastSpotUsdByAsset.get(assetUpper);
                       const fallbackSpot =
                         rtdsSpot != null ? rtdsSpot : spotAnchor != null ? spotAnchor : null;
+                      const hasRtdsSpot = rtdsSpot != null && Number.isFinite(rtdsSpot) && rtdsSpot > 0;
+                      const hasCacheSpot = spotAnchor != null && Number.isFinite(spotAnchor) && spotAnchor > 0;
+                      const source = hasRtdsSpot ? "rtds" : hasCacheSpot ? "cache" : "—";
                       this.chainlinkUsdByAsset.delete(assetUpper);
                       if (fallbackSpot != null && Number.isFinite(fallbackSpot) && fallbackSpot > 0) {
                         this.priceToBeatByAsset.set(assetUpper, fallbackSpot);
@@ -2314,9 +2572,9 @@ export class TradingEngine {
                       }
                       this.log(
                         "SIGNAL",
-                        `[CHAINLINK][STALE] asset=${assetUpper} ageMs=${ageMs} > ${staleMs} — fallback strike=$${(fallbackSpot ?? NaN).toFixed(
-                          2
-                        )} (windowSec=${ws})`
+                        `[CHAINLINK][STALE] asset=${assetUpper} ageMs=${ageMs} > ${staleMs} — fallback strike=$${(
+                          fallbackSpot ?? NaN
+                        ).toFixed(2)} (source=${source}, windowSec=${ws})`
                       );
                     }
                   } else {
@@ -2325,6 +2583,9 @@ export class TradingEngine {
                     const spotAnchor = this.lastSpotUsdByAsset.get(assetUpper);
                     const fallbackSpot =
                       rtdsSpot != null ? rtdsSpot : spotAnchor != null ? spotAnchor : null;
+                    const hasRtdsSpot = rtdsSpot != null && Number.isFinite(rtdsSpot) && rtdsSpot > 0;
+                    const hasCacheSpot = spotAnchor != null && Number.isFinite(spotAnchor) && spotAnchor > 0;
+                    const source = hasRtdsSpot ? "rtds" : hasCacheSpot ? "cache" : "—";
                     this.chainlinkUsdByAsset.delete(assetUpper);
                     if (fallbackSpot != null && Number.isFinite(fallbackSpot) && fallbackSpot > 0) {
                       this.priceToBeatByAsset.set(assetUpper, fallbackSpot);
@@ -2332,9 +2593,9 @@ export class TradingEngine {
                     }
                     this.log(
                       "SIGNAL",
-                      `[CHAINLINK][MISSING] asset=${assetUpper} no tick — fallback strike=$${(fallbackSpot ?? NaN).toFixed(
-                        2
-                      )} (windowSec=${ws})`
+                      `[CHAINLINK][MISSING] asset=${assetUpper} no tick — fallback strike=$${(
+                        fallbackSpot ?? NaN
+                      ).toFixed(2)} (source=${source}, windowSec=${ws})`
                     );
                   }
                 }

@@ -1,4 +1,5 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState, type CSSProperties, type ReactElement } from "react";
+import siteBackgroundUrl from "./assets/site-background.png";
 import {
   CartesianGrid,
   Line,
@@ -26,17 +27,45 @@ import { downloadBetLogsCsv, downloadLiveLogsCsv } from "./csvExport";
 import type {
   BetLogEntry,
   BotStatus,
+  DashboardEntryStrategyId,
   Direction,
+  EntryStrategyState,
   Insights,
   MarketOption,
   MarketPoint,
   Mode,
+  PingResponse,
   PolymarketAccountSummary,
   Prediction,
   Trade,
+  TradeLogQueryResponse,
+  TradeLogRow,
   TradingState,
-  WalletSummary
+  WalletSummary,
+  RiskSettingsSnapshot
 } from "./types";
+import {
+  CopyProMainNav,
+  CopyProMetricsRow,
+  CopyProTopBar,
+  OverviewSubNav,
+  RiskBetSettingsModal,
+  SnipeAssetCardsRow,
+  StrategyModulesStrip,
+  type OverviewSubTab
+} from "./copyProUi";
+import { SettingsScreenPoly, StrategyConfigScreen, WizardScreenPoly } from "./polySnipeScreens";
+import type { SnipeRoute } from "./snipeUi";
+
+/** Vite resolves the PNG URL; gradient kept lighter so dark artwork stays visible. */
+const appShellBackground: CSSProperties = {
+  backgroundColor: "#050508",
+  backgroundImage: `linear-gradient(160deg, rgba(5, 5, 8, 0.48) 0%, rgba(5, 5, 8, 0.58) 38%, rgba(5, 5, 8, 0.7) 100%), url(${siteBackgroundUrl})`,
+  backgroundSize: "cover",
+  backgroundPosition: "center top",
+  backgroundRepeat: "no-repeat",
+  backgroundAttachment: "scroll"
+};
 
 type LogLevel = "WIN" | "ERROR" | "SIGNAL" | "TRADE";
 
@@ -52,6 +81,12 @@ interface InspectionLine {
   ts: number;
   kind: InspectionKind;
   text: string;
+}
+
+type TradeLogPreset = "today" | "yesterday" | "7d" | "30d" | "custom";
+
+function dayStartLocal(d = new Date()): Date {
+  return new Date(d.getFullYear(), d.getMonth(), d.getDate(), 0, 0, 0, 0);
 }
 
 type PortfolioRange = "1m" | "1h" | "day" | "month" | "year";
@@ -73,21 +108,62 @@ function readMmAutoExitEnv() {
   };
 }
 
+function tradePnlUsd(t: Trade): number {
+  const x = Number(t.pnl);
+  return Number.isFinite(x) ? x : 0;
+}
+
+/** CLOB mid (0–1) → display % (e.g. 0.52 → 52.00). */
+function fmtEntryMidPct(v: number | undefined): string {
+  if (v == null || !Number.isFinite(v)) return "—";
+  return (v * 100).toFixed(2);
+}
+
+function isPaperNoFill(t: Trade): boolean {
+  return Boolean(t.paper?.missed);
+}
+
 function calcStats(trades: Trade[]) {
-  const wins = trades.filter((t) => t.status === "WIN");
-  const losses = trades.filter((t) => t.status === "LOSS");
-  const grossWin = wins.reduce((a, b) => a + Math.max(0, b.pnl), 0);
-  const grossLoss = losses.reduce((a, b) => a + Math.abs(Math.min(0, b.pnl)), 0);
-  const winRate = trades.length ? (wins.length / trades.length) * 100 : 0;
+  const settled = trades.filter((t) => !t.paper?.missed);
+  const wins = settled.filter((t) => t.status === "WIN");
+  const losses = settled.filter((t) => t.status === "LOSS");
+  const grossWin = wins.reduce((a, b) => a + Math.max(0, tradePnlUsd(b)), 0);
+  const grossLoss = losses.reduce((a, b) => a + Math.abs(Math.min(0, tradePnlUsd(b))), 0);
+  const winRate = settled.length ? (wins.length / settled.length) * 100 : 0;
   const profitFactor = grossLoss > 0 ? grossWin / grossLoss : grossWin;
-  const net = trades.reduce((a, b) => a + b.pnl, 0);
+  const net = settled.reduce((a, b) => a + tradePnlUsd(b), 0);
   return { winRate, profitFactor, net, grossWin, grossLoss };
 }
 
-/** Polymarket-style right-axis ticks in $25 steps. */
-const Y_TICK_USD = 25;
+/** Safe numeric display for API / websocket payloads that may omit or corrupt fields. */
+function fmtNum(n: unknown, digits: number): string {
+  const x = typeof n === "number" ? n : Number(n);
+  return Number.isFinite(x) ? x.toFixed(digits) : "—";
+}
 
-function buildYTicksUsd25(points: MarketPoint[], anchorUsd?: number | null): number[] {
+function formatBookRefreshAge(seconds: number | null | undefined): string {
+  if (seconds == null || !Number.isFinite(seconds)) return "—";
+  if (seconds < 3) return "just now";
+  if (seconds < 60) return `${seconds}s ago`;
+  const m = Math.floor(seconds / 60);
+  return `${m}m ago`;
+}
+
+function yTickStepUsd(mid: number): number {
+  if (!Number.isFinite(mid) || mid <= 0) return 25;
+  if (mid >= 20_000) return 25;
+  if (mid >= 5_000) return 10;
+  if (mid >= 1_000) return 5;
+  if (mid >= 200) return 2;
+  if (mid >= 50) return 1;
+  if (mid >= 10) return 0.5;
+  if (mid >= 1) return 0.1;
+  if (mid >= 0.2) return 0.02;
+  return 0.01;
+}
+
+/** Right-axis ticks scaled to spot magnitude (BTC → ~$25 steps; alts / memes → tighter). */
+function buildAdaptiveYTicks(points: MarketPoint[], anchorUsd?: number | null): number[] {
   const prices = points.map((p) => p.btcUsd).filter((v): v is number => v != null && Number.isFinite(v));
   if (prices.length === 0) return [];
   let min = Math.min(...prices);
@@ -96,12 +172,153 @@ function buildYTicksUsd25(points: MarketPoint[], anchorUsd?: number | null): num
     min = Math.min(min, anchorUsd);
     max = Math.max(max, anchorUsd);
   }
-  const pad = 100;
-  const low = Math.floor((min - pad) / Y_TICK_USD) * Y_TICK_USD;
-  const high = Math.ceil((max + pad) / Y_TICK_USD) * Y_TICK_USD;
+  const mid = (min + max) / 2;
+  const step = yTickStepUsd(mid);
+  const pad = step * 5;
+  const low = Math.floor((min - pad) / step) * step;
+  const high = Math.ceil((max + pad) / step) * step;
   const ticks: number[] = [];
-  for (let t = low; t <= high; t += Y_TICK_USD) ticks.push(t);
+  let t = low;
+  let n = 0;
+  const maxTicks = 72;
+  while (t <= high + step * 0.001 && n < maxTicks) {
+    ticks.push(Number(Number(t).toFixed(10)));
+    t += step;
+    n += 1;
+  }
   return ticks;
+}
+
+function formatUsdSpot(n: number): string {
+  if (n >= 1000) return n.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  if (n >= 1) return n.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 4 });
+  return n.toLocaleString(undefined, { minimumFractionDigits: 4, maximumFractionDigits: 6 });
+}
+
+const ASSET_CHART_STROKE: Record<string, string> = {
+  BTC: "#F7931A",
+  ETH: "#627EEA",
+  SOL: "#9945FF",
+  XRP: "#38B6FF",
+  DOGE: "#C2A633"
+};
+
+function chartStrokeForAsset(a: string): string {
+  return ASSET_CHART_STROKE[a.toUpperCase()] ?? "#94a3b8";
+}
+
+function AssetSpotChartCard({
+  asset,
+  points,
+  stroke
+}: {
+  asset: string;
+  points: MarketPoint[];
+  stroke: string;
+}): ReactElement {
+  const last = points[points.length - 1];
+  const target = last?.btcTargetUsd ?? null;
+  const spot = last?.btcUsd;
+  const yTicks = useMemo(() => buildAdaptiveYTicks(points, target ?? null), [points, target]);
+  const xTicks = useMemo(() => buildXTickTimes(points, 8), [points]);
+  const yDomain = useMemo((): [number, number] | undefined => {
+    if (yTicks.length < 2) return undefined;
+    return [yTicks[0], yTicks[yTicks.length - 1]];
+  }, [yTicks]);
+
+  return (
+    <div className="flex min-h-0 flex-col rounded-lg border border-slate-800 bg-[#0f1114] p-3">
+      <div className="mb-2 flex flex-wrap items-baseline justify-between gap-2">
+        <span className="text-sm font-bold tracking-tight text-white">{asset}</span>
+        {spot != null && Number.isFinite(spot) ? (
+          <div className="flex flex-wrap items-baseline gap-x-2 gap-y-0 text-xs">
+            <span className="text-lg font-semibold text-white">{formatUsdSpot(spot)}</span>
+            {target != null && Number.isFinite(target) ? (
+              <>
+                <span className="text-slate-500">Target</span>
+                <span className="font-mono text-slate-200">{formatUsdSpot(target)}</span>
+                <span
+                  className={
+                    spot - target >= 0 ? "font-medium text-emerald-400" : "font-medium text-rose-400"
+                  }
+                >
+                  {spot - target >= 0 ? "+" : ""}
+                  {formatUsdSpot(spot - target)}
+                </span>
+              </>
+            ) : null}
+          </div>
+        ) : (
+          <span className="text-xs text-slate-500">No spot yet</span>
+        )}
+      </div>
+      {points.length > 0 && points.some((p) => p.btcUsd != null) ? (
+        <div className="h-[240px] min-h-[220px] w-full flex-1">
+          <ResponsiveContainer width="100%" height="100%">
+            <LineChart data={points} margin={{ top: 8, right: 48, left: 2, bottom: 4 }}>
+              <CartesianGrid stroke="#1a1d22" strokeOpacity={0.9} vertical={false} />
+              <XAxis
+                dataKey="time"
+                stroke="#52525b"
+                tick={{ fill: "#a1a1aa", fontSize: 10 }}
+                ticks={xTicks}
+                interval={0}
+              />
+              <YAxis
+                orientation="right"
+                stroke="#52525b"
+                tick={{ fill: "#a1a1aa", fontSize: 10 }}
+                ticks={yTicks}
+                domain={yDomain ?? ["auto", "auto"]}
+                tickFormatter={(v) => (typeof v === "number" ? formatUsdSpot(v) : String(v))}
+                width={56}
+              />
+              {target != null && Number.isFinite(target) ? (
+                <ReferenceLine
+                  y={target}
+                  stroke="rgba(255,255,255,0.88)"
+                  strokeDasharray="4 4"
+                  label={{
+                    value: "Target",
+                    position: "right",
+                    fill: "#cbd5e1",
+                    fontSize: 10,
+                    fontWeight: 500
+                  }}
+                />
+              ) : null}
+              <Tooltip
+                contentStyle={{ background: "#1a1d23", border: "1px solid #334155", borderRadius: 8 }}
+                formatter={(v: number | string) => [
+                  typeof v === "number" ? formatUsdSpot(v) : v,
+                  asset
+                ]}
+                labelFormatter={(l) => String(l)}
+              />
+              <Line
+                type="monotone"
+                dataKey="btcUsd"
+                stroke={stroke}
+                strokeWidth={2}
+                dot={(props: { cx?: number; cy?: number; index?: number }) => {
+                  const { cx, cy, index } = props;
+                  if (cx == null || cy == null || index !== points.length - 1) return <g />;
+                  return <circle cx={cx} cy={cy} r={3} fill={stroke} stroke={stroke} />;
+                }}
+                activeDot={{ r: 4, fill: stroke, stroke: "#fff", strokeWidth: 1 }}
+                isAnimationActive={false}
+                connectNulls
+              />
+            </LineChart>
+          </ResponsiveContainer>
+        </div>
+      ) : (
+        <div className="flex min-h-[220px] flex-1 items-center justify-center rounded-md bg-[#0a0c10] text-xs text-slate-500">
+          Loading {asset} spot…
+        </div>
+      )}
+    </div>
+  );
 }
 
 /** Subsample time labels so the axis stays readable (underlying data stays full resolution). */
@@ -119,6 +336,7 @@ function buildXTickTimes(points: MarketPoint[], maxLabels = 12): string[] {
 
 export function App() {
   const [chartData, setChartData] = useState<MarketPoint[]>([]);
+  const [assetCharts, setAssetCharts] = useState<Record<string, MarketPoint[]>>({});
   const [prediction, setPrediction] = useState<Prediction | null>(null);
   const [logs, setLogs] = useState<LogEntry[]>([]);
   const [betLogs, setBetLogs] = useState<BetLogEntry[]>([]);
@@ -135,6 +353,7 @@ export function App() {
   const [markets, setMarkets] = useState<MarketOption[]>([]);
   const [selectedTokenID, setSelectedTokenID] = useState("");
   const [insights, setInsights] = useState<Insights | null>(null);
+  const insightsDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [loginHint, setLoginHint] = useState("Step 1: login with User ID and Password. Step 2: Start Bot.");
   const [showWalletHelp, setShowWalletHelp] = useState(false);
   const [showPasswordLogin, setShowPasswordLogin] = useState(false);
@@ -146,17 +365,228 @@ export function App() {
   const [inspectionLogs, setInspectionLogs] = useState<InspectionLine[]>([]);
   const [modeToggleLoading, setModeToggleLoading] = useState(false);
   const [tradingState, setTradingState] = useState<TradingState | null>(null);
+  const [assetAutoTradeBusy, setAssetAutoTradeBusy] = useState<string | null>(null);
   const [metaMaskOrderBusy, setMetaMaskOrderBusy] = useState(false);
   const [metaMaskConnected, setMetaMaskConnected] = useState(false);
   const [metaMaskAddress, setMetaMaskAddress] = useState<string | null>(null);
-  const [metaMaskAutoEnabled, setMetaMaskAutoEnabled] = useState(true);
+  /** Default off so server LIVE (“Go LIVE”) works without hunting for a checkbox; enable when you want client-signed orders only. */
+  const [metaMaskAutoEnabled, setMetaMaskAutoEnabled] = useState(false);
   const lastAutoMetaMaskTsRef = useRef(0);
   const lastMetaMaskTradeIdRef = useRef<string | null>(null);
+  /** First `/trading-state` response: align Execution & size with server risk (avoids stale default $1). */
+  const didBootstrapAmountFromServerRef = useRef(false);
   const mmAutoExitAbortRef = useRef<AbortController | null>(null);
   const [metaMaskPolymarketUsdc, setMetaMaskPolymarketUsdc] = useState<number | null>(null);
   const [metaMaskUsdcLoading, setMetaMaskUsdcLoading] = useState(false);
   const [capitalPctPerEntry, setCapitalPctPerEntry] = useState<number>(10);
   const [amountSource, setAmountSource] = useState<"PERCENT" | "MANUAL">("MANUAL");
+  const [snipeRoute, setSnipeRoute] = useState<SnipeRoute>("dashboard");
+  const [overviewSub, setOverviewSub] = useState<OverviewSubTab>("live");
+  const [riskModalOpen, setRiskModalOpen] = useState(false);
+  const [riskModalBusy, setRiskModalBusy] = useState(false);
+  const [riskModalError, setRiskModalError] = useState<string | null>(null);
+  const [pingData, setPingData] = useState<PingResponse | null>(null);
+  const [pingBusy, setPingBusy] = useState(false);
+  const [tradeLogPreset, setTradeLogPreset] = useState<TradeLogPreset>("today");
+  const [tradeLogFrom, setTradeLogFrom] = useState<string>(() => dayStartLocal().toISOString().slice(0, 10));
+  const [tradeLogTo, setTradeLogTo] = useState<string>(() => dayStartLocal().toISOString().slice(0, 10));
+  const [tradeLogAsset, setTradeLogAsset] = useState<string>("ALL");
+  const [tradeLogStrategy, setTradeLogStrategy] = useState<string>("ALL");
+  const [tradeLogSession, setTradeLogSession] = useState<"24h" | "AM" | "PM">("24h");
+  const [tradeLogLoading, setTradeLogLoading] = useState(false);
+  const [tradeLogRows, setTradeLogRows] = useState<TradeLogRow[]>([]);
+  const [tradeLogStats, setTradeLogStats] = useState<TradeLogQueryResponse["stats"] | null>(null);
+
+  const defaultRiskSnapshot = useMemo(
+    (): RiskSettingsSnapshot => ({
+      entryUsd: 1,
+      minTrade: 1,
+      maxTrade: 300,
+      stopLossUsd: 300,
+      cooldownMs: 1500,
+      env: {
+        entryUsd: 1,
+        minTrade: 1,
+        maxTrade: 300,
+        stopLossUsd: 300,
+        cooldownMs: 1500
+      },
+      overridesActive: false
+    }),
+    []
+  );
+
+  const riskSettingsForUi = tradingState?.riskSettings ?? defaultRiskSnapshot;
+
+  const defaultEntryStrategy = useMemo<EntryStrategyState>(
+    () => ({
+      effective: "momentum",
+      runtimeOverride: null,
+      fromEnv: "momentum",
+      label: "Momentum (chart trend)"
+    }),
+    []
+  );
+  const entryStrategyUi = tradingState?.entryStrategy ?? defaultEntryStrategy;
+  const [entryStrategyBusy, setEntryStrategyBusy] = useState(false);
+
+  const applyEntryStrategy = async (patch: { reset?: boolean; strategy?: DashboardEntryStrategyId }) => {
+    if (!isLoggedIn) {
+      setLoginHint("Sign in to change entry strategy.");
+      setShowPasswordLogin(true);
+      return;
+    }
+    setEntryStrategyBusy(true);
+    try {
+      const out = await api.setEntryStrategy(patch);
+      setTradingState((prev) => (prev ? { ...prev, entryStrategy: out.entryStrategy } : prev));
+      setLoginHint(
+        patch.reset
+          ? "Entry strategy follows server .env again."
+          : `Entry strategy: ${out.entryStrategy.label}.`
+      );
+    } catch (e) {
+      setLoginHint(e instanceof Error ? e.message : String(e));
+    } finally {
+      setEntryStrategyBusy(false);
+    }
+  };
+
+  const [lagSnipeBusy, setLagSnipeBusy] = useState(false);
+  const lagSnipeOn = Boolean(tradingState?.lagSnipeEnabled ?? tradingState?.liveEngine?.lagSnipeEnabled);
+  const [spotPolyLagBusy, setSpotPolyLagBusy] = useState(false);
+  const spotPolyLagOn = entryStrategyUi.effective === "spot_poly_lag";
+  const [spotPolyLagStatus, setSpotPolyLagStatus] = useState<{
+    ob_signal?: string;
+    ob_ratio?: string;
+    clob_ask?: string;
+    clob_spread?: string;
+    clob_depth?: string;
+  }>({});
+
+  const applyLagSnipe = async (enabled: boolean) => {
+    if (!isLoggedIn) {
+      setLoginHint("Sign in to toggle Lag Snipe.");
+      setShowPasswordLogin(true);
+      return;
+    }
+    setLagSnipeBusy(true);
+    try {
+      const out = await api.setLagSnipe(enabled);
+      setTradingState((prev) =>
+        prev
+          ? {
+              ...prev,
+              lagSnipeEnabled: out.lagSnipeEnabled,
+              lagSnipeBanner: out.banner,
+              liveEngine: prev.liveEngine
+                ? { ...prev.liveEngine, lagSnipeEnabled: out.lagSnipeEnabled }
+                : prev.liveEngine
+            }
+          : prev
+      );
+      setLoginHint(
+        out.lagSnipeEnabled
+          ? "Lag Snipe ON — BTC 5m, last ~30s entries only; auto-exit off (manual hold)."
+          : "Lag Snipe OFF — normal strategies and auto-exit restored."
+      );
+    } catch (e) {
+      setLoginHint(e instanceof Error ? e.message : String(e));
+    } finally {
+      setLagSnipeBusy(false);
+    }
+  };
+
+  const applySpotPolyLag = async (enabled: boolean) => {
+    if (!isLoggedIn) {
+      setLoginHint("Sign in to toggle Spot-Poly Lag.");
+      setShowPasswordLogin(true);
+      return;
+    }
+    setSpotPolyLagBusy(true);
+    try {
+      const out = await api.setSpotPolyLag(enabled);
+      setTradingState((prev) =>
+        prev
+          ? {
+              ...prev,
+              entryStrategy: out.entryStrategy,
+              spotPolyLagEnabled: Boolean(out.spotPolyLagEnabled),
+              liveEngine: prev.liveEngine
+                ? { ...prev.liveEngine, spotPolyLagEnabled: Boolean(out.spotPolyLagEnabled) }
+                : prev.liveEngine
+            }
+          : prev
+      );
+      setLoginHint(Boolean(out.spotPolyLagEnabled) ? "Spot-Poly Lag ON." : "Spot-Poly Lag OFF.");
+    } catch (e) {
+      setLoginHint(e instanceof Error ? e.message : String(e));
+    } finally {
+      setSpotPolyLagBusy(false);
+    }
+  };
+
+  const applyRiskSettings = async (patch: {
+    reset?: boolean;
+    entryUsd?: number;
+    minTrade?: number;
+    maxTrade?: number;
+    stopLossUsd?: number;
+    cooldownMs?: number;
+  }) => {
+    setRiskModalError(null);
+    setRiskModalBusy(true);
+    try {
+      const out = await api.setRiskSettings(patch);
+      setTradingState((prev) =>
+        prev ? { ...prev, riskSettings: out.riskSettings } : prev
+      );
+      setAmount(out.riskSettings.entryUsd);
+      setAmountSource("MANUAL");
+      void api.status().then(setStatus);
+      setRiskModalOpen(false);
+      setLoginHint(
+        patch.reset
+          ? "Risk settings reset to server .env defaults."
+          : `Risk updated: entry $${out.riskSettings.entryUsd} · min $${out.riskSettings.minTrade} · max $${out.riskSettings.maxTrade}.`
+      );
+    } catch (e) {
+      setRiskModalError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setRiskModalBusy(false);
+    }
+  };
+
+  const persistRiskSettingsToEnv = async (values: {
+    entryUsd: number;
+    minTrade: number;
+    maxTrade: number;
+    stopLossUsd: number;
+    cooldownMs: number;
+  }) => {
+    setRiskModalError(null);
+    setRiskModalBusy(true);
+    try {
+      const out = await api.persistRiskSettingsToEnv(values);
+      setTradingState((prev) =>
+        prev ? { ...prev, riskSettings: out.riskSettings } : prev
+      );
+      setAmount(out.riskSettings.entryUsd);
+      setAmountSource("MANUAL");
+      void api.status().then(setStatus);
+      setRiskModalOpen(false);
+      setLoginHint(
+        `Saved to server/.env: entry $${out.riskSettings.entryUsd} · min $${out.riskSettings.minTrade} · max $${out.riskSettings.maxTrade} · stop $${out.riskSettings.stopLossUsd} · cd ${out.riskSettings.cooldownMs}ms.`
+      );
+    } catch (e) {
+      setRiskModalError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setRiskModalBusy(false);
+    }
+  };
+
+  const sessionIdsBeforeStartRef = useRef<Set<string>>(new Set());
+  const [runningSince, setRunningSince] = useState<Date | null>(null);
 
   /** Prefer MetaMask CLOB read when present; else server CLOB USDC (LIVE); else bot paper balance. */
   const capitalUsd = metaMaskPolymarketUsdc ?? wallet?.polymarketUsdc ?? status?.balance ?? 0;
@@ -182,6 +612,24 @@ export function App() {
   };
   const pushInspectionUi = (text: string) => {
     setInspectionLogs((prev) => [{ ts: Date.now(), kind: "ui" as const, text }, ...prev].slice(0, 400));
+  };
+
+  const runConnectivityPings = async () => {
+    setPingBusy(true);
+    try {
+      const p = await api.ping();
+      setPingData(p);
+      const failed = p.results.filter((r) => !r.ok).length;
+      pushLog(
+        "SIGNAL",
+        `Connectivity ping: ${p.results.length} checks, ${failed} failed (${new Date(p.ts).toLocaleTimeString()}).`
+      );
+    } catch (e) {
+      setPingData(null);
+      pushLog("ERROR", `Ping failed: ${e instanceof Error ? e.message : String(e)}`);
+    } finally {
+      setPingBusy(false);
+    }
   };
 
   /** Polymarket funder (proxy/Safe or EOA) — from server `/wallet` after login. */
@@ -258,26 +706,65 @@ export function App() {
     () => (historyFilter === "ALL" ? trades : trades.filter((t) => t.status === historyFilter)),
     [historyFilter, trades]
   );
-  const chartTargetUsd = chartData[chartData.length - 1]?.btcTargetUsd;
-  const chartYTicks = useMemo(
-    () => buildYTicksUsd25(chartData, chartTargetUsd ?? null),
-    [chartData, chartTargetUsd]
-  );
-  const chartXTickTimes = useMemo(() => buildXTickTimes(chartData, 12), [chartData]);
-  const chartYDomain = useMemo((): [number, number] | undefined => {
-    if (chartYTicks.length < 2) return undefined;
-    return [chartYTicks[0], chartYTicks[chartYTicks.length - 1]];
-  }, [chartYTicks]);
 
+  useEffect(() => {
+    const today = dayStartLocal();
+    if (tradeLogPreset === "today") {
+      const d = today.toISOString().slice(0, 10);
+      setTradeLogFrom(d);
+      setTradeLogTo(d);
+      return;
+    }
+    if (tradeLogPreset === "yesterday") {
+      const y = new Date(today.getTime() - 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+      setTradeLogFrom(y);
+      setTradeLogTo(y);
+      return;
+    }
+    if (tradeLogPreset === "7d") {
+      const from = new Date(today.getTime() - 6 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+      setTradeLogFrom(from);
+      setTradeLogTo(today.toISOString().slice(0, 10));
+      return;
+    }
+    if (tradeLogPreset === "30d") {
+      const from = new Date(today.getTime() - 29 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+      setTradeLogFrom(from);
+      setTradeLogTo(today.toISOString().slice(0, 10));
+    }
+  }, [tradeLogPreset]);
+
+  useEffect(() => {
+    if (snipeRoute !== "journal") return;
+    setTradeLogLoading(true);
+    void api
+      .tradeLogQuery({
+        from: tradeLogFrom,
+        to: tradeLogTo,
+        asset: tradeLogAsset,
+        strategy: tradeLogStrategy,
+        session: tradeLogSession
+      })
+      .then((r) => {
+        setTradeLogRows(r.rows);
+        setTradeLogStats(r.stats);
+      })
+      .catch(() => {
+        setTradeLogRows([]);
+        setTradeLogStats(null);
+      })
+      .finally(() => setTradeLogLoading(false));
+  }, [snipeRoute, tradeLogFrom, tradeLogTo, tradeLogAsset, tradeLogStrategy, tradeLogSession, trades.length]);
   const suggestion = useMemo(() => {
     const conf = prediction?.confidence ?? 0;
     const pred = prediction?.prediction ?? "UP";
+    const primarySym = tradingState?.updownAssetsConfigured?.[0] ?? "BTC";
     if (prediction?.recommendation === "NO_TRADE") {
       return `No trade now: ${prediction.reason ?? "risk filter active"}.`;
     }
 
     if (chartData.length < 3) {
-      return "Waiting for live BTC data to generate investment suggestion.";
+      return `Waiting for live ${primarySym} data to generate investment suggestion.`;
     }
 
     const recent = chartData.slice(-6);
@@ -294,10 +781,10 @@ export function App() {
 
     if (firstPx != null && lastPx != null) {
       if (delta <= -12) {
-        return `BTC moved down ($${delta.toFixed(2)} over recent ticks). Suggestion: invest on DOWN.`;
+        return `${primarySym} moved down ($${delta.toFixed(2)} over recent ticks). Suggestion: invest on DOWN.`;
       }
       if (delta >= 12) {
-        return `BTC moved up (+$${delta.toFixed(2)} over recent ticks). Suggestion: invest on UP.`;
+        return `${primarySym} moved up (+$${delta.toFixed(2)} over recent ticks). Suggestion: invest on UP.`;
       }
     } else if (delta <= -1.2) {
       return `Market is dropping (${delta.toFixed(2)}). Suggestion: invest on DOWN.`;
@@ -310,7 +797,16 @@ export function App() {
     }
 
     return `Moderate signal (${conf.toFixed(0)}%): use small amount or wait for a clearer move.`;
-  }, [prediction, chartData]);
+  }, [prediction, chartData, tradingState?.updownAssetsConfigured]);
+
+  const chartAssetsList = useMemo(() => {
+    const cfg = tradingState?.updownAssetsConfigured;
+    if (cfg && cfg.length > 0) return cfg;
+    const keys = Object.keys(assetCharts).filter((k) => (assetCharts[k]?.length ?? 0) > 0);
+    return keys.sort();
+  }, [tradingState?.updownAssetsConfigured, assetCharts]);
+
+  const chartPrimaryAsset = tradingState?.updownAssetsConfigured?.[0] ?? chartAssetsList[0] ?? "BTC";
   const selectedMarketLabel = useMemo(
     () => markets.find((m) => m.tokenID === selectedTokenID)?.label ?? "BTC 5s Market",
     [markets, selectedTokenID]
@@ -319,7 +815,7 @@ export function App() {
     if (!status) return [];
     const ordered = [...trades].reverse();
     const realizedPnl = ordered.reduce((sum, t) => sum + (t.status === "PENDING" ? 0 : t.pnl), 0);
-    let balance = status.balance - realizedPnl;
+    let balance = Number(status.balance ?? 0) - realizedPnl;
     const now = Date.now();
     return ordered.map((t, idx) => {
       if (t.status !== "PENDING") balance += t.pnl;
@@ -357,32 +853,56 @@ export function App() {
 
   useEffect(() => {
     const loadInitial = async () => {
-      const [s, t, w, m, i] = await Promise.all([api.status(), api.trades(), api.wallet(), api.markets(), api.insights()]);
-      setStatus(s);
-      setTrades(t);
-      setWallet(w);
-      setMarkets(m);
-      setSelectedTokenID(m[0]?.tokenID ?? "");
-      setInsights(i);
+      const errors: string[] = [];
+      const run = async <T,>(label: string, p: Promise<T>, fallback: T): Promise<T> => {
+        try {
+          return await p;
+        } catch (e) {
+          const msg = e instanceof Error ? e.message : String(e);
+          errors.push(`${label}: ${msg}`);
+          return fallback;
+        }
+      };
+
+      const s = await run("status", api.status(), null as BotStatus | null);
+      const t = await run("trades", api.trades(), [] as Trade[]);
+      const w = await run("wallet", api.wallet(), null as WalletSummary | null);
+      const m = await run("markets", api.markets(), [] as MarketOption[]);
+      const i = await run("insights", api.insights(), null as Insights | null);
+
+      if (s) setStatus(s);
+      setTrades(Array.isArray(t) ? t : []);
+      if (w) setWallet(w);
+      setMarkets(Array.isArray(m) ? m : []);
+      setSelectedTokenID(Array.isArray(m) && m[0]?.tokenID ? m[0].tokenID : "");
+      if (i) setInsights(i);
+
+      if (errors.length > 0) {
+        setLoginHint(
+          `Some API calls failed (${errors.length}). Is the server running on :4000? ${errors[0]?.slice(0, 120) ?? ""}`
+        );
+        console.error("[PolyBot] loadInitial", errors);
+      }
+
       try {
         const me = await api.authMe();
         if (me.authenticated) {
           if (me.authType === "wallet" && me.address) setWalletAddress(me.address);
           if (me.authType === "password" && me.userId) setWalletAddress(`user:${me.userId}`);
           setIsLoggedIn(true);
-          setLoginHint("Logged in and ready to invest.");
+          if (errors.length === 0) setLoginHint("Logged in and ready to invest.");
         } else {
           localStorage.removeItem("polybot_auth_token");
           setIsLoggedIn(false);
-          setLoginHint("Session mismatch. Reconnect your allowed wallet.");
+          setLoginHint("Session mismatch. Sign in again (User ID / Password or wallet).");
         }
       } catch {
         localStorage.removeItem("polybot_auth_token");
         setIsLoggedIn(false);
-        setLoginHint("Login required before investing.");
+        if (errors.length === 0) setLoginHint("Login required before investing.");
       }
     };
-    loadInitial().catch(console.error);
+    void loadInitial();
   }, []);
 
   useEffect(() => {
@@ -393,19 +913,70 @@ export function App() {
   }, []);
 
   useEffect(() => {
-    const tick = () => api.tradingState().then(setTradingState).catch(() => undefined);
+    const tick = () =>
+      api
+        .tradingState()
+        .then((ts) => {
+          setTradingState(ts);
+          if (!didBootstrapAmountFromServerRef.current && amountSource === "MANUAL") {
+            const se = ts.riskSettings?.entryUsd;
+            if (se != null && Number.isFinite(se) && se > 0) {
+              didBootstrapAmountFromServerRef.current = true;
+              setAmount(se);
+            }
+          }
+          if (ts.liveEngine) {
+            const le = ts.liveEngine;
+            setStatus((prev) => {
+              if (!prev) return prev;
+              if (
+                prev.running === le.running &&
+                prev.autoTrading === le.autoTrading &&
+                prev.phase === le.phase &&
+                prev.phaseReason === le.phaseReason
+              ) {
+                return prev;
+              }
+              return {
+                ...prev,
+                running: le.running,
+                autoTrading: le.autoTrading,
+                phase: le.phase,
+                phaseReason: le.phaseReason
+              };
+            });
+          }
+          if (ts.predictionLive) {
+            const pl = ts.predictionLive;
+            setPrediction((prev) => {
+              if (prev && pl.ts < prev.ts) return prev;
+              return {
+                prediction: pl.prediction,
+                confidence: pl.confidence,
+                ts: pl.ts,
+                recommendation: pl.recommendation,
+                reason: pl.reason
+              };
+            });
+          }
+          if (ts.executionMode === "LIVE") {
+            void api.wallet().then(setWallet).catch(() => undefined);
+          }
+        })
+        .catch(() => undefined);
     tick();
-    const id = setInterval(tick, 5000);
+    const id = setInterval(tick, 4000);
     return () => clearInterval(id);
   }, []);
 
   useEffect(() => {
-    if (status?.mode !== "LIVE") return;
-    const refreshPm = () => api.wallet().then(setWallet).catch(() => undefined);
-    refreshPm();
-    const id = setInterval(refreshPm, 15000);
-    return () => clearInterval(id);
-  }, [status?.mode]);
+    return () => {
+      if (insightsDebounceRef.current) {
+        clearTimeout(insightsDebounceRef.current);
+        insightsDebounceRef.current = null;
+      }
+    };
+  }, []);
 
   useEffect(() => {
     const ws = new WebSocket(WS_URL);
@@ -414,17 +985,52 @@ export function App() {
     ws.onerror = () => setWsConnected(false);
     ws.onmessage = (ev) => {
       const msg = JSON.parse(ev.data);
-      if (msg.type === "market") setChartData(msg.payload);
+      if (msg.type === "market") {
+        const p = msg.payload;
+        if (Array.isArray(p)) {
+          setChartData(p);
+          setAssetCharts({});
+        } else if (p && typeof p === "object") {
+          const pack = p as { primary?: MarketPoint[]; byAsset?: Record<string, MarketPoint[]> };
+          setChartData(Array.isArray(pack.primary) ? pack.primary : []);
+          setAssetCharts(pack.byAsset && typeof pack.byAsset === "object" ? pack.byAsset : {});
+        }
+      }
       if (msg.type === "prediction") setPrediction(msg.payload);
-      if (msg.type === "trade") setTrades(msg.payload);
-      if (msg.type === "trade") api.insights().then(setInsights).catch(() => undefined);
+      if (msg.type === "trade") {
+        setTrades(msg.payload);
+        if (insightsDebounceRef.current) clearTimeout(insightsDebounceRef.current);
+        insightsDebounceRef.current = setTimeout(() => {
+          insightsDebounceRef.current = null;
+          void api.insights().then(setInsights).catch(() => undefined);
+        }, 250);
+      }
       if (msg.type === "status") {
         setStatus(msg.payload);
         if (msg.payload?.mode === "LIVE") {
           api.wallet().then(setWallet).catch(() => undefined);
         }
       }
-      if (msg.type === "log") setLogs((prev) => [msg.payload, ...prev].slice(0, 120));
+      if (msg.type === "log") {
+        setLogs((prev) => [msg.payload, ...prev].slice(0, 120));
+        const text = String(msg?.payload?.message ?? "");
+        if (text.includes("[SPL] OB:")) {
+          const ratio = text.match(/ratio=([0-9.]+)/)?.[1];
+          const signal = text.includes("BULLISH") ? "BULLISH" : text.includes("BEARISH") ? "BEARISH" : "NEUTRAL";
+          setSpotPolyLagStatus((prev) => ({ ...prev, ob_signal: signal, ob_ratio: ratio ?? prev.ob_ratio ?? "—" }));
+        }
+        if (text.includes("[SPL] CLOB:")) {
+          const ask = text.match(/ask=([0-9.]+)/)?.[1];
+          const spread = text.match(/spread=([0-9.]+%)/)?.[1];
+          const depth = text.match(/depth=([0-9.]+)/)?.[1];
+          setSpotPolyLagStatus((prev) => ({
+            ...prev,
+            clob_ask: ask ?? prev.clob_ask ?? "—",
+            clob_spread: spread ?? prev.clob_spread ?? "—",
+            clob_depth: depth ?? prev.clob_depth ?? "—"
+          }));
+        }
+      }
       if (msg.type === "betLogs") setBetLogs(Array.isArray(msg.payload) ? msg.payload : []);
       if (msg.type === "betLog") {
         const row = msg.payload as BetLogEntry;
@@ -439,14 +1045,12 @@ export function App() {
     return () => ws.close();
   }, []);
 
-  const doTrade = async () => {
-    pushLog("SIGNAL", "Auto-only mode enabled. Use Start Bot to let strategy place entries.");
-  };
-
   const MIN_TRADE_USD = 1;
 
-  /** MetaMask CLOB: size to available − reservations, post order, poll fill, confirm trade on server. */
-  const placeBetMetaMask = async (direction: "UP" | "DOWN", tradeId: string) => {
+  /** MetaMask CLOB: size from the server's PENDING trade (risk-sized), capped by wallet available USDC. */
+  const placeBetMetaMask = async (pending: Trade) => {
+    const direction = pending.direction;
+    const tradeId = pending.id;
     pushInspectionUi(`UI: Auto post MetaMask order (${direction}) trade=${tradeId.slice(0, 8)}…`);
     if (!isLoggedIn) {
       pushLog("ERROR", "Log in first (wallet or password).");
@@ -466,15 +1070,23 @@ export function App() {
 
       const budget = await getAvailableCollateralBudgetFromMetaMask(cfg as ClobSigningConfig);
       setMetaMaskPolymarketUsdc(budget.balanceUsdc);
-      let effAmount = Math.min(amount, budget.availableUsdc * 0.998);
+      const minUsd =
+        tradingState?.riskSettings?.minTrade != null &&
+        Number.isFinite(tradingState.riskSettings.minTrade) &&
+        tradingState.riskSettings.minTrade > 0
+          ? tradingState.riskSettings.minTrade
+          : MIN_TRADE_USD;
+      const serverUsd =
+        Number.isFinite(pending.amount) && pending.amount > 0 ? pending.amount : amount;
+      let effAmount = Math.min(serverUsd, budget.availableUsdc * 0.998);
       effAmount = Math.max(0, Number(effAmount.toFixed(2)));
       pushInspectionUi(
-        `UI: MetaMask collateral — balance $${budget.balanceUsdc.toFixed(2)} | reserved $${budget.reservedUsdc.toFixed(2)} | available $${budget.availableUsdc.toFixed(2)} → size $${effAmount}`
+        `UI: MetaMask collateral — balance $${budget.balanceUsdc.toFixed(2)} | reserved $${budget.reservedUsdc.toFixed(2)} | available $${budget.availableUsdc.toFixed(2)} → size $${effAmount} (server trade $${serverUsd.toFixed(2)})`
       );
-      if (effAmount < MIN_TRADE_USD) {
+      if (effAmount < minUsd) {
         pushLog(
           "ERROR",
-          `MetaMask: available USDC after open orders ($${budget.availableUsdc.toFixed(2)}) below min $${MIN_TRADE_USD}`
+          `MetaMask: available USDC after open orders ($${budget.availableUsdc.toFixed(2)}) below min $${minUsd}`
         );
         return;
       }
@@ -673,9 +1285,9 @@ export function App() {
             );
           }
           const budget2 = await getAvailableCollateralBudgetFromMetaMask(cfg as ClobSigningConfig);
-          let eff2 = Math.min(amount, budget2.availableUsdc * 0.998);
+          let eff2 = Math.min(serverUsd, budget2.availableUsdc * 0.998);
           eff2 = Math.max(0, Number(eff2.toFixed(2)));
-          if (eff2 < MIN_TRADE_USD) throw new Error("Available USDC still below min after re-approve");
+          if (eff2 < minUsd) throw new Error("Available USDC still below min after re-approve");
           await postAndReconcile(eff2);
         } else {
           throw orderErr;
@@ -839,8 +1451,15 @@ export function App() {
       // In Demo/SIMULATION, never use external execution; trades must auto-resolve.
       await api.setExternalExecution(Boolean(metaMaskAutoEnabled && liveMode));
       await api.start();
-      const s = await api.status();
+      sessionIdsBeforeStartRef.current = new Set(trades.map((t) => t.id));
+      setRunningSince(new Date());
+      const [s, ts] = await Promise.all([api.status(), api.tradingState()]);
       setStatus(s);
+      setTradingState(ts);
+      const se = ts.riskSettings?.entryUsd;
+      if (se != null && Number.isFinite(se) && se > 0 && amountSource === "MANUAL") {
+        setAmount(se);
+      }
       // Retry once on Start Bot when balance read is missing or appears stuck at 0.
       if (
         metaMaskAutoEnabled &&
@@ -867,8 +1486,8 @@ export function App() {
           setMetaMaskUsdcLoading(false);
         }
       }
-      pushLog("TRADE", "Bot started: directional momentum auto-trading active.");
-      setLoginHint("Bot is running. Auto-investing with momentum strategy.");
+      pushLog("TRADE", "Bot started: auto-trading active.");
+      setLoginHint("Bot is running. Auto-invest uses the entry strategy shown under Execution & size.");
     } catch (error) {
       pushLog("ERROR", error instanceof Error ? error.message : "Failed to start bot.");
     }
@@ -903,7 +1522,7 @@ export function App() {
     if (!pending) return;
     if (pending.id && pending.id === lastMetaMaskTradeIdRef.current) return;
     lastMetaMaskTradeIdRef.current = pending.id ?? null;
-    void placeBetMetaMask(pending.direction, pending.id);
+    void placeBetMetaMask(pending);
   }, [
     trades,
     status?.running,
@@ -922,7 +1541,7 @@ export function App() {
       await api.stop();
       const s = await api.status();
       setStatus(s);
-      pushLog("ERROR", "Bot stopped.");
+      pushLog("SIGNAL", "Bot stopped.");
       setLoginHint("Bot stopped. Start bot to resume automatic investing.");
     } catch (error) {
       pushLog("ERROR", error instanceof Error ? error.message : "Failed to stop bot.");
@@ -1139,6 +1758,47 @@ export function App() {
     await fetchPolymarketAccount("Refresh Polymarket → GET /wallet + /polymarket/clob/*");
   };
 
+  const sessionStats = useMemo(() => {
+    const baseline = sessionIdsBeforeStartRef.current;
+    const sessionTrades = trades.filter(
+      (t) => !baseline.has(t.id) && (t.status === "WIN" || t.status === "LOSS")
+    );
+    const pnl = sessionTrades.reduce((a, t) => a + tradePnlUsd(t), 0);
+    const wins = sessionTrades.filter((t) => t.status === "WIN").length;
+    const losses = sessionTrades.filter((t) => t.status === "LOSS").length;
+    const n = sessionTrades.length;
+    return { pnl, wins, losses, n, winRate: n ? (wins / n) * 100 : 0 };
+  }, [trades, runningSince, status?.running]);
+
+  const allTimePnl = useMemo(() => {
+    const settled = trades.filter((t) => t.status === "WIN" || t.status === "LOSS");
+    return settled.reduce((a, t) => a + tradePnlUsd(t), 0);
+  }, [trades]);
+
+  const wlCounts = useMemo(() => {
+    const settled = trades.filter((t) => t.status === "WIN" || t.status === "LOSS");
+    return {
+      w: settled.filter((t) => t.status === "WIN").length,
+      l: settled.filter((t) => t.status === "LOSS").length
+    };
+  }, [trades]);
+
+  const pnlCurveData = useMemo(() => {
+    const closed = trades.filter((t) => t.status === "WIN" || t.status === "LOSS");
+    const chrono = [...closed].reverse();
+    let cum = 0;
+    let hi = 0;
+    let lo = 0;
+    const pts: { idx: number; cum: number; t: string; win: boolean }[] = [];
+    chrono.forEach((t) => {
+      cum += tradePnlUsd(t);
+      hi = Math.max(hi, cum);
+      lo = Math.min(lo, cum);
+      pts.push({ idx: pts.length, cum, t: t.time, win: t.status === "WIN" });
+    });
+    return { pts, net: cum, hi, lo };
+  }, [trades]);
+
   const badgeClass = (badge: string) => {
     if (badge === "tradable") return "bg-emerald-500/25 text-emerald-200";
     if (badge === "wide_spread") return "bg-amber-500/25 text-amber-200";
@@ -1147,18 +1807,21 @@ export function App() {
     if (badge === "no_book") return "bg-slate-600 text-slate-300";
     return "bg-slate-600 text-slate-300";
   };
+  const fmtBookSpread = (spread: number | null | undefined) =>
+    spread != null && Number.isFinite(spread) ? spread.toFixed(4) : "—";
 
   const setTradingMode = async (target: Mode) => {
     if (!isLoggedIn) {
       pushLog("ERROR", "Login to switch between Demo and Real.");
       setLoginHint("Sign in first, then choose Demo (paper) or Real (Polymarket CLOB).");
+      setShowPasswordLogin(true);
       return;
     }
     if (status?.mode === target) return;
     setModeToggleLoading(true);
-    pushInspectionUi(`Mode → POST /api/mode (${target})`);
+    pushInspectionUi(`Mode → POST /api/config (${target === "SIMULATION" ? "SIMULATION=true" : "SIMULATION=false"})`);
     try {
-      const r = await api.setMode(target);
+      const r = await api.setConfig({ simulation: target === "SIMULATION" });
       const [s, m, w, ts] = await Promise.all([
         api.status(),
         api.markets(),
@@ -1188,97 +1851,161 @@ export function App() {
     }
   };
 
+  const requestLiveMode = () => {
+    if (!isLoggedIn) {
+      setLoginHint("Sign in first, then switch to LIVE.");
+      setShowPasswordLogin(true);
+      pushInspectionUi("UI: Go LIVE — open login (dashboard session required).");
+      return;
+    }
+    if (metaMaskAutoEnabled) {
+      const ok = window.confirm(
+        "Server LIVE mode cannot run while “Auto place trades from MetaMask” is on (only one execution path).\n\nTurn off MetaMask auto-trading and switch to LIVE?"
+      );
+      if (!ok) {
+        pushInspectionUi("UI: Go LIVE cancelled — MetaMask auto-trading still ON.");
+        return;
+      }
+      setMetaMaskAutoEnabled(false);
+      pushLog("SIGNAL", "MetaMask auto-trading turned off so the server can use LIVE mode.");
+      pushInspectionUi("UI: MetaMask auto OFF → proceeding with POST /api/mode (LIVE).");
+    }
+    void setTradingMode("LIVE");
+  };
+
+  const openLoginModal = (hint: string) => {
+    setLoginHint(hint);
+    setShowPasswordLogin(true);
+    pushInspectionUi(`UI: ${hint}`);
+  };
+
+  const handleStartBotClick = () => {
+    if (!isLoggedIn) {
+      openLoginModal("Sign in with User ID / Password (server APP_USER_ID / APP_PASSWORD), then start the bot.");
+      return;
+    }
+    void startBot();
+  };
+
+  const handleStopBotClick = () => {
+    if (!isLoggedIn) {
+      openLoginModal("Sign in to stop the bot (authenticated API).");
+      return;
+    }
+    void stopBot();
+  };
+
+  const handleBacktestClick = (strategyTitle: string) => {
+    pushInspectionUi(
+      `UI: Backtest (${strategyTitle}) — no historical/CSV replay endpoint. Use Demo (PAPER), Start Bot, then review Logs → Journal.`
+    );
+    pushLog(
+      "SIGNAL",
+      `Backtest (${strategyTitle}): this build has no separate historical replay. Forward-test in PAPER with the bot running, then use the Logs tab for trades, P&L, and bet snapshots.`
+    );
+    setLoginHint(`Backtest: switch to PAPER, start the bot, then read Logs. (${strategyTitle})`);
+    setSnipeRoute("journal");
+  };
+
+  const logoutDashboard = () => {
+    localStorage.removeItem("polybot_auth_token");
+    setIsLoggedIn(false);
+    setWalletAddress(null);
+    setPolyAccount(null);
+    setLoginHint("Logged out. Sign in again to trade.");
+    pushLog("SIGNAL", "Logged out");
+  };
+
+  const snipeCardsProps = useMemo(() => {
+    const last = chartData[chartData.length - 1];
+    const pt = last?.btcUsd;
+    const tgt = last?.btcTargetUsd;
+    const toMid = (x: number | undefined) =>
+      x == null || !Number.isFinite(x) ? null : x > 1 ? x / 100 : x;
+    return {
+      btcSlug: tradingState?.market.slug ?? null,
+      primarySlug: tradingState?.market.slug ?? null,
+      updownAssetsConfigured: tradingState?.updownAssetsConfigured ?? [],
+      updownWindows: tradingState?.updownWindows ?? [],
+      secsLeft: tradingState?.market.secondsToExpiry ?? null,
+      upMid: toMid(last?.up),
+      downMid: toMid(last?.down),
+      priceToBeat: typeof tgt === "number" && Number.isFinite(tgt) ? tgt : null,
+      currentBtc: typeof pt === "number" && Number.isFinite(pt) ? pt : null,
+      diffUsd:
+        typeof pt === "number" && typeof tgt === "number" && Number.isFinite(pt) && Number.isFinite(tgt)
+          ? pt - tgt
+          : null,
+      statusLine: [status?.phase, prediction?.recommendation, prediction?.reason, status?.phaseReason]
+        .filter(Boolean)
+        .join(" · ")
+    };
+  }, [chartData, tradingState, status, prediction]);
+
   return (
-    <div className="min-h-screen bg-bg pb-44 text-slate-200">
-      <header className="border-b border-slate-700 bg-[#111a2e]/90 px-6 py-4 backdrop-blur">
-        <div className="mx-auto flex max-w-[1400px] items-center justify-between">
-          <div className="flex items-center gap-4">
-            <div className="text-xl font-bold">PolyBot</div>
-            <input className="rounded-lg bg-panel px-3 py-2 text-sm outline-none" placeholder="Search markets" />
-            <div className="flex flex-col gap-1">
-              <span className="text-[10px] uppercase tracking-wide text-slate-500">Trading mode</span>
-              <div className="flex items-center gap-1 rounded-lg border border-slate-600 bg-slate-800/90 p-0.5">
-                <button
-                  type="button"
-                  disabled={!isLoggedIn || modeToggleLoading}
-                  onClick={() => void setTradingMode("SIMULATION")}
-                  className={`rounded px-3 py-1.5 text-xs font-semibold transition ${
-                    status?.mode !== "LIVE"
-                      ? "bg-sky-600 text-white shadow"
-                      : "text-slate-400 hover:text-slate-200"
-                  }`}
-                >
-                  Demo
-                </button>
-                <button
-                  type="button"
-                  disabled={!isLoggedIn || modeToggleLoading}
-                  onClick={() => {
-                    if (metaMaskAutoEnabled) {
-                      pushInspectionUi(
-                        "UI: Real mode blocked while MetaMask auto-trading is ON. Turn it off to let the server place LIVE orders."
-                      );
-                      pushLog(
-                        "ERROR",
-                        "Turn off “Auto place trades from MetaMask” to enable Real mode (server LIVE execution)."
-                      );
-                      return;
-                    }
-                    void setTradingMode("LIVE");
-                  }}
-                  className={`rounded px-3 py-1.5 text-xs font-semibold transition ${
-                    status?.mode === "LIVE"
-                      ? "bg-amber-600 text-white shadow"
-                      : "text-slate-400 hover:text-slate-200"
-                  }`}
-                  title="Real = server places Polymarket CLOB orders (requires server LIVE keys)."
-                >
-                  {modeToggleLoading ? "…" : "Real"}
-                </button>
-              </div>
-            </div>
-            <div className={`rounded px-2 py-1 text-xs ${wsConnected ? "bg-gain/20 text-gain" : "bg-loss/20 text-loss"}`}>
-              {wsConnected ? "Backend Connected" : "Backend Disconnected"}
-            </div>
-          </div>
-          <div className="flex flex-wrap items-center gap-3">
-            <div className="rounded-lg bg-panel px-3 py-2 text-sm">
-              Bot balance: ${status?.balance.toFixed(2) ?? "0.00"}
-            </div>
-            <div
-              className="rounded-lg border border-sky-500/30 bg-sky-500/10 px-3 py-2 text-sm text-sky-200"
-              title={
-                headerPolymarketUsdc
-                  ? `CLOB collateral (LIVE uses server read when available). ${headerPolymarketUsdc.hint ?? ""} Funder: ${funderDisplay}`
-                  : `USDC on Polymarket CLOB (funder ${funderDisplay})`
-              }
-            >
-              Polymarket USDC:{" "}
-              {headerPolymarketUsdc
+    <div
+      className="flex min-h-[100dvh] flex-col pb-44 text-slate-200"
+      style={appShellBackground}
+    >
+      <CopyProTopBar
+        wsConnected={wsConnected}
+        running={Boolean(status?.running)}
+        isLoggedIn={isLoggedIn}
+        isAuthenticating={isAuthenticating}
+        modeLive={status?.mode === "LIVE"}
+        modeToggleLoading={modeToggleLoading}
+        metaMaskAutoEnabled={metaMaskAutoEnabled}
+        onStop={handleStopBotClick}
+        onStart={handleStartBotClick}
+        onPaper={() => void setTradingMode("SIMULATION")}
+        onLive={requestLiveMode}
+        onLogin={() => openLoginModal("Enter dashboard User ID and Password from server/.env.")}
+        onLogout={logoutDashboard}
+        onOpenRiskSettings={() => {
+          setRiskModalError(null);
+          setRiskModalOpen(true);
+        }}
+      />
+      <RiskBetSettingsModal
+        open={riskModalOpen}
+        onClose={() => {
+          setRiskModalOpen(false);
+          setRiskModalError(null);
+        }}
+        settings={riskSettingsForUi}
+        busy={riskModalBusy}
+        error={riskModalError}
+        onApply={applyRiskSettings}
+        onPersistToEnv={persistRiskSettingsToEnv}
+      />
+      <CopyProMetricsRow
+        mode={status?.mode === "LIVE" ? "LIVE" : "PAPER"}
+        balance={`$${Number(status?.balance ?? 0).toFixed(2)}`}
+        todayOrSessionPnl={`${sessionStats.pnl >= 0 ? "+" : ""}$${sessionStats.pnl.toFixed(2)}`}
+        allPnl={`${allTimePnl >= 0 ? "+" : ""}$${allTimePnl.toFixed(2)}`}
+        wl={`${wlCounts.w} / ${wlCounts.l}`}
+        polymarketLine={
+          <>
+            <span className="font-mono text-copy-green">
+              {headerPolymarketUsdc && Number.isFinite(headerPolymarketUsdc.value)
                 ? `$${headerPolymarketUsdc.value.toFixed(2)}`
                 : status?.mode === "LIVE"
                   ? metaMaskUsdcLoading
                     ? "…"
                     : "—"
                   : "—"}
-            </div>
-            <button className="rounded-lg bg-gain/20 px-3 py-2 text-sm text-gain">Deposit</button>
-            <button
-              onClick={() => setShowPasswordLogin(true)}
-              className="rounded-lg bg-sky-500/20 px-3 py-2 text-sm text-sky-300 transition hover:bg-sky-500/30"
-            >
-              {isAuthenticating
-                ? "Signing..."
-                : isLoggedIn && walletAddress
-                  ? `${walletAddress.slice(0, 6)}...${walletAddress.slice(-4)}`
-                  : "User Login"}
-            </button>
-          </div>
-        </div>
-      </header>
+            </span>
+            <span className="mt-0.5 block truncate text-[10px] text-slate-600" title={funderDisplay}>
+              Funder {funderDisplay}
+            </span>
+          </>
+        }
+      />
+      <CopyProMainNav route={snipeRoute} onRoute={setSnipeRoute} />
 
+      <div className="flex min-h-0 min-w-0 flex-1 flex-col">
       {tradingState ? (
-        <div className="border-b border-slate-700 bg-[#0d1520] px-4 py-2.5 text-center text-sm">
+        <div className="border-b border-snipe-border bg-snipe-panel/80 px-4 py-2.5 text-center text-sm">
           <span
             className={
               tradingState.executionLabel === "LIVE_ONLY"
@@ -1294,10 +2021,239 @@ export function App() {
         </div>
       ) : null}
 
-      <main className="mx-auto grid max-w-[1400px] grid-cols-12 gap-4 p-4">
-        <section className="card col-span-12 grid gap-3 md:grid-cols-2">
+      <main className="mx-auto w-full max-w-[1800px] flex-1 space-y-4 overflow-y-auto p-4 sm:p-5">
+        {snipeRoute === "dashboard" && (
+          <>
+            <StrategyModulesStrip onOpenStrategies={() => setSnipeRoute("strategies")} />
+            <OverviewSubNav value={overviewSub} onChange={setOverviewSub} />
+            {overviewSub === "configuration" ? (
+              <div className="card border-copy-border/40">
+                <StrategyConfigScreen
+                  botRunning={Boolean(status?.running)}
+                  onBacktest={handleBacktestClick}
+                />
+              </div>
+            ) : overviewSub === "stats" ? (
+              <div className="card border-copy-border/40 space-y-3 p-6">
+                <h2 className="font-display text-lg font-bold text-white">Quick stats</h2>
+                <p className="text-sm text-slate-400">
+                  Win rate: {stats.winRate.toFixed(1)}% · Profit factor:{" "}
+                  {Number.isFinite(stats.profitFactor) ? stats.profitFactor.toFixed(2) : "—"} · Net: $
+                  {stats.net.toFixed(2)}
+                </p>
+                <div className="rounded-lg bg-slate-900/70 p-3 text-xs text-slate-300">
+                  <p>Bot activity trades: {insights?.totalTrades ?? 0}</p>
+                  <p>No-trade signals: {insights?.noTradeSignals ?? 0}</p>
+                  <p>
+                    BONE blocks — hc {insights?.boneEntryFilters?.highConf ?? 0}, eq{" "}
+                    {insights?.boneEntryFilters?.equilibrium ?? 0}, ls {insights?.boneEntryFilters?.longshot ?? 0}, lat{" "}
+                    {insights?.boneEntryFilters?.latency ?? 0}
+                  </p>
+                </div>
+                <p className="text-[11px] text-slate-500">Full journal: open the Logs tab.</p>
+              </div>
+            ) : overviewSub === "faq" ? (
+              <div className="card border-copy-border/40 space-y-3 p-6 text-sm leading-relaxed text-slate-400">
+                <h2 className="font-display text-lg font-bold text-white">Disclosure</h2>
+                <p>
+                  PolyBot is self-hosted software for research and automation. Prediction markets involve risk of loss.
+                  There is no guarantee of profit. You are responsible for API keys, wallet security, and compliance
+                  with applicable law.
+                </p>
+                <p>
+                  Strategy parameters and filters are configured via <code className="text-copy-green">server/.env</code>.
+                  This UI does not move private keys off your machine unless you use MetaMask in the browser.
+                </p>
+              </div>
+            ) : (
+          <div className="space-y-4">
+            <SnipeAssetCardsRow
+              {...snipeCardsProps}
+              assetAutoTradeEnabled={tradingState?.assetAutoTradeEnabled}
+              assetAutoTradeBusy={assetAutoTradeBusy}
+              onToggleAssetAutoTrade={(asset, enabled) => {
+                if (!isLoggedIn) {
+                  openLoginModal("Sign in to change per-asset auto-trade.");
+                  return;
+                }
+                setAssetAutoTradeBusy(asset);
+                void api
+                  .setAssetAutoTrade(asset, enabled)
+                  .then(() => api.tradingState())
+                  .then(setTradingState)
+                  .catch((e) => pushLog("ERROR", e instanceof Error ? e.message : String(e)))
+                  .finally(() => setAssetAutoTradeBusy(null));
+              }}
+            />
+            <div className="flex flex-col gap-4 xl:flex-row xl:items-start">
+              <aside className="card w-full shrink-0 space-y-4 border-snipe-border xl:w-[300px]">
+                <h2 className="font-display text-[10px] font-bold uppercase tracking-[0.22em] text-slate-500">Bot status</h2>
+                <div className="flex items-center gap-2">
+                  <span
+                    className={
+                      "h-2 w-2 shrink-0 rounded-full " +
+                      (status?.running ? "bg-emerald-400 shadow-[0_0_10px_#34d399]" : "bg-slate-600")
+                    }
+                  />
+                  <span className="text-sm font-semibold text-white">{status?.running ? "Running" : "Stopped"}</span>
+                </div>
+                {runningSince && status?.running ? (
+                  <p className="text-[11px] text-slate-500">Running since {runningSince.toLocaleString()}</p>
+                ) : null}
+                <div>
+                  <p className="text-[10px] uppercase tracking-wide text-slate-500">Balance</p>
+                  <p className="font-mono text-xl font-bold text-snipe-accent">${Number(status?.balance ?? 0).toFixed(2)}</p>
+                </div>
+                <p className="truncate font-mono text-[10px] text-slate-500" title={funderDisplay}>
+                  {funderDisplay.length > 14
+                    ? `${funderDisplay.slice(0, 6)}…${funderDisplay.slice(-4)}`
+                    : funderDisplay}
+                </p>
+                <button
+                  type="button"
+                  onClick={handleStopBotClick}
+                  disabled={!isLoggedIn || !status?.running}
+                  title={!isLoggedIn ? "Login first" : !status?.running ? "Bot is not running" : "Stop the bot"}
+                  className="w-full rounded-xl bg-rose-600 py-3 text-sm font-bold text-white shadow-lg shadow-rose-900/40 transition hover:brightness-110 disabled:cursor-not-allowed disabled:opacity-40"
+                >
+                  Stop Bot
+                </button>
+                <button
+                  type="button"
+                  onClick={handleStartBotClick}
+                  disabled={!isLoggedIn || Boolean(status?.running) || isAuthenticating}
+                  title={
+                    !isLoggedIn
+                      ? "Login first"
+                      : isAuthenticating
+                        ? "Signing in…"
+                        : status?.running
+                          ? "Bot already running"
+                          : "Start the bot"
+                  }
+                  className="w-full rounded-xl border border-snipe-accent/50 bg-snipe-accent/15 py-2.5 text-sm font-bold text-snipe-accent transition hover:bg-snipe-accent/25 disabled:cursor-not-allowed disabled:opacity-40"
+                >
+                  Start Bot
+                </button>
+                <div className="space-y-2 border-t border-snipe-border pt-3 text-xs">
+                  <div className="flex justify-between">
+                    <span className="text-slate-500">Session P&amp;L</span>
+                    <span className={sessionStats.pnl >= 0 ? "font-mono text-emerald-400" : "font-mono text-rose-400"}>
+                      {sessionStats.pnl >= 0 ? "+" : ""}${sessionStats.pnl.toFixed(3)}
+                    </span>
+                  </div>
+                  <div className="flex justify-between">
+                    <span className="text-slate-500">All-time P&amp;L</span>
+                    <span className={allTimePnl >= 0 ? "font-mono text-emerald-400" : "font-mono text-rose-400"}>
+                      {allTimePnl >= 0 ? "+" : ""}${allTimePnl.toFixed(3)}
+                    </span>
+                  </div>
+                  <div className="flex justify-between text-slate-400">
+                    <span>Trades</span>
+                    <span>{sessionStats.n}</span>
+                  </div>
+                  <div className="flex justify-between text-slate-400">
+                    <span>Win / Loss</span>
+                    <span>
+                      {sessionStats.wins} / {sessionStats.losses}
+                    </span>
+                  </div>
+                  <div className="flex justify-between text-slate-400">
+                    <span>Win rate</span>
+                    <span>{sessionStats.winRate.toFixed(0)}%</span>
+                  </div>
+                </div>
+                <div className="rounded-xl border border-snipe-border bg-[#0a0c10] p-3 text-[10px] leading-relaxed">
+                  <p className="mb-1 font-bold uppercase tracking-wide text-slate-500">Last signal</p>
+                  <p>
+                    <span className="text-slate-500">Type:</span>{" "}
+                    <span className="font-semibold text-snipe-accent">
+                      {prediction?.prediction ?? "—"} {prediction?.recommendation ?? ""}
+                    </span>
+                  </p>
+                  <p className="mt-1 text-slate-500">
+                    At: {prediction?.ts ? new Date(prediction.ts).toLocaleTimeString() : "—"}
+                  </p>
+                  <p className="mt-1 break-words font-mono text-[9px] text-slate-500">
+                    Gate: {prediction?.reason ?? "—"}
+                  </p>
+                </div>
+              </aside>
+              <div className="card min-w-0 flex-1 overflow-hidden border-snipe-border p-0">
+                <div className="border-b border-snipe-border px-4 py-3">
+                  <h2 className="font-display text-xs font-bold uppercase tracking-[0.2em] text-slate-400">Recent trades</h2>
+                </div>
+                <div className="max-h-[min(520px,55vh)] overflow-auto">
+                  <table className="w-full text-left text-xs">
+                    <thead className="sticky top-0 z-10 bg-[#0c0f14] text-[10px] uppercase tracking-wide text-slate-500">
+                      <tr>
+                        <th className="px-3 py-2">Time</th>
+                        <th className="px-2 py-2">Asset</th>
+                        <th className="px-2 py-2">Strategy</th>
+                        <th className="px-2 py-2">Side</th>
+                        <th className="px-2 py-2">UP@entry</th>
+                        <th className="px-2 py-2">DN@entry</th>
+                        <th className="px-2 py-2">Entry</th>
+                        <th className="px-2 py-2">Exit</th>
+                        <th className="px-2 py-2">Spent</th>
+                        <th className="px-2 py-2">P&amp;L</th>
+                        <th className="px-2 py-2">Held</th>
+                        <th className="px-2 py-2">Reason</th>
+                      </tr>
+                    </thead>
+                    <tbody className="font-mono text-[11px] text-slate-300">
+                      {filteredTrades.map((t) => (
+                        <tr key={t.id} className="border-b border-white/[0.04] hover:bg-white/[0.02]">
+                          <td className="whitespace-nowrap px-3 py-2 text-slate-400">{t.time}</td>
+                          <td className="px-2 py-2 font-semibold text-slate-300">{t.asset ?? "—"}</td>
+                          <td className="px-2 py-2 text-slate-400">
+                            {entryStrategyUi.effective.replace(/_/g, " ")}
+                          </td>
+                          <td className="px-2 py-2">
+                            <span
+                              className={
+                                t.direction === "UP"
+                                  ? "font-bold text-emerald-400"
+                                  : "font-bold text-rose-400"
+                              }
+                            >
+                              {t.direction === "UP" ? "YES" : "NO"}
+                            </span>
+                          </td>
+                          <td className="px-2 py-2 text-emerald-300/90">{fmtEntryMidPct(t.upPriceAtEntry)}</td>
+                          <td className="px-2 py-2 text-rose-300/90">{fmtEntryMidPct(t.downPriceAtEntry)}</td>
+                          <td className="px-2 py-2">{(Number(t.price ?? 0) * 100).toFixed(2)}</td>
+                          <td className="px-2 py-2 text-slate-400">
+                            {isPaperNoFill(t)
+                              ? "—"
+                              : t.status === "WIN"
+                                ? "100.00"
+                                : t.status === "LOSS"
+                                  ? "0.00"
+                                  : "—"}
+                          </td>
+                          <td className="px-2 py-2">${Number(t.amount ?? 0).toFixed(2)}</td>
+                          <td className={`px-2 py-2 ${isPaperNoFill(t) ? "text-slate-500" : Number(t.pnl ?? 0) >= 0 ? "text-emerald-400" : "text-rose-400"}`}>
+                            {isPaperNoFill(t) ? "NO FILL" : `${Number(t.pnl ?? 0) >= 0 ? "+" : ""}$${Number(t.pnl ?? 0).toFixed(3)}`}
+                          </td>
+                          <td className="px-2 py-2 text-slate-600">—</td>
+                          <td
+                            className="max-w-[200px] truncate px-2 py-2 text-[10px] text-slate-500"
+                            title={t.decisionReason ?? t.status}
+                          >
+                            {t.decisionReason ?? t.status}
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+            </div>
+
+        <section className="card grid gap-3 md:grid-cols-2">
           <div className="space-y-2 rounded-lg border border-slate-700/80 bg-slate-900/40 p-3">
-            <h3 className="text-sm font-semibold text-slate-200">Market window & books</h3>
+            <h3 className="text-sm font-semibold text-slate-200">Market window &amp; books</h3>
             {!tradingState ? (
               <p className="text-xs text-slate-500">Loading…</p>
             ) : (
@@ -1335,21 +2291,17 @@ export function App() {
                 <div className="mt-2 grid grid-cols-2 gap-2 text-xs">
                   <div className="rounded border border-slate-700 p-2">
                     <div className="mb-1 font-medium text-slate-300">UP</div>
-                    <span className={badgeClass(tradingState.books.up?.badge ?? "no_book")}>
-                      {tradingState.books.up?.badge ?? "no_book"}
+                    <span className={badgeClass(tradingState.books?.up?.badge ?? "no_book")}>
+                      {tradingState.books?.up?.badge ?? "no_book"}
                     </span>
-                    <span className="ml-2 text-slate-400">
-                      spread {tradingState.books.up?.spread?.toFixed(4) ?? "—"}
-                    </span>
+                    <span className="ml-2 text-slate-400">spread {fmtBookSpread(tradingState.books?.up?.spread)}</span>
                   </div>
                   <div className="rounded border border-slate-700 p-2">
                     <div className="mb-1 font-medium text-slate-300">DOWN</div>
-                    <span className={badgeClass(tradingState.books.down?.badge ?? "no_book")}>
-                      {tradingState.books.down?.badge ?? "no_book"}
+                    <span className={badgeClass(tradingState.books?.down?.badge ?? "no_book")}>
+                      {tradingState.books?.down?.badge ?? "no_book"}
                     </span>
-                    <span className="ml-2 text-slate-400">
-                      spread {tradingState.books.down?.spread?.toFixed(4) ?? "—"}
-                    </span>
+                    <span className="ml-2 text-slate-400">spread {fmtBookSpread(tradingState.books?.down?.spread)}</span>
                   </div>
                 </div>
               </>
@@ -1398,158 +2350,249 @@ export function App() {
           </div>
         </section>
 
-        <section className="card col-span-8">
+        <section className="card">
           <div className="mb-2 flex items-center justify-between">
-            <h2 className="text-lg font-semibold">{selectedMarketLabel}</h2>
+            <h2 className="font-display text-lg font-bold text-white">{selectedMarketLabel}</h2>
             <div className="flex items-center gap-2">
               <select
-                value={selectedTokenID}
+                value={
+                  markets.length > 0 && !markets.some((m) => m.tokenID === selectedTokenID)
+                    ? (markets[0]?.tokenID ?? "")
+                    : selectedTokenID
+                }
                 onChange={(e) => onSelectMarket(e.target.value)}
-                className="rounded bg-slate-700 px-2 py-1 text-xs text-slate-100 outline-none"
+                aria-label="Select market"
+                className="rounded border border-transparent bg-slate-700 px-2 py-1 text-xs text-slate-100 outline-none focus:border-copy-green/50 focus:ring-2 focus:ring-copy-green/30"
               >
-                {markets.map((m) => (
-                  <option key={m.tokenID} value={m.tokenID}>
-                    {m.label}
-                  </option>
-                ))}
+                {markets.length === 0 ? (
+                  <option value="">No markets — start API on :4000</option>
+                ) : (
+                  markets.map((m) => (
+                    <option key={m.tokenID} value={m.tokenID}>
+                      {m.label}
+                    </option>
+                  ))
+                )}
               </select>
               <div className="rounded bg-slate-700 px-2 py-1 text-xs">
                 Prediction: {prediction?.prediction ?? "--"} ({prediction?.confidence ?? 0}%)
               </div>
             </div>
           </div>
-          {(() => {
-            const last = chartData[chartData.length - 1];
-            return last?.btcUsd != null ? (
-              <div className="mb-2 flex flex-wrap items-baseline gap-3 text-sm">
-                <span className="text-2xl font-semibold tracking-tight text-white">
-                  ${last.btcUsd.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
-                </span>
-                {last.btcTargetUsd != null && (
-                  <>
-                    <span className="text-slate-500">Target</span>
-                    <span className="font-mono text-slate-200">
-                      ${last.btcTargetUsd.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
-                    </span>
-                    <span
-                      className={
-                        last.btcUsd - last.btcTargetUsd >= 0 ? "font-medium text-emerald-400" : "font-medium text-rose-400"
-                      }
-                    >
-                      {last.btcUsd - last.btcTargetUsd >= 0 ? "+" : ""}$
-                      {(last.btcUsd - last.btcTargetUsd).toFixed(2)}
-                    </span>
-                  </>
-                )}
-              </div>
-            ) : null;
-          })()}
-          {chartData.length > 0 && chartData.some((p) => p.btcUsd != null) ? (
-            <div className="h-[360px] rounded-lg bg-[#0f1114]">
-              <ResponsiveContainer width="100%" height="100%">
-                <LineChart
-                  data={chartData}
-                  margin={{ top: 10, right: 52, left: 4, bottom: 8 }}
-                >
-                  <CartesianGrid stroke="#1a1d22" strokeOpacity={0.9} vertical={false} />
-                  <XAxis
-                    dataKey="time"
-                    stroke="#52525b"
-                    tick={{ fill: "#a1a1aa", fontSize: 11 }}
-                    ticks={chartXTickTimes}
-                    interval={0}
-                  />
-                  <YAxis
-                    orientation="right"
-                    stroke="#52525b"
-                    tick={{ fill: "#a1a1aa", fontSize: 11 }}
-                    ticks={chartYTicks}
-                    domain={chartYDomain ?? ["auto", "auto"]}
-                    tickFormatter={(v) =>
-                      typeof v === "number"
-                        ? `$${v.toLocaleString(undefined, { minimumFractionDigits: 0, maximumFractionDigits: 0 })}`
-                        : String(v)
-                    }
-                    width={64}
-                  />
-                  {chartData[chartData.length - 1]?.btcTargetUsd != null && (
-                    <ReferenceLine
-                      y={chartData[chartData.length - 1]!.btcTargetUsd}
-                      stroke="rgba(255,255,255,0.88)"
-                      strokeDasharray="4 4"
-                      label={{
-                        value: "Target",
-                        position: "right",
-                        fill: "#cbd5e1",
-                        fontSize: 11,
-                        fontWeight: 500
-                      }}
-                    />
-                  )}
-                  <Tooltip
-                    contentStyle={{ background: "#1a1d23", border: "1px solid #334155", borderRadius: 8 }}
-                    formatter={(v: number | string) => [
-                      typeof v === "number"
-                        ? `$${v.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`
-                        : v,
-                      "BTC"
-                    ]}
-                    labelFormatter={(l) => String(l)}
-                  />
-                  <Line
-                    type="monotone"
-                    dataKey="btcUsd"
-                    stroke="#F7931A"
-                    strokeWidth={2}
-                    dot={(props: { cx?: number; cy?: number; index?: number }) => {
-                      const { cx, cy, index } = props;
-                      if (cx == null || cy == null || index !== chartData.length - 1) return <g />;
-                      return <circle cx={cx} cy={cy} r={4} fill="#F7931A" stroke="#F7931A" />;
-                    }}
-                    activeDot={{ r: 5, fill: "#F7931A", stroke: "#fff", strokeWidth: 1 }}
-                    isAnimationActive={false}
-                    connectNulls
-                  />
-                </LineChart>
-              </ResponsiveContainer>
+          <p className="mb-3 text-[11px] leading-relaxed text-slate-500">
+            One chart per <span className="text-slate-400">UPDOWN_ASSETS</span> symbol. Line = exchange spot (Coinbase / Binance); dashed
+            target = Polymarket price to beat when available, else window-open anchor. Engine momentum still tracks{" "}
+            <span className="font-medium text-slate-400">{chartPrimaryAsset}</span> (first in list).
+          </p>
+          {chartAssetsList.length > 0 ? (
+            <div className="grid gap-4 sm:grid-cols-1 lg:grid-cols-2">
+              {chartAssetsList.map((a) => {
+                const series =
+                  assetCharts[a]?.length && assetCharts[a]!.some((p) => p.btcUsd != null)
+                    ? assetCharts[a]!
+                    : a === chartPrimaryAsset && chartData.length > 0 && chartData.some((p) => p.btcUsd != null)
+                      ? chartData
+                      : [];
+                return (
+                  <AssetSpotChartCard key={a} asset={a} points={series} stroke={chartStrokeForAsset(a)} />
+                );
+              })}
             </div>
+          ) : chartData.length > 0 && chartData.some((p) => p.btcUsd != null) ? (
+            <AssetSpotChartCard asset="Spot" points={chartData} stroke="#F7931A" />
           ) : (
-            <div className="flex h-[360px] items-center justify-center rounded-lg bg-[#0f1114] text-sm text-slate-500">
-              Loading live BTC/USD spot…
+            <div className="flex min-h-[240px] items-center justify-center rounded-lg bg-[#0f1114] text-sm text-slate-500">
+              Loading spot feeds…
             </div>
           )}
-          <p className="mt-2 text-[11px] leading-relaxed text-slate-500">
-            Updates every ~4s (Polymarket-style cadence). Spot from Coinbase / Binance fallback; axis ticks in $25 steps. Polymarket
-            resolution may use a different oracle than this line.
-          </p>
         </section>
 
-        <aside className="card col-span-4 space-y-3">
-          <h3 className="text-lg font-semibold">Buy / Sell</h3>
-          <div className="grid grid-cols-2 gap-2">
-            <button
-              onClick={startBot}
-              className="rounded-lg bg-gain/20 py-2 text-xs font-semibold text-gain transition hover:bg-gain/30"
-            >
-              Start Bot
-            </button>
-            <button
-              onClick={stopBot}
-              className="rounded-lg bg-loss/20 py-2 text-xs font-semibold text-loss transition hover:bg-loss/30"
-            >
-              Stop Bot
-            </button>
-          </div>
+        <section className="card grid gap-4 lg:grid-cols-2">
+          <div className="space-y-3">
+          <h3 className="font-display text-lg font-bold text-white">Execution &amp; size</h3>
           <div className="text-xs text-slate-300">
             Bot State: {status?.running ? "Running" : "Stopped"} | Auto: {status?.autoTrading ? "ON" : "OFF"} | Phase:{" "}
             <span className="font-medium text-slate-100">{status?.phase ?? "—"}</span>
+            {tradingState ? (
+              <>
+                {" "}
+                | Exec:{" "}
+                <span className={tradingState.executionMode === "LIVE" ? "text-emerald-300" : "text-slate-300"}>
+                  {tradingState.executionMode === "LIVE" ? "LIVE" : "SIM"}
+                </span>
+              </>
+            ) : null}
             {status?.phaseReason ? (
               <span className="text-slate-400"> — {status.phaseReason}</span>
             ) : null}
           </div>
-          <div className="rounded-lg border border-slate-700 bg-slate-900/70 px-3 py-2 text-xs text-slate-200">
-            Direction is auto-selected by bot strategy (momentum + orderbook + signal).
+          {tradingState?.liveEngine ? (
+            <div className="flex flex-wrap items-center gap-x-2.5 gap-y-1 rounded-md border border-slate-800/90 bg-[#0a0c10]/90 px-2.5 py-1.5 font-mono text-[10px] leading-tight text-slate-500">
+              <span>
+                RTDS{" "}
+                <span
+                  className={
+                    tradingState.liveEngine.rtdsConnected ? "font-semibold text-emerald-400" : "font-semibold text-amber-400"
+                  }
+                >
+                  {tradingState.liveEngine.rtdsConnected ? "LIVE" : "…"}
+                </span>
+              </span>
+              <span className="text-slate-700" aria-hidden>
+                │
+              </span>
+              <span>
+                CLOB+Γ{" "}
+                <span className="text-slate-300">{formatBookRefreshAge(tradingState.liveEngine.secondsSinceBookRefresh)}</span>
+                {tradingState.liveEngine.lastBookRefreshMs != null ? (
+                  <span className="text-slate-600">
+                    {" "}
+                    @ {new Date(tradingState.liveEngine.lastBookRefreshMs).toLocaleTimeString()}
+                  </span>
+                ) : null}
+                <span className="text-slate-600">
+                  {" "}
+                  · {tradingState.liveEngine.discoveredSlotCount} mkt
+                  {tradingState.liveEngine.discoveredSlotCount === 1 ? "" : "s"}
+                </span>
+                {tradingState.executionMode === "LIVE" && !tradingState.liveEngine.hasLiveMarketData ? (
+                  <span className="text-amber-400/90"> · books pending</span>
+                ) : null}
+              </span>
+              <span className="text-slate-700" aria-hidden>
+                │
+              </span>
+              <span title="REST poll matches book refresh; CLOB/Gamma requests coalesce when concurrent; WS skips duplicate signal payloads">
+                sync 4s · coalesced fetches
+              </span>
+            </div>
+          ) : null}
+          <div className="space-y-2 rounded-lg border border-slate-700 bg-slate-900/70 px-3 py-2 text-xs text-slate-200">
+            <p>
+              <span className="text-slate-400">Entry strategy: </span>
+              <span className="font-medium text-slate-100">{entryStrategyUi.label}</span>
+              {entryStrategyUi.runtimeOverride ? (
+                <span className="ml-1 text-copy-green">· dashboard</span>
+              ) : (
+                <span className="ml-1 text-slate-500">· .env</span>
+              )}
+            </p>
+            {entryStrategyUi.fromEnv === "contrarian" && entryStrategyUi.runtimeOverride == null ? (
+              <p className="text-[10px] leading-snug text-amber-200/90">
+                Contrarian is set in <code className="text-slate-300">ENTRY_STRATEGY</code>. Choose a mode below to override from the UI.
+              </p>
+            ) : null}
+            <div className="flex flex-wrap gap-1.5">
+              {(
+                [
+                  ["ensemble", "Ensemble (all)"],
+                  ["momentum", "Momentum"],
+                  ["spot_poly_lag", "Spot-Poly Lag"],
+                  ["orderbook", "Order book"],
+                  ["whale_edge", "Whale edge"],
+                  ["ola", "OLA (latency)"],
+                  ["mean_revert", "Mean revert"],
+                  ["chart", "Chart"]
+                ] as const satisfies ReadonlyArray<readonly [DashboardEntryStrategyId, string]>
+              ).map(([id, label]) => {
+                const active = entryStrategyUi.effective === id;
+                return (
+                  <button
+                    key={id}
+                    type="button"
+                    disabled={!isLoggedIn || entryStrategyBusy}
+                    onClick={() => void applyEntryStrategy({ strategy: id })}
+                    className={`rounded-md px-2.5 py-1 text-[10px] font-semibold transition ${
+                      active
+                        ? "bg-copy-green/30 text-copy-green ring-1 ring-copy-green/40"
+                        : "bg-slate-800 text-slate-300 hover:bg-slate-700"
+                    } disabled:cursor-not-allowed disabled:opacity-50`}
+                  >
+                    {label}
+                  </button>
+                );
+              })}
+              <button
+                type="button"
+                disabled={!isLoggedIn || entryStrategyBusy || entryStrategyUi.runtimeOverride == null}
+                onClick={() => void applyEntryStrategy({ reset: true })}
+                className="rounded-md border border-slate-600 px-2.5 py-1 text-[10px] text-slate-400 transition hover:bg-slate-800 disabled:cursor-not-allowed disabled:opacity-40"
+              >
+                Use .env
+              </button>
+              <button
+                type="button"
+                disabled={!isLoggedIn || lagSnipeBusy || entryStrategyBusy}
+                onClick={() => void applyLagSnipe(!lagSnipeOn)}
+                title="BTC 5m only, last ~30s of window, 2×1m candle + book gates; disables GTC and live auto-flatten"
+                className={`rounded-md px-2.5 py-1 text-[10px] font-semibold transition ${
+                  lagSnipeOn
+                    ? "bg-amber-500/25 text-amber-200 ring-1 ring-amber-400/50"
+                    : "bg-slate-800 text-slate-300 hover:bg-slate-700"
+                } disabled:cursor-not-allowed disabled:opacity-50`}
+              >
+                Lag Snipe {lagSnipeOn ? "ON" : "OFF"}
+              </button>
+              <button
+                type="button"
+                disabled={!isLoggedIn || spotPolyLagBusy || entryStrategyBusy}
+                onClick={() => void applySpotPolyLag(!spotPolyLagOn)}
+                className={`rounded-md px-2.5 py-1 text-[10px] font-semibold transition ${
+                  spotPolyLagOn
+                    ? "bg-fuchsia-500/25 text-fuchsia-200 ring-1 ring-fuchsia-400/50"
+                    : "bg-slate-800 text-slate-300 hover:bg-slate-700"
+                } disabled:cursor-not-allowed disabled:opacity-50`}
+              >
+                Start Spot-Poly Lag 🎯
+              </button>
+            </div>
+            {lagSnipeOn ? (
+              <p className="text-[10px] font-medium text-amber-200/95">
+                {tradingState?.lagSnipeBanner ?? "Lag Snipe: HOLD Manual Exit"} — other strategies paused for entries.
+                {tradingState?.market?.secondsToExpiry != null
+                  ? ` · window left ~${Math.max(0, Math.floor(tradingState.market.secondsToExpiry))}s`
+                  : ""}
+              </p>
+            ) : null}
+            <div className="rounded-md border border-fuchsia-700/70 bg-fuchsia-950/20 px-2.5 py-2 text-[10px] text-fuchsia-100">
+              <p className="mb-1 font-semibold">🎯 Spot-Poly Lag</p>
+              <div className="grid grid-cols-2 gap-y-1">
+                <span className="text-fuchsia-200/80">OB Signal</span>
+                <span
+                  className={
+                    spotPolyLagStatus.ob_signal === "BULLISH"
+                      ? "text-emerald-300"
+                      : spotPolyLagStatus.ob_signal === "BEARISH"
+                        ? "text-rose-300"
+                        : "text-amber-300"
+                  }
+                >
+                  {spotPolyLagStatus.ob_signal ?? "NEUTRAL"}
+                </span>
+                <span className="text-fuchsia-200/80">OB Ratio</span>
+                <span>{spotPolyLagStatus.ob_ratio ?? "—"}</span>
+                <span className="text-fuchsia-200/80">CLOB Ask</span>
+                <span>{spotPolyLagStatus.clob_ask ?? "—"}</span>
+                <span className="text-fuchsia-200/80">CLOB Spread</span>
+                <span>{spotPolyLagStatus.clob_spread ?? "—"}</span>
+                <span className="text-fuchsia-200/80">CLOB Depth</span>
+                <span>{spotPolyLagStatus.clob_depth ?? "—"}</span>
+              </div>
+            </div>
+            <p className="text-[10px] leading-relaxed text-slate-500">
+              <strong className="text-slate-400">Ensemble</strong> blends momentum, orderbook, mean-revert, chart, mid-flip,
+              last-second collapse, and reversal snipe; optional whale filters via{" "}
+              <code className="text-slate-400">ENSEMBLE_APPLY_WHALE_FILTER</code>. Other buttons force a single leg only.
+            </p>
           </div>
+          <p className="text-[11px] text-slate-500">
+            Server auto-trade: ${riskSettingsForUi.entryUsd.toFixed(2)} target · min ${riskSettingsForUi.minTrade} · max $
+            {riskSettingsForUi.maxTrade} · cooldown {riskSettingsForUi.cooldownMs}ms
+            {riskSettingsForUi.overridesActive ? (
+              <span className="text-copy-green"> · overrides .env</span>
+            ) : null}
+            . Use <span className="font-semibold text-slate-400">Risk &amp; bet</span> in the header to change.
+          </p>
           <div className="space-y-2">
             <div className="flex items-center justify-between gap-3">
               <span className="text-xs text-slate-400">% of capital per entry</span>
@@ -1559,7 +2602,8 @@ export function App() {
                   setCapitalPctPerEntry(Number(e.target.value));
                   setAmountSource("PERCENT");
                 }}
-                className="rounded bg-slate-700 px-2 py-1 text-xs text-slate-100 outline-none"
+                aria-label="Percent of capital per entry"
+                className="rounded border border-transparent bg-slate-700 px-2 py-1 text-xs text-slate-100 outline-none focus:border-copy-green/50 focus:ring-2 focus:ring-copy-green/30"
               >
                 {([1, 2, 5, 10, 15, 20, 25, 33, 50] as const).map((p) => (
                   <option key={p} value={p}>
@@ -1581,49 +2625,25 @@ export function App() {
                 setAmount(Number(e.target.value));
                 setAmountSource("MANUAL");
               }}
-              className="w-full rounded-lg bg-slate-800 px-3 py-2"
+              aria-label="Trade size override USD"
+              className="w-full rounded-lg border border-transparent bg-slate-800 px-3 py-2 text-slate-200 outline-none focus:border-copy-green/40 focus:ring-2 focus:ring-copy-green/25"
             />
             <p className="text-[11px] text-slate-500">
               {amountSource === "PERCENT" ? "Auto-calculated (editing switches to manual)." : "Manual override."}
             </p>
           </div>
           <div className="rounded-lg bg-slate-800 p-3 text-sm">
-            <p>You can earn ${expected.profit.toFixed(2)} in 5 seconds</p>
-            <p className="text-loss">You can lose ${expected.loss.toFixed(2)}</p>
+            <p>You can earn ${fmtNum(expected.profit, 2)} in 5 seconds</p>
+            <p className="text-loss">You can lose ${fmtNum(expected.loss, 2)}</p>
           </div>
           <button
+            type="button"
             disabled
-            onClick={doTrade}
-            className="w-full rounded-lg bg-indigo-500 py-2 transition disabled:opacity-50"
+            title="Manual trade button is disabled; the bot places trades automatically."
+            className="w-full rounded-xl bg-slate-700 py-2 text-sm transition disabled:cursor-not-allowed disabled:opacity-50"
           >
             Auto-only mode
           </button>
-          <div className="space-y-2 rounded-lg border border-sky-800/60 bg-sky-950/30 px-3 py-2">
-            <p className="text-xs font-medium text-sky-200">MetaMask Auto-Trading</p>
-            <p className="text-[11px] leading-snug text-slate-400">
-              One click to connect MetaMask, then press Start Bot. New TRADE signals are posted automatically from your MetaMask
-              account (Polygon).
-            </p>
-            <button
-              type="button"
-              disabled={metaMaskOrderBusy}
-              onClick={() => void connectMetaMaskTrading()}
-              className="w-full rounded-lg bg-sky-600 py-2 text-xs font-semibold text-white transition hover:bg-sky-500 disabled:opacity-50"
-            >
-              {metaMaskConnected ? `MetaMask Connected (${metaMaskAddress?.slice(0, 6)}...${metaMaskAddress?.slice(-4)})` : "Connect MetaMask"}
-            </button>
-            <label className="flex items-center justify-between rounded bg-slate-900/60 px-2 py-2 text-xs text-slate-200">
-              <span>Auto place trades from MetaMask</span>
-              <input
-                type="checkbox"
-                checked={metaMaskAutoEnabled}
-                onChange={(e) => setMetaMaskAutoEnabled(e.target.checked)}
-              />
-            </label>
-            <p className="text-[11px] text-slate-500">
-              When enabled, Start Bot runs strategy on server and places real CLOB orders through your browser wallet.
-            </p>
-          </div>
           <p className="rounded-lg border border-slate-700 bg-slate-900/70 px-3 py-2 text-xs text-slate-200">
             Bot Suggestion: {suggestion}
           </p>
@@ -1636,83 +2656,434 @@ export function App() {
             {metaMaskPolymarketUsdc != null ? ` | MetaMask $${metaMaskPolymarketUsdc.toFixed(2)}` : ""}
           </div>
           <div className={`text-xs ${isLoggedIn ? "text-gain" : "text-yellow-300"}`}>{loginHint}</div>
-        </aside>
+          </div>
+          <div className="space-y-3 rounded-xl border border-snipe-border/80 bg-[#0a0c10]/50 p-4">
+            <p className="text-xs font-bold uppercase tracking-wide text-snipe-accent">MetaMask</p>
+            <button
+              type="button"
+              disabled={metaMaskOrderBusy}
+              onClick={() => void connectMetaMaskTrading()}
+              className="w-full rounded-xl bg-snipe-accent py-2.5 text-xs font-bold text-[#061016] transition hover:brightness-110 disabled:cursor-not-allowed disabled:opacity-50"
+            >
+              {metaMaskConnected
+                ? `Connected ${metaMaskAddress?.slice(0, 6)}…${metaMaskAddress?.slice(-4)}`
+                : "Connect MetaMask"}
+            </button>
+            <label className="flex items-center justify-between text-xs text-slate-300">
+              <span>Auto place trades</span>
+              <input
+                type="checkbox"
+                checked={metaMaskAutoEnabled}
+                onChange={(e) => setMetaMaskAutoEnabled(e.target.checked)}
+              />
+            </label>
+          </div>
+        </section>
+          </div>
+            )}
+          </>
+        )}
 
-        <section className="card col-span-12">
-          <div className="mb-2 flex items-center justify-between">
-            <h3 className="text-lg font-semibold">Account Portfolio</h3>
-            <div className="flex items-center gap-2">
-              {(["1m", "1h", "day", "month", "year"] as const).map((range) => (
-                <button
-                  key={range}
-                  onClick={() => setPortfolioRange(range)}
-                  className={`rounded px-2 py-1 text-xs ${
-                    portfolioRange === range ? "bg-sky-500/30 text-sky-200" : "bg-slate-700 text-slate-200"
-                  }`}
-                >
-                  {range}
-                </button>
-              ))}
+        {snipeRoute === "strategies" && (
+          <>
+            <StrategyModulesStrip onOpenStrategies={() => setSnipeRoute("strategies")} />
+            <div className="card border-copy-border/40 p-6">
+              <StrategyConfigScreen
+                botRunning={Boolean(status?.running)}
+                onBacktest={handleBacktestClick}
+              />
+            </div>
+          </>
+        )}
+
+        {snipeRoute === "tools" && (
+          <div className="card border-copy-border/40 grid gap-4 p-6 lg:grid-cols-2">
+            <div className="space-y-3">
+              <h2 className="font-display text-lg font-bold text-white">MetaMask</h2>
+              <p className="text-xs text-slate-400">
+                Connect a signer for read-only CLOB balance or optional client-side orders. Server LIVE mode uses keys in{" "}
+                <code className="text-copy-green">server/.env</code>.
+              </p>
+              <button
+                type="button"
+                disabled={metaMaskOrderBusy}
+                onClick={() => void connectMetaMaskTrading()}
+                className="w-full rounded-xl bg-copy-green py-2.5 text-xs font-bold text-black transition hover:brightness-110 disabled:cursor-not-allowed disabled:opacity-50"
+              >
+                {metaMaskConnected
+                  ? `Connected ${metaMaskAddress?.slice(0, 6)}…${metaMaskAddress?.slice(-4)}`
+                  : "Connect MetaMask"}
+              </button>
+              <label className="flex items-center justify-between text-xs text-slate-300">
+                <span>Auto place trades from MetaMask</span>
+                <input
+                  type="checkbox"
+                  checked={metaMaskAutoEnabled}
+                  onChange={(e) => setMetaMaskAutoEnabled(e.target.checked)}
+                />
+              </label>
+            </div>
+            <div className="space-y-2 text-xs text-slate-400">
+              <h3 className="font-semibold text-slate-200">Session</h3>
+              <p>
+                Mode: <span className="text-slate-200">{status?.mode ?? "—"}</span> · CLOB:{" "}
+                {wallet?.connected ? "connected" : "not connected"}
+              </p>
+              <p className="text-[11px] text-slate-500">
+                Live chart, books, and API inspection stay on Overview → Live status. Use the bar at the bottom for request
+                traces.
+              </p>
             </div>
           </div>
-          <div className="h-[240px]">
+        )}
+
+        {snipeRoute === "wizard" && (
+          <div className="card border-snipe-border p-6">
+            <WizardScreenPoly onExit={() => setSnipeRoute("dashboard")} />
+          </div>
+        )}
+
+        {snipeRoute === "settings" && (
+          <div className="space-y-4">
+            <div className="card border-snipe-border p-4">
+              <h3 className="mb-2 font-display text-sm font-bold text-white">Trading mode</h3>
+              <div className="flex flex-wrap gap-2">
+                <button
+                  type="button"
+                  disabled={!isLoggedIn || modeToggleLoading}
+                  onClick={() => void setTradingMode("SIMULATION")}
+                  className={`rounded-xl px-4 py-2 text-sm font-semibold transition disabled:cursor-not-allowed disabled:opacity-50 ${
+                    status?.mode !== "LIVE" ? "bg-snipe-accent text-[#061016]" : "bg-snipe-panel text-slate-400"
+                  }`}
+                >
+                  Demo
+                </button>
+                <button
+                  type="button"
+                  disabled={!isLoggedIn || modeToggleLoading}
+                  onClick={() => requestLiveMode()}
+                  className={`rounded-xl px-4 py-2 text-sm font-semibold transition disabled:cursor-not-allowed disabled:opacity-50 ${
+                    status?.mode === "LIVE" ? "bg-amber-500 text-slate-900" : "bg-snipe-panel text-slate-400"
+                  }`}
+                >
+                  Real
+                </button>
+              </div>
+            </div>
+            <div className="card border-snipe-border p-6">
+              <SettingsScreenPoly />
+            </div>
+          </div>
+        )}
+
+        {snipeRoute === "journal" && (
+          <div className="grid grid-cols-12 gap-4">
+        <section className="card col-span-12">
+          <div className="mb-3 flex flex-wrap items-start justify-between gap-3">
+            <h3 className="font-display text-xs font-bold uppercase tracking-[0.2em] text-slate-400">P&amp;L curve</h3>
+            <div className="flex flex-wrap gap-4 text-xs">
+              <div>
+                <span className="text-slate-500">Net </span>
+                <span className="font-mono font-bold text-snipe-accent">${pnlCurveData.net.toFixed(2)}</span>
+              </div>
+              <div>
+                <span className="text-slate-500">High </span>
+                <span className="font-mono text-emerald-400">${pnlCurveData.hi.toFixed(2)}</span>
+              </div>
+              <div>
+                <span className="text-slate-500">Low </span>
+                <span className="font-mono text-rose-400">${pnlCurveData.lo.toFixed(2)}</span>
+              </div>
+            </div>
+          </div>
+          <p className="mb-2 text-[11px] text-slate-500">Realized cumulative P&amp;L after each closed trade (chronological).</p>
+          <div className="h-[260px]">
             <ResponsiveContainer width="100%" height="100%">
-              <LineChart data={filteredPortfolioData}>
-                <CartesianGrid stroke="#334155" />
-                <XAxis dataKey="ts" stroke="#94a3b8" type="number" tickFormatter={formatPortfolioTick} domain={["dataMin", "dataMax"]} />
-                <YAxis stroke="#94a3b8" />
+              <LineChart data={pnlCurveData.pts} margin={{ top: 8, right: 12, left: 4, bottom: 4 }}>
+                <CartesianGrid stroke="#1e293b" vertical={false} />
+                <XAxis dataKey="idx" stroke="#64748b" tick={{ fill: "#64748b", fontSize: 10 }} />
+                <YAxis stroke="#64748b" tick={{ fill: "#94a3b8", fontSize: 10 }} tickFormatter={(v) => `$${v}`} width={56} />
                 <Tooltip
-                  formatter={(value: number, name: string) =>
-                    name === "balance" ? [`$${value.toFixed(2)}`, "Balance"] : [value, name]
-                  }
-                  labelFormatter={(label) => new Date(Number(label)).toLocaleString()}
+                  contentStyle={{ background: "#12161c", border: "1px solid #1c2230" }}
+                  formatter={(v: number | string) => [`$${fmtNum(v, 2)}`, "Cum. P&L"]}
+                  labelFormatter={(_, p) => (p?.[0]?.payload?.t ? String(p[0].payload.t) : "")}
                 />
                 <Line
                   type="monotone"
-                  dataKey="balance"
-                  stroke="#60a5fa"
+                  dataKey="cum"
+                  stroke="#2dd4bf"
                   strokeWidth={2}
-                  dot={false}
+                  dot={(props: { cx?: number; cy?: number; payload?: { win: boolean } }) => {
+                    const { cx, cy, payload } = props;
+                    if (cx == null || cy == null) return <g />;
+                    const fill = payload?.win ? "#34d399" : "#f87171";
+                    return <circle cx={cx} cy={cy} r={4} fill={fill} stroke="#0a0c10" strokeWidth={1} />;
+                  }}
+                  isAnimationActive={false}
                 />
+              </LineChart>
+            </ResponsiveContainer>
+          </div>
+          <div className="mt-3 flex flex-wrap gap-2 border-t border-snipe-border pt-3">
+            {(["1m", "1h", "day", "month", "year"] as const).map((range) => (
+              <button
+                key={range}
+                type="button"
+                onClick={() => setPortfolioRange(range)}
+                className={`rounded-lg px-2 py-1 text-[10px] font-semibold uppercase ${
+                  portfolioRange === range ? "bg-snipe-accent/20 text-snipe-accent" : "bg-snipe-panel text-slate-400"
+                }`}
+              >
+                Balance {range}
+              </button>
+            ))}
+          </div>
+          <div className="mt-3 h-[180px]">
+            <ResponsiveContainer width="100%" height="100%">
+              <LineChart data={filteredPortfolioData}>
+                <CartesianGrid stroke="#1e293b" />
+                <XAxis dataKey="ts" stroke="#64748b" type="number" tickFormatter={formatPortfolioTick} domain={["dataMin", "dataMax"]} />
+                <YAxis stroke="#64748b" tick={{ fill: "#94a3b8", fontSize: 10 }} />
+                <Tooltip
+                  formatter={(value: number | string, name: string) =>
+                    name === "balance" ? [`$${fmtNum(value, 2)}`, "Balance"] : [value, name]
+                  }
+                  labelFormatter={(label) => new Date(Number(label)).toLocaleString()}
+                />
+                <Line type="monotone" dataKey="balance" stroke="#60a5fa" strokeWidth={2} dot={false} />
               </LineChart>
             </ResponsiveContainer>
           </div>
         </section>
 
-        <section className="card col-span-8">
-          <div className="mb-3 flex items-center justify-between">
-            <h3 className="text-lg font-semibold">Order History</h3>
+        <section className="card col-span-12">
+          <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
+            <h3 className="font-display text-xs font-bold uppercase tracking-[0.2em] text-slate-400">Trade log filters</h3>
+            <button
+              type="button"
+              onClick={() => {
+                const header = "time,asset,strategy,side,prob,entry,exit,pnl,status";
+                const lines = tradeLogRows.map((r) =>
+                  [
+                    r.timeIso,
+                    r.asset,
+                    r.strategy,
+                    r.side,
+                    r.prob == null ? "" : r.prob.toFixed(4),
+                    r.entry.toFixed(6),
+                    r.exit == null ? "" : r.exit.toFixed(6),
+                    r.pnl.toFixed(6),
+                    r.status
+                  ].join(",")
+                );
+                const blob = new Blob([[header, ...lines].join("\n")], { type: "text/csv;charset=utf-8" });
+                const url = URL.createObjectURL(blob);
+                const a = document.createElement("a");
+                a.href = url;
+                a.download = `trade-log-${tradeLogFrom}-to-${tradeLogTo}.csv`;
+                a.click();
+                URL.revokeObjectURL(url);
+              }}
+              disabled={tradeLogRows.length === 0}
+              className="rounded bg-slate-600 px-3 py-1.5 text-xs text-slate-100 hover:bg-slate-500 disabled:cursor-not-allowed disabled:opacity-40"
+            >
+              Download CSV
+            </button>
+          </div>
+          <div className="mb-3 flex flex-wrap gap-2">
+            {([
+              ["today", "Today"],
+              ["yesterday", "Yesterday"],
+              ["7d", "7d"],
+              ["30d", "30d"],
+              ["custom", "Custom"]
+            ] as const).map(([id, label]) => (
+              <button
+                key={id}
+                type="button"
+                onClick={() => setTradeLogPreset(id)}
+                className={`rounded-lg px-2 py-1 text-[10px] font-bold uppercase ${
+                  tradeLogPreset === id ? "bg-snipe-accent text-[#061016]" : "bg-snipe-panel text-slate-400"
+                }`}
+              >
+                {label}
+              </button>
+            ))}
+            <label className="ml-2 text-xs text-slate-400">
+              From{" "}
+              <input
+                type="date"
+                value={tradeLogFrom}
+                onChange={(e) => {
+                  setTradeLogPreset("custom");
+                  setTradeLogFrom(e.target.value);
+                }}
+                className="rounded bg-slate-800 px-2 py-1 text-slate-200"
+              />
+            </label>
+            <label className="text-xs text-slate-400">
+              To{" "}
+              <input
+                type="date"
+                value={tradeLogTo}
+                onChange={(e) => {
+                  setTradeLogPreset("custom");
+                  setTradeLogTo(e.target.value);
+                }}
+                className="rounded bg-slate-800 px-2 py-1 text-slate-200"
+              />
+            </label>
+            <select
+              value={tradeLogAsset}
+              onChange={(e) => setTradeLogAsset(e.target.value)}
+              className="rounded bg-slate-800 px-2 py-1 text-xs text-slate-200"
+            >
+              <option value="ALL">Asset: All</option>
+              <option value="BTC">BTC</option>
+              <option value="ETH">ETH</option>
+              <option value="SOL">SOL</option>
+              <option value="XRP">XRP</option>
+              <option value="DOGE">DOGE</option>
+            </select>
+            <select
+              value={tradeLogStrategy}
+              onChange={(e) => setTradeLogStrategy(e.target.value)}
+              className="rounded bg-slate-800 px-2 py-1 text-xs text-slate-200"
+            >
+              <option value="ALL">Strategy: All</option>
+              <option value="lag_snipe">lag_snipe</option>
+              <option value="ola">ola</option>
+              <option value="ensemble">ensemble</option>
+              <option value="whale_edge">whale_edge</option>
+              <option value="orderbook">orderbook</option>
+              <option value="mean_revert">mean_revert</option>
+              <option value="chart">chart</option>
+              <option value="momentum">momentum</option>
+            </select>
+            <select
+              value={tradeLogSession}
+              onChange={(e) => setTradeLogSession(e.target.value as "24h" | "AM" | "PM")}
+              className="rounded bg-slate-800 px-2 py-1 text-xs text-slate-200"
+            >
+              <option value="24h">Session: 24h</option>
+              <option value="AM">Session: AM</option>
+              <option value="PM">Session: PM</option>
+            </select>
+          </div>
+          <p className="mb-2 text-xs text-slate-400">
+            {tradeLogStats
+              ? `Trades ${tradeLogStats.total} · Win ${tradeLogStats.winRate.toFixed(1)}% · PnL ${
+                  tradeLogStats.pnl >= 0 ? "+" : ""
+                }$${tradeLogStats.pnl.toFixed(2)} · Avg ${tradeLogStats.avgPnl >= 0 ? "+" : ""}$${tradeLogStats.avgPnl.toFixed(
+                  2
+                )} · Best asset ${tradeLogStats.bestAsset ?? "—"} · Best strategy ${tradeLogStats.bestStrategy ?? "—"}`
+              : "Loading trade log stats..."}
+          </p>
+          <div className="max-h-[300px] overflow-auto">
+            <table className="w-full text-left text-xs">
+              <thead className="sticky top-0 bg-[#0c0f14] text-[10px] uppercase tracking-wide text-slate-500">
+                <tr>
+                  <th className="px-2 py-2">Time</th>
+                  <th className="px-2 py-2">Asset</th>
+                  <th className="px-2 py-2">Strategy</th>
+                  <th className="px-2 py-2">Side</th>
+                  <th className="px-2 py-2">Prob</th>
+                  <th className="px-2 py-2">Entry</th>
+                  <th className="px-2 py-2">Exit</th>
+                  <th className="px-2 py-2">PnL</th>
+                </tr>
+              </thead>
+              <tbody className="font-mono text-[11px]">
+                {tradeLogLoading ? (
+                  <tr>
+                    <td colSpan={8} className="px-2 py-4 text-slate-500">
+                      Loading...
+                    </td>
+                  </tr>
+                ) : tradeLogRows.length === 0 ? (
+                  <tr>
+                    <td colSpan={8} className="px-2 py-4 text-slate-500">
+                      No rows for this filter.
+                    </td>
+                  </tr>
+                ) : (
+                  tradeLogRows.map((r) => (
+                    <tr key={r.id} className="border-b border-white/[0.04]">
+                      <td className="px-2 py-2 text-slate-400">{new Date(r.timeIso).toLocaleString()}</td>
+                      <td className="px-2 py-2 text-slate-300">{r.asset}</td>
+                      <td className="px-2 py-2 text-slate-400">{r.strategy}</td>
+                      <td className={`px-2 py-2 font-bold ${r.side === "UP" ? "text-emerald-400" : "text-rose-400"}`}>
+                        {r.side === "UP" ? "YES" : "NO"}
+                      </td>
+                      <td className="px-2 py-2">{r.prob == null ? "—" : `${(r.prob * 100).toFixed(1)}%`}</td>
+                      <td className="px-2 py-2">{(r.entry * 100).toFixed(2)}</td>
+                      <td className="px-2 py-2 text-slate-400">{r.exit == null ? "—" : (r.exit * 100).toFixed(2)}</td>
+                      <td className={`px-2 py-2 ${r.pnl >= 0 ? "text-emerald-400" : "text-rose-400"}`}>
+                        {r.pnl >= 0 ? "+" : ""}${r.pnl.toFixed(3)}
+                      </td>
+                    </tr>
+                  ))
+                )}
+              </tbody>
+            </table>
+          </div>
+        </section>
+
+        <section className="card col-span-12 lg:col-span-8">
+          <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
+            <h3 className="font-display text-xs font-bold uppercase tracking-[0.2em] text-slate-400">Recent sample trades</h3>
             <div className="flex gap-2">
               {(["ALL", "WIN", "LOSS"] as const).map((f) => (
-                <button key={f} onClick={() => setHistoryFilter(f)} className="rounded bg-slate-700 px-2 py-1 text-xs">
+                <button
+                  key={f}
+                  type="button"
+                  onClick={() => setHistoryFilter(f)}
+                  className={`rounded-lg px-2 py-1 text-[10px] font-bold uppercase ${
+                    historyFilter === f ? "bg-snipe-accent text-[#061016]" : "bg-snipe-panel text-slate-400"
+                  }`}
+                >
                   {f}
                 </button>
               ))}
             </div>
           </div>
-          <div className="max-h-[260px] overflow-auto">
-            <table className="w-full text-sm">
-              <thead className="text-slate-400">
+          <div className="max-h-[320px] overflow-auto">
+            <table className="w-full text-left text-xs">
+              <thead className="sticky top-0 bg-[#0c0f14] text-[10px] uppercase tracking-wide text-slate-500">
                 <tr>
-                  <th>Time</th>
-                  <th>Market</th>
-                  <th>Price</th>
-                  <th>Amount</th>
-                  <th>P&L</th>
-                  <th>Status</th>
-                  <th>Reason</th>
+                  <th className="px-2 py-2">Time</th>
+                  <th className="px-2 py-2">Asset</th>
+                  <th className="px-2 py-2">Side</th>
+                  <th className="px-2 py-2">UP@entry</th>
+                  <th className="px-2 py-2">DN@entry</th>
+                  <th className="px-2 py-2">In</th>
+                  <th className="px-2 py-2">Out</th>
+                  <th className="px-2 py-2">P&amp;L</th>
+                  <th className="px-2 py-2">Reason</th>
+                  <th className="px-2 py-2">Market</th>
                 </tr>
               </thead>
-              <tbody>
+              <tbody className="font-mono text-[11px]">
                 {filteredTrades.map((t) => (
-                  <tr key={t.id}>
-                    <td>{t.time}</td>
-                    <td>{t.market}</td>
-                    <td>{t.price.toFixed(3)}</td>
-                    <td>${t.amount.toFixed(2)}</td>
-                    <td className={t.pnl >= 0 ? "text-gain" : "text-loss"}>{t.pnl.toFixed(2)}</td>
-                    <td>{t.status}</td>
-                    <td className="max-w-[240px] truncate text-xs text-slate-300">{t.decisionReason ?? "-"}</td>
+                  <tr key={t.id} className="border-b border-white/[0.04]">
+                    <td className="px-2 py-2 text-slate-400">{t.time}</td>
+                    <td className="px-2 py-2 font-semibold text-slate-300">{t.asset ?? "—"}</td>
+                    <td className={`px-2 py-2 font-bold ${t.direction === "UP" ? "text-emerald-400" : "text-rose-400"}`}>
+                      {t.direction === "UP" ? "YES" : "NO"}
+                    </td>
+                    <td className="px-2 py-2 text-emerald-300/90">{fmtEntryMidPct(t.upPriceAtEntry)}</td>
+                    <td className="px-2 py-2 text-rose-300/90">{fmtEntryMidPct(t.downPriceAtEntry)}</td>
+                    <td className="px-2 py-2">{(Number(t.price ?? 0) * 100).toFixed(2)}</td>
+                    <td className="px-2 py-2 text-slate-400">
+                      {isPaperNoFill(t) ? "—" : t.status === "WIN" ? "100.00" : t.status === "LOSS" ? "0.00" : "—"}
+                    </td>
+                    <td className={`px-2 py-2 ${isPaperNoFill(t) ? "text-slate-500" : Number(t.pnl ?? 0) >= 0 ? "text-emerald-400" : "text-rose-400"}`}>
+                      {isPaperNoFill(t) ? "NO FILL" : `${Number(t.pnl ?? 0) >= 0 ? "+" : ""}$${Number(t.pnl ?? 0).toFixed(2)}`}
+                    </td>
+                    <td className="max-w-[180px] truncate px-2 py-2 text-[10px] text-slate-500" title={t.decisionReason}>
+                      {t.decisionReason ?? t.status}
+                    </td>
+                    <td className="px-2 py-2 text-slate-500">{t.market}</td>
                   </tr>
                 ))}
               </tbody>
@@ -1720,21 +3091,102 @@ export function App() {
           </div>
         </section>
 
-        <section className="card col-span-4 space-y-2">
+        <section className="card col-span-12 lg:col-span-4 space-y-2">
           <h3 className="text-lg font-semibold">Stats</h3>
-          <p>Win Rate: {stats.winRate.toFixed(2)}%</p>
-          <p>Profit Factor: {stats.profitFactor.toFixed(2)}</p>
-          <p>Net P&L: ${stats.net.toFixed(2)}</p>
+          <p>Win Rate: {fmtNum(stats.winRate, 2)}%</p>
+          <p>Profit Factor: {Number.isFinite(stats.profitFactor) ? stats.profitFactor.toFixed(2) : "—"}</p>
+          <p>
+            Net P&amp;L: ${fmtNum(stats.net, 2)}
+          </p>
           <p>Gross Win: ${stats.grossWin.toFixed(2)}</p>
           <p>Gross Loss: ${stats.grossLoss.toFixed(2)}</p>
           <div className="mt-3 rounded-lg bg-slate-900/70 p-2 text-xs">
             <p>Bot Activity Trades: {insights?.totalTrades ?? 0}</p>
             <p>No-Trade Signals: {insights?.noTradeSignals ?? 0}</p>
-            {(insights?.marketWinRates ?? []).slice(0, 3).map((m) => (
-              <p key={m.market}>
-                {m.market}: {m.winRate.toFixed(1)}% ({m.trades})
+            <p>HighConf mid blocks (SIGNAL_MODE=highConf): {insights?.highConfMidBlocked ?? 0}</p>
+            <p className="text-slate-400">
+              BONE entry blocks — highConf: {insights?.boneEntryFilters?.highConf ?? 0}, eq:{" "}
+              {insights?.boneEntryFilters?.equilibrium ?? 0}, longshot: {insights?.boneEntryFilters?.longshot ?? 0}, latency:{" "}
+              {insights?.boneEntryFilters?.latency ?? 0}
+            </p>
+            {(insights?.marketWinRates ?? []).slice(0, 3).map((m, idx) => (
+              <p key={m?.market ?? `mwr-${idx}`}>
+                {m?.market ?? "—"}: {fmtNum(m?.winRate, 1)}% ({fmtNum(m?.trades, 0)})
               </p>
             ))}
+          </div>
+        </section>
+
+        <section className="card col-span-12 space-y-3">
+          <div className="flex flex-wrap items-end justify-between gap-3">
+            <div className="min-w-0 flex-1 space-y-1">
+              <h3 className="text-lg font-semibold">API connectivity</h3>
+              <p className="max-w-3xl text-xs text-slate-400">
+                Covers integrations used by this app: Gamma (tags, markets, events), Data API (activity, trades), CLOB REST (/,
+                /time, public /book), <code className="text-slate-300">@polymarket/clob-client</code> book path via the engine,
+                RTDS (shared socket, PING→PONG RTT — not a cold connect per refresh), optional{" "}
+                <code className="text-slate-300">RPC_URL</code>, and Coinbase /
+                Binance spot (BTC + ETH). Measured from the server. No login required.
+              </p>
+              {pingData ? (
+                <p className="text-[11px] text-slate-500">
+                  Last run: {new Date(pingData.ts).toLocaleString()} · {pingData.results.filter((r) => r.ok).length}/
+                  {pingData.results.length} OK
+                </p>
+              ) : (
+                <p className="text-[11px] text-slate-500">No results yet — press Refresh.</p>
+              )}
+            </div>
+            <button
+              type="button"
+              onClick={() => void runConnectivityPings()}
+              disabled={pingBusy}
+              className="rounded bg-emerald-600 px-3 py-1.5 text-xs font-semibold text-white hover:bg-emerald-500 disabled:cursor-not-allowed disabled:opacity-50"
+            >
+              {pingBusy ? "Pinging…" : "Refresh"}
+            </button>
+          </div>
+          <div className="max-h-[360px] overflow-auto rounded-lg border border-white/[0.06] bg-slate-950/60">
+            {pingData && pingData.results.length > 0 ? (
+              <table className="w-full text-left text-xs">
+                <thead className="sticky top-0 bg-[#0c0f14] text-[10px] uppercase tracking-wide text-slate-500">
+                  <tr>
+                    <th className="px-3 py-2">Check</th>
+                    <th className="px-3 py-2">Latency</th>
+                    <th className="px-3 py-2">HTTP</th>
+                    <th className="px-3 py-2">Status</th>
+                    <th className="px-3 py-2">URL / error</th>
+                  </tr>
+                </thead>
+                <tbody className="font-mono text-[11px]">
+                  {pingData.results.map((r) => (
+                    <tr key={r.id} className="border-b border-white/[0.04]">
+                      <td className="px-3 py-2 text-slate-200">{r.label}</td>
+                      <td className="px-3 py-2">{r.ms} ms</td>
+                      <td className="px-3 py-2 text-slate-400">{r.httpStatus || "—"}</td>
+                      <td className="px-3 py-2">
+                        <span
+                          className={
+                            r.ok
+                              ? "rounded bg-emerald-500/20 px-1.5 py-0.5 text-emerald-400"
+                              : "rounded bg-rose-500/20 px-1.5 py-0.5 text-rose-400"
+                          }
+                        >
+                          {r.ok ? "OK" : "FAIL"}
+                        </span>
+                      </td>
+                      <td className="max-w-[min(520px,50vw)] truncate px-3 py-2 text-slate-500" title={r.url}>
+                        {r.error ?? r.note ?? r.url}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            ) : (
+              <p className="p-4 text-sm text-slate-500">
+                {pingBusy ? "Running checks (up to ~12s each)…" : "Click Refresh to measure endpoints from the server."}
+              </p>
+            )}
           </div>
         </section>
 
@@ -1814,19 +3266,19 @@ export function App() {
                   </p>
                   <p>
                     <span className="text-slate-500">Best bid</span>{" "}
-                    <span className="text-slate-100">{b.bestBid.toFixed(4)}</span>
+                    <span className="text-slate-100">{fmtNum(b.bestBid, 4)}</span>
                     {" · "}
                     <span className="text-slate-500">Best ask</span>{" "}
-                    <span className="text-slate-100">{b.bestAsk.toFixed(4)}</span>
+                    <span className="text-slate-100">{fmtNum(b.bestAsk, 4)}</span>
                     {" · "}
                     <span className="text-slate-500">Computed spread</span>{" "}
-                    <span className="text-slate-100">{b.spread.toFixed(4)}</span>
+                    <span className="text-slate-100">{fmtNum(b.spread, 4)}</span>
                     <span className="text-slate-500"> (= ask − bid)</span>
                   </p>
                   <p>
                     <span className="text-slate-500">Mid / liquidity</span>{" "}
-                    <span className="text-slate-100">{b.mid.toFixed(4)}</span> ·{" "}
-                    <span className="text-slate-100">{b.liquidity.toFixed(0)}</span>
+                    <span className="text-slate-100">{fmtNum(b.mid, 4)}</span> ·{" "}
+                    <span className="text-slate-100">{fmtNum(b.liquidity, 0)}</span>
                   </p>
                   <p>
                     <span className="text-slate-500">Time since market rollover</span>{" "}
@@ -1905,10 +3357,18 @@ export function App() {
             ))}
           </div>
         </section>
+          </div>
+        )}
       </main>
+      <p className="mx-auto max-w-[1800px] px-4 py-2 text-[10px] leading-snug text-slate-600 sm:px-6">
+        PolyBot is self-hosted software provided as-is. Automated trading and prediction markets involve substantial risk;
+        you are responsible for keys, configuration, and compliance with applicable law.
+      </p>
 
-      <div className="fixed bottom-0 left-0 right-0 z-40 border-t border-slate-600 bg-[#0b1220]/98 shadow-[0_-4px_24px_rgba(0,0,0,0.35)] backdrop-blur">
-        <div className="mx-auto flex max-w-[1400px] flex-col gap-1 px-4 py-2">
+      </div>
+
+      <div className="fixed bottom-0 left-0 right-0 z-40 border-t border-snipe-border bg-snipe-sidebar/98 shadow-[0_-8px_32px_rgba(0,0,0,0.5)] backdrop-blur">
+        <div className="mx-auto flex max-w-[1600px] flex-col gap-1 px-5 py-2">
           <div className="flex items-center justify-between gap-2">
             <h3 className="text-xs font-semibold uppercase tracking-wide text-sky-300">API inspection (live)</h3>
             <div className="flex items-center gap-2">
@@ -1916,7 +3376,7 @@ export function App() {
               <button
                 type="button"
                 onClick={() => setInspectionLogs([])}
-                className="rounded bg-slate-700 px-2 py-0.5 text-[10px] text-slate-200 hover:bg-slate-600"
+                className="rounded bg-slate-700 px-2 py-0.5 text-[10px] text-slate-200 transition hover:bg-slate-600"
               >
                 Clear
               </button>
@@ -1949,91 +3409,131 @@ export function App() {
       </div>
 
       {showWalletHelp ? (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4">
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4"
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="wallet-help-title"
+        >
           <div className="w-full max-w-md rounded-2xl border border-slate-700 bg-panel p-4">
-            <h4 className="mb-2 text-lg font-semibold">Wallet Required</h4>
+            <h4 id="wallet-help-title" className="mb-2 text-lg font-semibold">
+              Wallet Required
+            </h4>
             <p className="mb-4 text-sm text-slate-300">
               MetaMask wallet extension was not detected. Install it, then retry login.
             </p>
             <div className="flex gap-2">
               <button
+                type="button"
                 onClick={() => window.open("https://metamask.io/download/", "_blank", "noopener,noreferrer")}
-                className="flex-1 rounded-lg bg-sky-500/20 px-3 py-2 text-sm text-sky-300"
+                className="flex-1 rounded-lg bg-sky-500/20 px-3 py-2 text-sm text-sky-300 transition hover:bg-sky-500/30"
               >
                 Install MetaMask
               </button>
               <button
+                type="button"
                 onClick={async () => {
                   const ok = await connectAndLogin();
                   if (ok) setShowWalletHelp(false);
                 }}
-                className="flex-1 rounded-lg bg-gain/20 px-3 py-2 text-sm text-gain"
+                className="flex-1 rounded-lg bg-gain/20 px-3 py-2 text-sm text-gain transition hover:bg-gain/30"
               >
                 Retry Login
               </button>
             </div>
-            <button onClick={() => setShowWalletHelp(false)} className="mt-3 w-full rounded-lg bg-slate-700 py-2 text-sm">
+            <button
+              type="button"
+              onClick={() => setShowWalletHelp(false)}
+              className="mt-3 w-full rounded-lg bg-slate-700 py-2 text-sm transition hover:bg-slate-600"
+            >
               Close
             </button>
           </div>
         </div>
       ) : null}
       {showPasswordLogin ? (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4">
-          <div className="w-full max-w-md rounded-2xl border border-slate-700 bg-panel p-4">
-            <h4 className="mb-2 text-lg font-semibold">User login → Polymarket</h4>
-            <p className="mb-3 text-sm text-slate-300">
-              Enter <strong>APP_USER_ID</strong> and <strong>APP_PASSWORD</strong> from <code className="text-sky-300">server/.env</code>.
-              This unlocks the dashboard. The same button then loads your <strong>Polymarket CLOB</strong> balance and orders using the
-              wallet configured on the server (not polymarket.com email login).
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/75 p-4 backdrop-blur-sm"
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="login-dialog-title"
+        >
+          <div className="w-full max-w-md rounded-2xl bg-gradient-to-br from-snipe-accent/25 via-snipe-border to-transparent p-[1px] shadow-[0_0_60px_rgba(52,211,153,0.12)]">
+            <div className="rounded-2xl border border-snipe-border bg-[#0d1118] px-8 py-8">
+            <div className="mb-1 flex items-center gap-2">
+              <svg width="28" height="28" viewBox="0 0 24 24" fill="none" aria-hidden className="text-snipe-accent">
+                <path
+                  d="M13 2L3 14h8l-1 8 10-12h-8l1-8z"
+                  fill="currentColor"
+                  opacity="0.95"
+                />
+              </svg>
+              <span id="login-dialog-title" className="font-display text-2xl font-bold tracking-tight">
+                <span className="text-snipe-accent">Poly</span>
+                <span className="text-[#e2e8f0]">Bot</span>
+              </span>
+            </div>
+            <p className="mb-6 text-sm text-slate-500">Authorized buyer access only.</p>
+            <div className="mb-6 inline-flex rounded-full border border-snipe-accent/60 bg-snipe-accent/10 px-3 py-1.5">
+              <span className="text-[10px] font-bold uppercase tracking-[0.2em] text-snipe-accent">Secure local login</span>
+            </div>
+            <div className="mb-4">
+              <label className="mb-1.5 block text-[10px] font-bold uppercase tracking-wider text-slate-500">User ID</label>
+              <input
+                value={userIdInput}
+                onChange={(e) => setUserIdInput(e.target.value)}
+                placeholder="APP_USER_ID from server/.env"
+                className="w-full rounded-xl border border-snipe-border bg-[#080a0f] px-4 py-3 text-sm text-slate-200 outline-none placeholder:text-slate-600 focus:border-snipe-accent/50 focus:ring-2 focus:ring-snipe-accent/25"
+              />
+            </div>
+            <div className="mb-6">
+              <label className="mb-1.5 block text-[10px] font-bold uppercase tracking-wider text-slate-500">Password</label>
+              <input
+                type="password"
+                value={passwordInput}
+                onChange={(e) => setPasswordInput(e.target.value)}
+                placeholder="Enter dashboard password"
+                className="w-full rounded-xl border border-snipe-border bg-[#080a0f] px-4 py-3 text-sm text-slate-200 outline-none placeholder:text-slate-600 focus:border-snipe-accent/50 focus:ring-2 focus:ring-snipe-accent/25"
+                onKeyDown={(e) => {
+                  if (e.key === "Enter") void passwordLogin();
+                }}
+              />
+            </div>
+            <button
+              type="button"
+              onClick={signInAndConnectPolymarket}
+              className="mb-4 w-full rounded-xl bg-snipe-accent py-3.5 text-base font-bold text-[#061016] shadow-lg shadow-snipe-accent/20 transition hover:brightness-110 disabled:cursor-not-allowed disabled:opacity-60"
+              disabled={isAuthenticating || isPolyConnecting}
+            >
+              {isAuthenticating || isPolyConnecting ? "Working…" : "Sign In"}
+            </button>
+            <p className="mb-4 text-center text-[11px] leading-relaxed text-slate-600">
+              If sign-in is locked after repeated failures, restart the bot process to clear the lockout.
             </p>
-            <input
-              value={userIdInput}
-              onChange={(e) => setUserIdInput(e.target.value)}
-              placeholder="User ID"
-              className="mb-2 w-full rounded-lg bg-slate-800 px-3 py-2 text-sm outline-none"
-            />
-            <input
-              type="password"
-              value={passwordInput}
-              onChange={(e) => setPasswordInput(e.target.value)}
-              placeholder="Password"
-              className="mb-3 w-full rounded-lg bg-slate-800 px-3 py-2 text-sm outline-none"
-            />
-            <div className="flex flex-col gap-2">
+            <div className="flex flex-wrap gap-2 border-t border-snipe-border/80 pt-4">
               <button
                 type="button"
-                onClick={signInAndConnectPolymarket}
-                className="w-full rounded-lg bg-sky-500/30 px-3 py-2.5 text-sm font-semibold text-sky-100 transition hover:bg-sky-500/40"
+                onClick={passwordLogin}
+                className="flex-1 rounded-lg bg-snipe-panel px-3 py-2 text-xs font-medium text-slate-300 ring-1 ring-snipe-border transition hover:bg-slate-800 disabled:cursor-not-allowed disabled:opacity-50"
                 disabled={isAuthenticating || isPolyConnecting}
               >
-                {isAuthenticating || isPolyConnecting ? "Working…" : "Sign in & connect Polymarket"}
+                Sign in only
               </button>
-              <div className="flex gap-2">
-                <button
-                  type="button"
-                  onClick={passwordLogin}
-                  className="flex-1 rounded-lg bg-slate-700 px-3 py-2 text-xs text-slate-200"
-                  disabled={isAuthenticating || isPolyConnecting}
-                >
-                  Sign in only
-                </button>
-                <button
-                  type="button"
-                  onClick={refreshPolymarketAccount}
-                  className="flex-1 rounded-lg bg-gain/15 px-3 py-2 text-xs text-gain"
-                  disabled={isPolyConnecting || !isLoggedIn}
-                >
-                  {isPolyConnecting ? "…" : "Refresh Polymarket"}
-                </button>
-                <button
-                  type="button"
-                  onClick={() => setShowPasswordLogin(false)}
-                  className="flex-1 rounded-lg bg-slate-700 px-3 py-2 text-xs"
-                >
-                  Close
-                </button>
-              </div>
+              <button
+                type="button"
+                onClick={refreshPolymarketAccount}
+                className="flex-1 rounded-lg bg-snipe-panel px-3 py-2 text-xs font-medium text-snipe-accent ring-1 ring-snipe-accent/30 transition hover:bg-slate-800 disabled:cursor-not-allowed disabled:opacity-50"
+                disabled={isPolyConnecting || !isLoggedIn}
+              >
+                {isPolyConnecting ? "…" : "Refresh Polymarket"}
+              </button>
+              <button
+                type="button"
+                onClick={() => setShowPasswordLogin(false)}
+                className="rounded-lg bg-snipe-panel px-3 py-2 text-xs text-slate-500 ring-1 ring-snipe-border transition hover:bg-slate-800 hover:text-slate-300"
+              >
+                Close
+              </button>
             </div>
             {polyAccount ? (
               <div className="mt-3 rounded-lg border border-slate-700 bg-slate-900/70 p-3 text-xs text-slate-200">
@@ -2054,6 +3554,7 @@ export function App() {
                 </p>
               </div>
             ) : null}
+            </div>
           </div>
         </div>
       ) : null}
