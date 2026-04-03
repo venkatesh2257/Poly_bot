@@ -1,7 +1,7 @@
 const WebSocket = require("ws");
 
 const RTDS_URL = "wss://ws-live-data.polymarket.com";
-const subs = [{ topic: "crypto_prices_chainlink", type: "*", filters: '{"symbol":"eth/usd"}' }];
+const subs = [{ topic: "crypto_prices_chainlink", type: "*", filters: '{"symbol":"xrp/usd"}' }];
 
 const WS_CONNECT_OPTS = { perMessageDeflate: false, handshakeTimeout: 12000 };
 const ws = new WebSocket(RTDS_URL, WS_CONNECT_OPTS);
