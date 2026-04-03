@@ -1,30 +1,86 @@
 import { randomUUID } from "node:crypto";
 import type {
   BetLogEntry,
+  BotTradeHistoryRecord,
+  DashboardEntryStrategyId,
   Direction,
   DirectionalContext,
   BotPhase,
+  EntryStrategyKind,
+  EntryStrategyState,
   GtcExitMetrics,
   Insights,
   LogLevel,
   MarketContext,
   MarketOption,
   MarketPoint,
+  MarketWsPayload,
   Prediction,
+  RiskSettingsSnapshot,
   Status,
   Trade,
   TradingState
 } from "../types/index.js";
+import {
+  executePaperLimitBuyOrder,
+  normalizeRawOrderBook,
+  simulatePaperMarketSell
+} from "./paperExecution.js";
+import { computeEnsemble, type MidSample } from "./ensembleStrategy.js";
+import { evaluateWhaleEdgeGate, whalePaperTakeProfitMid } from "./whaleStrategy.js";
+import { runConnectivityPings } from "./apiPings.js";
 import { fetchBtcUsd } from "./btcPriceFeed.js";
+import { fetchUsdSpot } from "./cryptoPriceFeed.js";
+import { fetchGammaDisplayStats } from "./gammaDisplayStats.js";
+import { ChainlinkFeedService, type ChainlinkUsdPriceTick } from "./chainlinkFeed.js";
+import { PolymarketRtdsFeed } from "./polymarketRtdsFeed.js";
+import {
+  applyRiskToProcessEnv,
+  resolveServerDotEnvPath,
+  writeRiskSettingsToDotEnv,
+  type RiskEnvValues
+} from "./envFile.js";
 import { WalletService } from "./wallet.js";
+import { BinanceAggTradeFeed } from "./binanceAggTradeFeed.js";
+import {
+  OLA_KILL_SWITCH_LOSS_FRAC,
+  OLA_KILL_WINDOW_MS,
+  olaBookSnipeAllowed,
+  olaDirectionFromOracle,
+  olaOracleVersusTarget,
+  olaSecondsToExpiryAbort,
+  olaSlippageExceeded,
+  olaSnipeAskCap,
+  olaThresholdUsd,
+  olaWindowSpendCap,
+  OLA_SLIPPAGE_FRAC
+} from "./olaStrategy.js";
+import {
+  loadBotFiltersConfig,
+  tradeAssetAllowedByConfig,
+  bookMidSpread01,
+  slippageFracFromConfig,
+  type BotFiltersConfig
+} from "./botFiltersConfig.js";
+import {
+  fetchLastFiveClosed1mBtcUsdt,
+  fetchLastFiveClosed1mEthUsdt,
+  type KlineOhlc
+} from "./binance1mKlines.js";
+import {
+  candleSignalFromFive,
+  lagSnipeCalcSizeFromDepth,
+  lagSnipeConfirmationsRequired,
+  lagSnipeDirectionFromUpProb,
+  lagSnipeInWindow,
+  lagSnipeLiquidityConfirmation,
+  lagSnipeMaxSecondsLeft,
+  lagSnipeMinProb,
+  lagSnipePremiumDirectionFromOracleDiff,
+  lagSnipeSrOk
+} from "./lagSnipeStrategy.js";
 
 const START_BALANCE = Number(process.env.START_BALANCE ?? 1000);
-const MIN_TRADE = Number(process.env.MIN_TRADE ?? 1);
-const MAX_TRADE = Number(process.env.MAX_TRADE ?? 300);
-const COOLDOWN_MS = Number(process.env.COOLDOWN_MS ?? 1500);
-const STOP_LOSS = Number(process.env.STOP_LOSS ?? 300);
-/** Fixed USD collateral per entry (auto + manual sizing baseline). Override with ENTRY_USD in .env */
-const ENTRY_USD = Number(process.env.ENTRY_USD ?? 1);
 /** Default caps; effective values read inside trade() after dotenv (engine imports before index loads .env). */
 const DEFAULT_MAX_SPREAD = 0.15;
 const DEFAULT_MIN_LIQUIDITY = 80;
@@ -48,6 +104,17 @@ function liveCloseEntryOnFill() {
   return String(process.env.LIVE_CLOSE_ENTRY_ON_FILL ?? "true").toLowerCase() !== "false";
 }
 
+/** Optional: `highConf` requires mid ≥ threshold OR (confidence×mid) ≥ threshold before book checks. */
+function signalModeHighConf() {
+  return String(process.env.SIGNAL_MODE ?? "").toLowerCase() === "highconf";
+}
+
+function highConfMidThreshold() {
+  const t = envNum("HIGH_CONF_MID_THRESHOLD", 0.92);
+  if (!Number.isFinite(t) || t <= 0 || t > 1) return 0.92;
+  return t;
+}
+
 function clampGtcPrice(): number {
   const target = envNum("GTC_EXIT_PRICE", 0.95);
   const min = envNum("GTC_PRICE_MIN", 0.9);
@@ -61,6 +128,65 @@ function gtcFillLockPct(): number {
   return p;
 }
 
+function boneEnvTrue(key: string): boolean {
+  return String(process.env[key] ?? "").toLowerCase() === "true";
+}
+
+/** When using ensemble, apply whale_edge liquidity/time/spread gates on the combined vote (default on). */
+function ensembleApplyWhaleFilter(): boolean {
+  const v = process.env.ENSEMBLE_APPLY_WHALE_FILTER;
+  if (v == null || v === "") return true;
+  return String(v).toLowerCase() !== "false" && String(v) !== "0";
+}
+
+function olaUseWhaleFilter(): boolean {
+  return String(process.env.OLA_USE_WHALE_FILTER ?? "").toLowerCase() === "true";
+}
+
+/** Exact high-conf scalping defaults (60% depth + 0.60 conf×mid floor + mid≥HIGH_CONF_MID_THRESHOLD OR). */
+const BONE_SCALP_MIN_CONF_PCT = 96;
+const BONE_SCALP_MIN_CONF_TIMES_MID = 0.6;
+const BONE_SCALP_WHALE_FRAC = 0.6;
+
+/** Parsed from `ENTRY_STRATEGY` only (contrarian is .env-only). Empty env defaults to ensemble (all legs). */
+function parseEnvEntryStrategy(): EntryStrategyKind {
+  const raw = process.env.ENTRY_STRATEGY;
+  const s = String(raw == null || String(raw).trim() === "" ? "ensemble" : raw).toLowerCase().trim();
+  if (s === "spot_poly_lag" || s === "spot-poly-lag" || s === "spl") return "spot_poly_lag";
+  if (s === "contrarian" || s === "fade") return "contrarian";
+  if (s === "orderbook" || s === "book") return "orderbook";
+  if (s === "mean_revert" || s === "revert" || s === "fade_odds") return "mean_revert";
+  if (s === "chart" || s === "pseudo" || s === "synthetic") return "chart";
+  if (s === "whale_edge" || s === "whale" || s === "edge") return "whale_edge";
+  if (s === "ensemble" || s === "all" || s === "combined") return "ensemble";
+  if (s === "ola" || s === "latency" || s === "oracle_latency") return "ola";
+  return "momentum";
+}
+
+function parseDashboardEntryStrategyId(raw: unknown): DashboardEntryStrategyId | null {
+  if (typeof raw !== "string") return null;
+  const s = raw.trim().toLowerCase();
+  if (s === "momentum") return "momentum";
+  if (s === "spot_poly_lag" || s === "spot-poly-lag" || s === "spl") return "spot_poly_lag";
+  if (s === "orderbook" || s === "book") return "orderbook";
+  if (s === "mean_revert" || s === "revert" || s === "fade_odds") return "mean_revert";
+  if (s === "chart") return "chart";
+  if (s === "whale_edge" || s === "whale" || s === "edge") return "whale_edge";
+  if (s === "ensemble" || s === "all" || s === "combined") return "ensemble";
+  if (s === "ola" || s === "latency" || s === "oracle_latency") return "ola";
+  return null;
+}
+
+/** How momentum is measured when ENTRY_STRATEGY=momentum (ignored for orderbook signal path). */
+type MomentumModeKind = "ticks" | "weighted" | "from_open";
+
+function momentumMode(): MomentumModeKind {
+  const s = String(process.env.MOMENTUM_MODE ?? "ticks").toLowerCase();
+  if (s === "weighted" || s === "w") return "weighted";
+  if (s === "from_open" || s === "window" || s === "open") return "from_open";
+  return "ticks";
+}
+
 export class TradingEngine {
   private wallet = new WalletService();
   private running = false;
@@ -68,6 +194,9 @@ export class TradingEngine {
   private balance = START_BALANCE;
   private trades: Trade[] = [];
   private marketData: MarketPoint[] = [];
+  /** Per-asset spot vs target for UI charts (same cadence as primary series). */
+  private assetSpotSeries = new Map<string, MarketPoint[]>();
+  private assetSpotChartWindowKey = new Map<string, string>();
   private phase: BotPhase = "STOPPED";
   private phaseReason?: string;
   /**
@@ -83,7 +212,9 @@ export class TradingEngine {
     recommendation: "TRADE",
     reason: "Warm start"
   };
-  private lastTradeAt = 0;
+  /** Cooldown keyed by Gamma slug (separate 5m markets can trade in parallel). */
+  private lastTradeAtBySlug = new Map<string, number>();
+  private autoTradeSlotRotation = 0;
   private stopLossTriggered = false;
   private noTradeSignals = 0;
   private markets: MarketOption[] = [{ tokenID: "sim-btc-up", label: "BTC 5s UP", outcome: "UP" }];
@@ -97,11 +228,70 @@ export class TradingEngine {
     bestAsk: 0.51
   };
   private directionalContext: DirectionalContext | null = null;
+  /** Rolling UP/DOWN mids per Gamma slug — mid-flip / LSC / reversal legs (ensemble). */
+  private ensembleMidBySlug = new Map<string, MidSample[]>();
+  /** Per-asset UP/DOWN book snapshot (all discovered slots), updated with the 4s refresh. */
+  private multiSlotBooks: Record<
+    string,
+    {
+      up: { mid: number; spread: number; badge: string };
+      down: { mid: number; spread: number; badge: string };
+    }
+  > | null = null;
   private betLogs: BetLogEntry[] = [];
+  /** Paper fills / exits (same schema intent as live logs for 1:1 comparison). */
+  private botTradeHistory: BotTradeHistoryRecord[] = [];
   private lastBookRefreshMs: number | null = null;
   /** Tracks 5m window (Gamma slug time or local 5m bucket in SIM). */
   private lastTrackedWindowKey: string | null = null;
   private btcTargetUsd: number | null = null;
+  /** Per UPDOWN asset: window key + spot at first tick in that window (BONE_LATENCY on non-BTC). */
+  private spotWindowByAsset = new Map<string, { windowKey: string; openUsd: number }>();
+  private lastSpotUsdByAsset = new Map<string, number>();
+
+  /** Polymarket RTDS — Chainlink/Binance feeds used on polymarket.com for crypto Up/Down. */
+  private polymarketRtds = new PolymarketRtdsFeed();
+  /** On-chain Chainlink BTC/USD (authoritative) oracle + staleness protection. */
+  private chainlinkFeed = new ChainlinkFeedService();
+  /** Cached latest Chainlink tick; used as “oracle spot” for BTC-only logic. */
+  private chainlinkUsdByAsset = new Map<string, ChainlinkUsdPriceTick>();
+  private gammaDisplayByAsset = new Map<
+    string,
+    { up: number; down: number; priceToBeat?: number; updatedMs: number }
+  >();
+  private priceToBeatByAsset = new Map<string, number>();
+  private oracleWindowTrackedByAsset = new Map<string, number>();
+  /** Binance spot @aggTrade — OLA signal vs Gamma price-to-beat. */
+  private binanceAgg = new BinanceAggTradeFeed();
+  /** OLA: USDC spent this 5m window per slug (key slug|windowStartSec). */
+  private olaSpendByWindowKey = new Map<string, number>();
+  /** OLA: settled trade PnL samples for rolling 1h kill switch. */
+  private olaPnlHourly: Array<{ t: number; pnl: number }> = [];
+  private olaKillTriggered = false;
+  /** Lag Snipe mode: BTC+ETH, last N seconds, 1m candles; disables GTC + live auto-flatten. */
+  private lagSnipeEnabled = false;
+  private lagSnipeKlinesCache:
+    | {
+        asset: "BTC" | "ETH";
+        candles: KlineOhlc[];
+        fetchedAt: number;
+      }
+    | null = null;
+  private lagSnipeKlineTimer: ReturnType<typeof setInterval> | null = null;
+  /** Per UPDOWN asset: allow auto-trader to rotate into this market (default true). */
+  private assetAutoTradeEnabled = new Map<string, boolean>();
+
+  /** Runtime overrides (API); unset fields fall back to process.env. */
+  private riskOverrides: Partial<{
+    entryUsd: number;
+    minTrade: number;
+    maxTrade: number;
+    stopLossUsd: number;
+    cooldownMs: number;
+  }> = {};
+
+  /** Runtime override from dashboard API; null = follow `ENTRY_STRATEGY` in .env. */
+  private entryStrategyRuntime: DashboardEntryStrategyId | null = null;
 
   private gtcMetrics: GtcExitMetrics = {
     postsAttempted: 0,
@@ -113,13 +303,33 @@ export class TradingEngine {
     fillRatioSum: 0
   };
 
+  /** Count of entries blocked by highConf mid gate (replay / stats). */
+  private highConfMidBlocked = 0;
+
+  /** BONE_* optional entry filters — blocked counts for replay / insights. */
+  private boneHighConfBlocked = 0;
+  private boneEqBlocked = 0;
+  private boneLongshotBlocked = 0;
+  private boneLatencyBlocked = 0;
+
   /** Stops the 50ms GTC fill / pre-resolve monitor loop. */
   private stopGtcMonitor: (() => void) | null = null;
+  /** Per-trade settle retry timer guard to avoid duplicate loops/log spam. */
+  private settleRetryTimerByTradeId = new Map<string, ReturnType<typeof setTimeout>>();
+
+  /** Skip redundant WS `status` when phase copy is unchanged. */
+  private lastBroadcastPredKey = "";
+  private lastBroadcastPhaseKey = "";
+  /** Avoid stacked chart / book timers when upstream APIs are slow (keeps data coherent). */
+  private chartPollInFlight = false;
+  private bookRefreshInFlight = false;
 
   private setPhase(phase: BotPhase, phaseReason?: string) {
+    const nextReason = phaseReason ?? "";
+    const prevReason = this.phaseReason ?? "";
+    if (this.phase === phase && prevReason === nextReason) return;
     this.phase = phase;
     this.phaseReason = phaseReason;
-    // Update UI immediately when the phase changes.
     this.onStatus?.(this.status());
   }
 
@@ -127,6 +337,401 @@ export class TradingEngine {
     const meta = this.wallet.getDiscoveredMeta();
     if (meta?.windowStartSec != null) return String(meta.windowStartSec);
     return String(Math.floor(Date.now() / 300_000));
+  }
+
+  private chainlinkAsset(asset: string): string | null {
+    const a = asset.trim().toUpperCase();
+    if (a === "BTC") return "BTC";
+    return null;
+  }
+
+  private chainlinkStaleMs(): number {
+    const n = envNum("CHAINLINK_MAX_STALE_MS", envNum("RTDS_MAX_STALE_MS", 8000));
+    return Number.isFinite(n) ? Math.max(500, n) : 8000;
+  }
+
+  private oracleSpotUsdForAsset(asset: string): number | null {
+    const a = this.chainlinkAsset(asset);
+    if (a) {
+      const tick = this.chainlinkUsdByAsset.get(a);
+      return tick?.price ?? null;
+    }
+    return this.polymarketRtds.getUsdForAsset(asset);
+  }
+
+  private oracleAgeMsForAsset(asset: string): number | null {
+    const a = this.chainlinkAsset(asset);
+    if (a) {
+      const tick = this.chainlinkUsdByAsset.get(a);
+      if (!tick || !Number.isFinite(tick.updatedAt)) return null;
+      return Math.max(0, Date.now() - tick.updatedAt);
+    }
+    return this.polymarketRtds.getAgeMsForAsset(asset);
+  }
+
+  private oracleStaleMsForAsset(asset: string): number {
+    const a = this.chainlinkAsset(asset);
+    if (a) return this.chainlinkStaleMs();
+    return Math.max(500, envNum("RTDS_MAX_STALE_MS", 8000));
+  }
+
+  /** Poll Coinbase/Binance for each configured UPDOWN symbol (parallel); anchors BONE_LATENCY per asset. */
+  private async refreshSpotAnchorsForConfiguredAssets() {
+    const assets = this.wallet.getUpdownAssetsConfigured();
+    if (assets.length === 0) return;
+    const wk = this.currentWindowKey();
+    const results = await Promise.all(
+      assets.map(async (a) => {
+        try {
+          const p = await fetchUsdSpot(a);
+          return [a, p] as const;
+        } catch {
+          return [a, null] as const;
+        }
+      })
+    );
+    for (const [a, p] of results) {
+      if (p == null || !Number.isFinite(p) || p <= 0) continue;
+      const prev = this.spotWindowByAsset.get(a);
+      if (!prev || prev.windowKey !== wk) {
+        this.spotWindowByAsset.set(a, { windowKey: wk, openUsd: p });
+      }
+      this.lastSpotUsdByAsset.set(a, p);
+    }
+  }
+
+  private envMinTrade(): number {
+    const n = Number(process.env.MIN_TRADE ?? 1);
+    return Number.isFinite(n) && n > 0 ? n : 1;
+  }
+
+  private envMaxTrade(): number {
+    const n = Number(process.env.MAX_TRADE ?? 300);
+    return Number.isFinite(n) && n > 0 ? n : 300;
+  }
+
+  private envEntryUsd(): number {
+    const n = Number(process.env.ENTRY_USD ?? 1);
+    return Number.isFinite(n) && n > 0 ? n : 1;
+  }
+
+  private envCooldownMs(): number {
+    const n = Number(process.env.COOLDOWN_MS ?? 1500);
+    return Number.isFinite(n) && n >= 0 ? n : 1500;
+  }
+
+  private envStopLossUsd(): number {
+    const n = Number(process.env.STOP_LOSS ?? 300);
+    return Number.isFinite(n) && n > 0 ? n : 300;
+  }
+
+  private effMinTrade(): number {
+    const o = this.riskOverrides.minTrade;
+    return o != null && Number.isFinite(o) && o > 0 ? o : this.envMinTrade();
+  }
+
+  private effMaxTrade(): number {
+    const o = this.riskOverrides.maxTrade;
+    const v = o != null && Number.isFinite(o) && o > 0 ? o : this.envMaxTrade();
+    return Math.max(v, this.effMinTrade());
+  }
+
+  private effEntryUsd(): number {
+    const o = this.riskOverrides.entryUsd;
+    const base = o != null && Number.isFinite(o) && o > 0 ? o : this.envEntryUsd();
+    const lo = this.effMinTrade();
+    const hi = this.effMaxTrade();
+    return Math.min(hi, Math.max(lo, base));
+  }
+
+  private effCooldownMs(): number {
+    const o = this.riskOverrides.cooldownMs;
+    return o != null && Number.isFinite(o) && o >= 0 ? o : this.envCooldownMs();
+  }
+
+  private effStopLossUsd(): number {
+    const o = this.riskOverrides.stopLossUsd;
+    return o != null && Number.isFinite(o) && o > 0 ? o : this.envStopLossUsd();
+  }
+
+  getRiskSettingsSnapshot(): RiskSettingsSnapshot {
+    const env = {
+      entryUsd: this.envEntryUsd(),
+      minTrade: this.envMinTrade(),
+      maxTrade: Math.max(this.envMaxTrade(), this.envMinTrade()),
+      stopLossUsd: this.envStopLossUsd(),
+      cooldownMs: this.envCooldownMs()
+    };
+    const o = this.riskOverrides;
+    const overridesActive = Object.keys(o).some(
+      (k) => o[k as keyof typeof o] !== undefined && o[k as keyof typeof o] !== null
+    );
+    return {
+      entryUsd: this.effEntryUsd(),
+      minTrade: this.effMinTrade(),
+      maxTrade: this.effMaxTrade(),
+      stopLossUsd: this.effStopLossUsd(),
+      cooldownMs: this.effCooldownMs(),
+      env,
+      overridesActive
+    };
+  }
+
+  /**
+   * Update runtime risk/size (auto-trades + validation gates). Use `reset: true` to clear overrides.
+   */
+  setRiskSettings(input: {
+    reset?: boolean;
+    entryUsd?: number;
+    minTrade?: number;
+    maxTrade?: number;
+    stopLossUsd?: number;
+    cooldownMs?: number;
+  }): { ok: true; riskSettings: RiskSettingsSnapshot } | { ok: false; reason: string } {
+    if (input.reset) {
+      this.riskOverrides = {};
+      this.log("SIGNAL", "Risk settings: cleared runtime overrides (using .env)");
+      this.pushStatus();
+      return { ok: true, riskSettings: this.getRiskSettingsSnapshot() };
+    }
+
+    const touched =
+      input.entryUsd !== undefined ||
+      input.minTrade !== undefined ||
+      input.maxTrade !== undefined ||
+      input.stopLossUsd !== undefined ||
+      input.cooldownMs !== undefined;
+    if (!touched) {
+      return { ok: true, riskSettings: this.getRiskSettingsSnapshot() };
+    }
+
+    const next = { ...this.riskOverrides };
+    const minBound = 0.01;
+    const maxCooldown = 3_600_000;
+
+    if (input.minTrade !== undefined) {
+      if (!Number.isFinite(input.minTrade) || input.minTrade < minBound) {
+        return { ok: false, reason: `minTrade must be ≥ ${minBound}` };
+      }
+      next.minTrade = input.minTrade;
+    }
+    if (input.maxTrade !== undefined) {
+      if (!Number.isFinite(input.maxTrade) || input.maxTrade < minBound) {
+        return { ok: false, reason: `maxTrade must be ≥ ${minBound}` };
+      }
+      next.maxTrade = input.maxTrade;
+    }
+    const tryMin = next.minTrade ?? this.envMinTrade();
+    const tryMax = next.maxTrade ?? this.envMaxTrade();
+    if (tryMax < tryMin) {
+      return { ok: false, reason: "maxTrade must be >= minTrade" };
+    }
+
+    if (input.entryUsd !== undefined) {
+      if (!Number.isFinite(input.entryUsd) || input.entryUsd < minBound) {
+        return { ok: false, reason: `entryUsd must be ≥ ${minBound}` };
+      }
+      next.entryUsd = input.entryUsd;
+    }
+
+    if (input.stopLossUsd !== undefined) {
+      if (!Number.isFinite(input.stopLossUsd) || input.stopLossUsd < 1) {
+        return { ok: false, reason: "stopLossUsd must be >= 1" };
+      }
+      next.stopLossUsd = input.stopLossUsd;
+    }
+
+    if (input.cooldownMs !== undefined) {
+      if (!Number.isFinite(input.cooldownMs) || input.cooldownMs < 0 || input.cooldownMs > maxCooldown) {
+        return { ok: false, reason: `cooldownMs must be 0..${maxCooldown}` };
+      }
+      next.cooldownMs = input.cooldownMs;
+    }
+
+    this.riskOverrides = next;
+
+    const lo = this.effMinTrade();
+    const hi = this.effMaxTrade();
+    const ent = this.effEntryUsd();
+    if (ent < lo || ent > hi) {
+      this.riskOverrides.entryUsd = Math.min(hi, Math.max(lo, ent));
+    }
+
+    this.log(
+      "SIGNAL",
+      `Risk settings: entry=$${this.effEntryUsd().toFixed(2)} min=$${this.effMinTrade().toFixed(2)} max=$${this.effMaxTrade().toFixed(2)} stopLoss=$${this.effStopLossUsd().toFixed(2)} cooldown=${this.effCooldownMs()}ms`
+    );
+    this.pushStatus();
+    return { ok: true, riskSettings: this.getRiskSettingsSnapshot() };
+  }
+
+  /**
+   * Writes risk fields to `server/.env`, updates `process.env`, and clears runtime overrides
+   * so values match the file after restart.
+   */
+  async persistRiskSettingsToEnv(input: RiskEnvValues): Promise<
+    { ok: true; riskSettings: RiskSettingsSnapshot } | { ok: false; reason: string }
+  > {
+    const minBound = 0.01;
+    const maxCooldown = 3_600_000;
+    if (!Number.isFinite(input.minTrade) || input.minTrade < minBound) {
+      return { ok: false, reason: `minTrade must be ≥ ${minBound}` };
+    }
+    if (!Number.isFinite(input.maxTrade) || input.maxTrade < minBound) {
+      return { ok: false, reason: `maxTrade must be ≥ ${minBound}` };
+    }
+    if (input.maxTrade < input.minTrade) {
+      return { ok: false, reason: "maxTrade must be >= minTrade" };
+    }
+    if (!Number.isFinite(input.entryUsd) || input.entryUsd < minBound) {
+      return { ok: false, reason: `entryUsd must be ≥ ${minBound}` };
+    }
+    if (input.entryUsd < input.minTrade || input.entryUsd > input.maxTrade) {
+      return { ok: false, reason: "entryUsd must be between minTrade and maxTrade" };
+    }
+    if (!Number.isFinite(input.stopLossUsd) || input.stopLossUsd < 1) {
+      return { ok: false, reason: "stopLossUsd must be >= 1" };
+    }
+    if (!Number.isFinite(input.cooldownMs) || input.cooldownMs < 0 || input.cooldownMs > maxCooldown) {
+      return { ok: false, reason: `cooldownMs must be 0..${maxCooldown}` };
+    }
+
+    const envPath = resolveServerDotEnvPath();
+    const wrote = await writeRiskSettingsToDotEnv(envPath, input);
+    if (!wrote.ok) return wrote;
+
+    applyRiskToProcessEnv(input);
+    this.riskOverrides = {};
+
+    this.log(
+      "SIGNAL",
+      `Risk settings saved to .env (${envPath}): entry=$${input.entryUsd} min=$${input.minTrade} max=$${input.maxTrade} stopLoss=$${input.stopLossUsd} cooldown=${Math.round(input.cooldownMs)}ms`
+    );
+    this.pushStatus();
+    return { ok: true, riskSettings: this.getRiskSettingsSnapshot() };
+  }
+
+  private effectiveEntryStrategy(): EntryStrategyKind {
+    return this.entryStrategyRuntime ?? parseEnvEntryStrategy();
+  }
+
+  private entryStrategyLabel(kind: EntryStrategyKind): string {
+    switch (kind) {
+      case "momentum":
+        return "Momentum (chart trend)";
+      case "spot_poly_lag":
+        return "Spot-Poly Lag [SPL]";
+      case "orderbook":
+        return "Order book (mid tilt)";
+      case "mean_revert":
+        return "Mean reversion";
+      case "chart":
+        return "Chart tilt (synthetic)";
+      case "whale_edge":
+        return "Whale edge (time + spread + tilt + optional oracle)";
+      case "ensemble":
+        return "Ensemble (momentum+book+MR+chart+mid-flip+LSC+reversal)";
+      case "ola":
+        return "OLA — Binance vs price-to-beat + CLOB discount snipe";
+      case "contrarian":
+        return "Contrarian (.env)";
+      default:
+        return kind;
+    }
+  }
+
+  private getEntryStrategyState(): EntryStrategyState {
+    const fromEnv = parseEnvEntryStrategy();
+    const effective = this.effectiveEntryStrategy();
+    return {
+      effective,
+      runtimeOverride: this.entryStrategyRuntime,
+      fromEnv,
+      label: this.entryStrategyLabel(effective)
+    };
+  }
+
+  setEntryStrategy(input: {
+    reset?: boolean;
+    strategy?: string;
+  }): { ok: true; entryStrategy: EntryStrategyState } | { ok: false; reason: string } {
+    if (input.reset) {
+      this.entryStrategyRuntime = null;
+      this.log("SIGNAL", "Entry strategy: cleared runtime override (using ENTRY_STRATEGY from .env)");
+      if (!this.livePhaseSyncFrozen()) {
+        this.synchronizeLivePredictionAndPhase(false);
+        this.onPrediction?.(this.prediction);
+      }
+      this.pushStatus();
+      return { ok: true, entryStrategy: this.getEntryStrategyState() };
+    }
+    if (input.strategy !== undefined) {
+      const id = parseDashboardEntryStrategyId(input.strategy);
+      if (!id) {
+        return {
+          ok: false,
+          reason: "strategy must be momentum, orderbook, mean_revert, chart, whale_edge, ensemble, or ola"
+        };
+      }
+      this.entryStrategyRuntime = id;
+      this.log("SIGNAL", `Entry strategy: ${id} (dashboard override)`);
+      if (!this.livePhaseSyncFrozen()) {
+        this.synchronizeLivePredictionAndPhase(false);
+        this.onPrediction?.(this.prediction);
+      }
+      this.pushStatus();
+      return { ok: true, entryStrategy: this.getEntryStrategyState() };
+    }
+    return { ok: true, entryStrategy: this.getEntryStrategyState() };
+  }
+
+  /**
+   * Merge keys from `UPDOWN_ASSETS` — new symbols default to auto-trade **on**; removed symbols drop from the map.
+   */
+  private syncAssetAutoTradeKeysFromConfigured() {
+    const assets = this.wallet.getUpdownAssetsConfigured().map((a) => a.trim().toUpperCase());
+    const allow = new Set(assets);
+    for (const a of assets) {
+      if (!this.assetAutoTradeEnabled.has(a)) {
+        this.assetAutoTradeEnabled.set(a, true);
+      }
+    }
+    for (const k of [...this.assetAutoTradeEnabled.keys()]) {
+      if (!allow.has(k)) this.assetAutoTradeEnabled.delete(k);
+    }
+  }
+
+  /** Auto-trader may rotate into this asset’s discovered slot (default true). */
+  private isAssetAutoTradeEnabled(asset: string): boolean {
+    const k = asset.trim().toUpperCase();
+    return this.assetAutoTradeEnabled.get(k) !== false;
+  }
+
+  private getAssetAutoTradeEnabledSnapshot(): Record<string, boolean> {
+    const out: Record<string, boolean> = {};
+    for (const a of this.wallet.getUpdownAssetsConfigured()) {
+      const k = a.trim().toUpperCase();
+      out[k] = this.isAssetAutoTradeEnabled(k);
+    }
+    return out;
+  }
+
+  setAssetAutoTradeEnabled(
+    asset: string,
+    enabled: boolean
+  ): { ok: true; assetAutoTradeEnabled: Record<string, boolean> } | { ok: false; reason: string } {
+    const k = asset.trim().toUpperCase();
+    const allowed = new Set(this.wallet.getUpdownAssetsConfigured().map((a) => a.trim().toUpperCase()));
+    if (!allowed.has(k)) {
+      return {
+        ok: false,
+        reason: `Asset ${k} is not in UPDOWN_ASSETS — add it in server .env first`
+      };
+    }
+    this.assetAutoTradeEnabled.set(k, enabled);
+    this.log("SIGNAL", `Auto-trade ${k}: ${enabled ? "ON" : "OFF"}`);
+    this.pushStatus();
+    return { ok: true, assetAutoTradeEnabled: this.getAssetAutoTradeEnabledSnapshot() };
   }
 
   private pushMarketPointFromLiveBtc(price: number) {
@@ -162,12 +767,161 @@ export class TradingEngine {
     this.marketData = [...this.marketData.slice(-(CHART_MAX_POINTS - 1)), point];
   }
 
+  private pushAssetSpotChartPoint(asset: string, spotUsd: number) {
+    const a = asset.trim().toUpperCase();
+    const wk = this.currentWindowKey();
+    if (this.assetSpotChartWindowKey.get(a) !== wk) {
+      this.assetSpotChartWindowKey.set(a, wk);
+      this.assetSpotSeries.set(a, []);
+    }
+    const series = this.assetSpotSeries.get(a) ?? [];
+    const last = series[series.length - 1];
+    const movement =
+      last?.btcUsd != null && Number.isFinite(last.btcUsd)
+        ? Number((spotUsd - last.btcUsd).toFixed(8))
+        : 0;
+    const ptb = this.priceToBeatByAsset.get(a);
+    const sw = this.spotWindowByAsset.get(a);
+    let targetUsd: number;
+    if (ptb != null && Number.isFinite(ptb) && ptb > 0) {
+      targetUsd = ptb;
+    } else if (sw != null && sw.windowKey === wk && Number.isFinite(sw.openUsd) && sw.openUsd > 0) {
+      targetUsd = sw.openUsd;
+    } else {
+      targetUsd = spotUsd;
+    }
+    const sens = Math.max(spotUsd * 0.00012, a === "BTC" ? 40 : spotUsd * 0.00018);
+    const pseudo = Math.max(-2.5, Math.min(2.5, movement / sens));
+    const up = Math.max(1, Math.min(99, Number((50 + pseudo).toFixed(3))));
+    const down = Number((100 - up).toFixed(3));
+    const ts = Date.now();
+    const time = new Date(ts).toLocaleTimeString("en-US", {
+      hour: "numeric",
+      minute: "2-digit",
+      second: "2-digit",
+      hour12: true
+    });
+    const point: MarketPoint = {
+      time,
+      ts,
+      up,
+      down,
+      movement,
+      btcUsd: spotUsd,
+      btcTargetUsd: targetUsd
+    };
+    this.assetSpotSeries.set(a, [...series.slice(-(CHART_MAX_POINTS - 1)), point]);
+  }
+
+  private buildMarketWsPayload(): MarketWsPayload {
+    const byAsset: Record<string, MarketPoint[]> = {};
+    for (const [k, v] of this.assetSpotSeries.entries()) {
+      if (v.length > 0) byAsset[k] = v;
+    }
+    return { primary: this.marketData, byAsset };
+  }
+
+  /** Net momentum: positive → UP bias. `from_open` uses last BTC vs 5m window open. */
+  private momentumScalar(lookback: number): number {
+    const mode = momentumMode();
+    if (mode === "from_open") {
+      const last = this.marketData[this.marketData.length - 1];
+      if (last?.btcUsd == null || this.btcTargetUsd == null) return 0;
+      return last.btcUsd - this.btcTargetUsd;
+    }
+    const n = Math.max(2, Math.min(50, lookback));
+    const recent = this.marketData.slice(-n);
+    if (recent.length === 0) return 0;
+    if (mode === "weighted") {
+      let sum = 0;
+      for (let i = 0; i < recent.length; i++) {
+        sum += (i + 1) * recent[i].movement;
+      }
+      return sum;
+    }
+    return recent.reduce((acc, p) => acc + p.movement, 0);
+  }
+
+  private trendBoostFromScalar(trend: number): number {
+    if (momentumMode() === "from_open") {
+      const cap = envNum("MOMENTUM_MAX_CONF_BOOST", 4);
+      const usdPer = envNum("MOMENTUM_FROM_OPEN_USD_PER_CONF", 25);
+      const div = !Number.isFinite(usdPer) || usdPer <= 0 ? 25 : usdPer;
+      return Math.min(cap, Math.abs(trend) / div);
+    }
+    const scale = envNum("MOMENTUM_TICK_SCALE", 0.2);
+    return Math.min(2, Math.abs(trend) * scale);
+  }
+
+  /** Fade synthetic chart UP% when it leans away from 50. */
+  private basePredictMeanRevert(): { prediction: Direction; confidence: number; ts: number } {
+    const lb = Math.max(3, Math.min(30, envNum("MEAN_REVERT_LOOKBACK", 8)));
+    const recent = this.marketData.slice(-lb);
+    const ts = Date.now();
+    if (recent.length === 0) {
+      return { prediction: "UP", confidence: 92, ts };
+    }
+    const avgUp = recent.reduce((s, p) => s + p.up, 0) / recent.length;
+    const thr = envNum("MEAN_REVERT_THRESHOLD", 2);
+    const direction: Direction = avgUp >= 50 ? "DOWN" : "UP";
+    const edge = Math.abs(avgUp - 50);
+    const strong = edge > thr;
+    const confidence = strong
+      ? Math.min(100, Number((92 + Math.min(6, (edge - thr) * 0.45) + Math.random() * 2).toFixed(2)))
+      : Math.min(93, Number((87 + Math.random() * 2).toFixed(2)));
+    return { prediction: direction, confidence, ts };
+  }
+
+  /** Follow latest chart bar synthetic UP/DOWN tilt. */
+  private basePredictChart(): { prediction: Direction; confidence: number; ts: number } {
+    const last = this.marketData[this.marketData.length - 1];
+    const ts = Date.now();
+    if (!last) return { prediction: "UP", confidence: 92, ts };
+    const direction: Direction = last.up >= 50 ? "UP" : "DOWN";
+    const tilt = Math.abs(last.up - 50);
+    const confidence = Math.min(
+      100,
+      Number((91 + Math.min(8, tilt * 0.35) + Math.random() * 3).toFixed(2))
+    );
+    return { prediction: direction, confidence, ts };
+  }
+
   private basePredict() {
-    const recent = this.marketData.slice(-10);
-    const trend = recent.reduce((acc, p) => acc + p.movement, 0);
-    const direction: Direction = trend >= 0 ? "UP" : "DOWN";
+    if (this.lagSnipeEnabled) {
+      const ev = this.evaluateLagSnipeDisplay();
+      return { prediction: ev.prediction, confidence: ev.confidence, ts: Date.now() };
+    }
+    const strat = this.effectiveEntryStrategy();
+    if (strat === "ola") {
+      const c = this.getOlaSignalCore();
+      return { prediction: c.prediction, confidence: c.confidence, ts: Date.now() };
+    }
+    if (strat === "ensemble") {
+      const r = this.buildEnsembleResult();
+      const conf = Math.min(99, 80 + Math.min(18, Math.abs(r.score) * 2.2));
+      return {
+        prediction: r.direction,
+        confidence: Number(conf.toFixed(2)),
+        ts: Date.now()
+      };
+    }
+    if ((strat === "orderbook" || strat === "whale_edge") && this.directionalContext) {
+      const { up, down } = this.directionalContext;
+      const direction: Direction = up.mid >= down.mid ? "UP" : "DOWN";
+      const edge = Math.abs(up.mid - down.mid);
+      const confidenceBase = 92 + Math.min(6, edge * 40);
+      const confidence = Math.min(100, Number((confidenceBase + Math.random() * 2).toFixed(2)));
+      return { prediction: direction, confidence, ts: Date.now() };
+    }
+    if (strat === "mean_revert") return this.basePredictMeanRevert();
+    if (strat === "chart") return this.basePredictChart();
+
+    const predictLb = envNum("MOMENTUM_PREDICT_LOOKBACK", 10);
+    const trend = this.momentumScalar(predictLb);
+    let direction: Direction = trend >= 0 ? "UP" : "DOWN";
+    if (strat === "contrarian") direction = direction === "UP" ? "DOWN" : "UP";
     const confidenceBase = 92 + Math.random() * 8;
-    const trendBoost = Math.min(2, Math.abs(trend) * 0.2);
+    const trendBoost = this.trendBoostFromScalar(trend);
     return {
       prediction: direction,
       confidence: Math.min(100, Number((confidenceBase + trendBoost).toFixed(2))),
@@ -176,14 +930,251 @@ export class TradingEngine {
   }
 
   private momentumDirection(): Direction {
-    const recent = this.marketData.slice(-8);
-    const momentum = recent.reduce((sum, p) => sum + p.movement, 0);
+    const scoreLb = envNum("MOMENTUM_SCORE_LOOKBACK", 8);
+    const momentum = this.momentumScalar(scoreLb);
+    const raw = momentum >= 0 ? "UP" : "DOWN";
+    if (this.effectiveEntryStrategy() === "contrarian") return raw === "UP" ? "DOWN" : "UP";
+    return raw;
+  }
+
+  /** Raw chart momentum (no contrarian flip) — for BOT_FILTER momentum vs signal agreement. */
+  private rawMomentumSide(): Direction {
+    const scoreLb = envNum("MOMENTUM_SCORE_LOOKBACK", 8);
+    const momentum = this.momentumScalar(scoreLb);
     return momentum >= 0 ? "UP" : "DOWN";
   }
 
+  private async refreshLagSnipeKlinesIfEnabled() {
+    if (!this.lagSnipeEnabled) return;
+    try {
+      const asset = this.wallet.getActiveDiscoveredAsset();
+      if (asset !== "BTC" && asset !== "ETH") return;
+      const candles =
+        asset === "BTC" ? await fetchLastFiveClosed1mBtcUsdt() : await fetchLastFiveClosed1mEthUsdt();
+      if (candles) {
+        this.lagSnipeKlinesCache = { asset, candles, fetchedAt: Date.now() };
+      }
+    } catch {
+      /* ignore */
+    }
+  }
+
+  private evaluateLagSnipeDisplay(): {
+    prediction: Direction;
+    confidence: number;
+    recommendation: "TRADE" | "NO_TRADE";
+    reason: string;
+  } {
+    const asset = this.wallet.getActiveDiscoveredAsset();
+    if (asset !== "BTC" && asset !== "ETH") {
+      return {
+        prediction: "UP",
+        confidence: 50,
+        recommendation: "NO_TRADE",
+        reason: `Lag Snipe: BTC+ETH only (active slot is ${asset ?? "unknown"})`
+      };
+    }
+
+    const meta = this.wallet.getDiscoveredMeta();
+    const endParsed = meta?.endDateIso ? new Date(meta.endDateIso).getTime() : NaN;
+    const secLeft = !Number.isNaN(endParsed) ? Math.floor((endParsed - Date.now()) / 1000) : null;
+
+    if (!lagSnipeInWindow(secLeft)) {
+      return {
+        prediction: "UP",
+        confidence: 55,
+        recommendation: "NO_TRADE",
+        reason: `Lag Snipe: enter only in last ${lagSnipeMaxSecondsLeft()}s (left ${secLeft ?? "n/a"}s)`
+      };
+    }
+
+    const k = this.lagSnipeKlinesCache;
+    const candles = k?.asset === asset ? k.candles : null;
+    if (!candles) {
+      return {
+        prediction: "UP",
+        confidence: 50,
+        recommendation: "NO_TRADE",
+        reason: `Lag Snipe: loading last 5×1m ${asset} candles…`
+      };
+    }
+    if (candles.length < 5) {
+      return {
+        prediction: "UP",
+        confidence: 52,
+        recommendation: "NO_TRADE",
+        reason: `Lag Snipe: need 5×1m candles (have ${candles.length})`
+      };
+    }
+
+    if (!this.directionalContext || !this.wallet.hasLiveMarketData()) {
+      return {
+        prediction: candleSignalFromFive(candles) ?? "UP",
+        confidence: 72,
+        recommendation: "NO_TRADE",
+        reason: "Lag Snipe: need live UP/DOWN books"
+      };
+    }
+
+    const { up, down } = this.directionalContext;
+
+    // 1) Min-prob "0% fees" gate (approx by CLOB UP probability; direction is forced).
+    const direction = lagSnipeDirectionFromUpProb(up.mid, lagSnipeMinProb());
+    if (!direction) {
+      return {
+        prediction: "UP",
+        confidence: 55,
+        recommendation: "NO_TRADE",
+        reason: `Lag Snipe: min-prob gate failed (need up>=${lagSnipeMinProb()} or down>=${lagSnipeMinProb()}; up=${up.mid.toFixed(
+          3
+        )})`
+      };
+    }
+
+    // 2) 4-minute candle analysis confirmation.
+    const candleSignal = candleSignalFromFive(candles);
+    const candleConfirm = candleSignal != null && candleSignal === direction;
+
+    // 3) Dynamic liquidity confirmation.
+    const depth = direction === "UP" ? up.liquidity : down.liquidity;
+    const sizeUsd = lagSnipeCalcSizeFromDepth(depth);
+    const liquidityConfirm = lagSnipeLiquidityConfirmation(depth, sizeUsd);
+
+    // 4) S/R cap confirmation (simple outcome-mid cap in this codebase).
+    const srConfirm = lagSnipeSrOk(direction, up, down);
+
+    // 5) Premium signal confirmation (oracle spot vs strike/price-to-beat).
+    const spot = this.oracleSpotUsdForAsset(asset);
+    const ptb = this.priceToBeatByAsset.get(asset);
+    const oracleDiffUsd =
+      spot != null && ptb != null && Number.isFinite(spot) && Number.isFinite(ptb) ? spot - ptb : null;
+    const spotAgeMs = this.oracleAgeMsForAsset(asset);
+    const staleMs = this.oracleStaleMsForAsset(asset);
+    const premiumFresh = spotAgeMs == null || spotAgeMs <= staleMs;
+    const premiumDir = lagSnipePremiumDirectionFromOracleDiff(oracleDiffUsd);
+    const premiumConfirm = premiumFresh && premiumDir != null && premiumDir === direction;
+
+    const required = lagSnipeConfirmationsRequired();
+    const confirmations = [candleConfirm, liquidityConfirm, srConfirm, premiumConfirm].filter(Boolean).length;
+
+    if (confirmations < required) {
+      return {
+        prediction: direction,
+        confidence: 60 + confirmations * 6,
+        recommendation: "NO_TRADE",
+        reason: `Lag Snipe: confirms ${confirmations}/${required} (candle=${candleConfirm ? "Y" : "N"}, liq=${
+          liquidityConfirm ? "Y" : "N"
+        }, sr=${srConfirm ? "Y" : "N"}, premium=${premiumConfirm ? "Y" : "N"}${
+          premiumFresh ? "" : ", premiumFeed=STALE"
+        })`
+      };
+    }
+
+    const confidence = Math.min(100, 75 + confirmations * 7 + Math.random() * 2);
+    return {
+      prediction: direction,
+      confidence: Number(confidence.toFixed(2)),
+      recommendation: "TRADE",
+      reason: `Lag Snipe: HOLD Manual Exit | ${direction} | Confirms ${confirmations}/${required} -> TRADE FIRED | $${sizeUsd} size | ~${secLeft ?? "?"}s left`
+    };
+  }
+
+  private chooseLagSnipeEntry(): { direction: Direction; reason: string } {
+    const ev = this.evaluateLagSnipeDisplay();
+    if (ev.recommendation === "NO_TRADE") {
+      return { direction: ev.prediction, reason: `LAG_SNIPE_SKIP: ${ev.reason}` };
+    }
+    return {
+      direction: ev.prediction,
+      reason: `LAG_SNIPE: ${ev.prediction} | HOLD Manual Exit | King confirms`
+    };
+  }
+
+  setLagSnipe(enabled: boolean): { ok: true; lagSnipeEnabled: boolean; banner?: string } {
+    this.lagSnipeEnabled = enabled;
+    if (this.lagSnipeKlineTimer) {
+      clearInterval(this.lagSnipeKlineTimer);
+      this.lagSnipeKlineTimer = null;
+    }
+    if (enabled) {
+      void this.refreshLagSnipeKlinesIfEnabled();
+      this.lagSnipeKlineTimer = setInterval(() => void this.refreshLagSnipeKlinesIfEnabled(), 20_000);
+      this.log(
+        "SIGNAL",
+        `Lag Snipe ON — BTC+ETH 5m only, last ${lagSnipeMaxSecondsLeft()}s window, auto-exit disabled`
+      );
+    } else {
+      this.lagSnipeKlinesCache = null;
+      this.log("SIGNAL", "Lag Snipe OFF — restored normal strategies + auto-exit");
+    }
+    if (!this.livePhaseSyncFrozen()) {
+      this.synchronizeLivePredictionAndPhase(false);
+      this.onPrediction?.(this.prediction);
+    }
+    this.pushStatus();
+    return {
+      ok: true,
+      lagSnipeEnabled: enabled,
+      banner: enabled ? "Lag Snipe: HOLD Manual Exit" : undefined
+    };
+  }
+
+  /**
+   * Optional `server/config.json`: TRADE_ASSETS, MIN_SIGNAL_CONF, MIN_EDGE, REQUIRE_MOMENTUM_SIGNAL_AGREE.
+   * OLA: only TRADE_ASSETS + MIN_SIGNAL_CONF; book-spread + momentum gates are non-OLA.
+   */
+  private checkConfigTradeFilters(strat: EntryStrategyKind, cfg: BotFiltersConfig): { ok: true } | { ok: false; reason: string } {
+    if (this.lagSnipeEnabled) return { ok: true };
+    const asset = this.wallet.getActiveDiscoveredAsset();
+    if (!tradeAssetAllowedByConfig(asset, cfg)) {
+      return {
+        ok: false,
+        reason: `BOT_FILTER: asset ${asset ?? "?"} not allowed (TRADE_ASSETS in config.json)`
+      };
+    }
+
+    const minConf = cfg.MIN_SIGNAL_CONF;
+    if (minConf != null && Number.isFinite(minConf) && this.prediction.confidence < minConf) {
+      return {
+        ok: false,
+        reason: `BOT_FILTER: signal conf ${this.prediction.confidence.toFixed(1)}% < MIN_SIGNAL_CONF ${minConf}`
+      };
+    }
+
+    if (strat === "ola") {
+      return { ok: true };
+    }
+
+    const minEdge = cfg.MIN_EDGE;
+    if (minEdge != null && Number.isFinite(minEdge) && minEdge > 0) {
+      const spread = bookMidSpread01(this.directionalContext);
+      if (spread == null) {
+        return { ok: false, reason: "BOT_FILTER: MIN_EDGE requires live UP/DOWN books" };
+      }
+      if (spread < minEdge) {
+        return {
+          ok: false,
+          reason: `BOT_FILTER: book spread ${spread.toFixed(4)} < MIN_EDGE ${minEdge}`
+        };
+      }
+    }
+
+    if (cfg.REQUIRE_MOMENTUM_SIGNAL_AGREE === true) {
+      const mom = this.rawMomentumSide();
+      if (mom !== this.prediction.prediction) {
+        return {
+          ok: false,
+          reason: `BOT_FILTER: momentum ${mom} ≠ signal ${this.prediction.prediction}`
+        };
+      }
+    }
+
+    return { ok: true };
+  }
+
   private getRiskSizedAmount() {
-    const target = Number.isFinite(ENTRY_USD) && ENTRY_USD > 0 ? ENTRY_USD : 1;
-    const capped = Math.min(this.balance, Math.max(MIN_TRADE, Math.min(MAX_TRADE, target)));
+    const target = this.effEntryUsd();
+    const capped = Math.min(this.balance, Math.max(this.effMinTrade(), Math.min(this.effMaxTrade(), target)));
     return Number(capped.toFixed(2));
   }
 
@@ -197,8 +1188,11 @@ export class TradingEngine {
     }
     const budget = await this.wallet.getAvailableCollateralBudget();
     if (!budget || budget.availableUsdc <= 0) return { amount: 0, budget };
-    const target = Number.isFinite(ENTRY_USD) && ENTRY_USD > 0 ? ENTRY_USD : 1;
-    const capped = Math.min(budget.availableUsdc, Math.max(MIN_TRADE, Math.min(MAX_TRADE, target)));
+    const target = this.effEntryUsd();
+    const capped = Math.min(
+      budget.availableUsdc,
+      Math.max(this.effMinTrade(), Math.min(this.effMaxTrade(), target))
+    );
     return { amount: Number(capped.toFixed(2)), budget };
   }
 
@@ -242,6 +1236,262 @@ export class TradingEngine {
   }
 
   /** Maps execution rules to short UI badges. */
+  /**
+   * Global NO_TRADE can reflect slot-0 books only; AUTO on another slot with tradable books should still run.
+   */
+  private canIgnoreNoTradeForBookOnlyBlock(source: "MANUAL" | "AUTO"): boolean {
+    if (this.prediction.recommendation !== "NO_TRADE") return false;
+    const r = this.prediction.reason ?? "";
+    if (!r.includes("Live books not tradable")) return false;
+    if (source !== "AUTO") return false;
+    return (
+      this.wallet.hasLiveMarketData() &&
+      !!this.directionalContext &&
+      this.liveBookTradability(this.directionalContext.up).ok &&
+      this.liveBookTradability(this.directionalContext.down).ok
+    );
+  }
+
+  /** Do not override phase from feed tickers while executing or stopped. */
+  private livePhaseSyncFrozen(): boolean {
+    switch (this.phase) {
+      case "EXECUTING":
+      case "WAITING_RESOLUTION":
+      case "RISK_BLOCKED":
+      case "ERROR":
+      case "STOPPED":
+      case "AUTH_CHECK":
+      case "STARTING":
+      case "CONFIG_INVALID":
+        return true;
+      default:
+        return false;
+    }
+  }
+
+  /**
+   * One source of truth for prediction + phase from chart volatility, strategy, and live CLOB books.
+   * Called on the 5s timer (`fromTimer`) and after each CLOB/Gamma book refresh (~4s) so status matches APIs.
+   */
+  private synchronizeLivePredictionAndPhase(fromTimer: boolean) {
+    if (this.livePhaseSyncFrozen()) return;
+
+    if (this.lagSnipeEnabled) {
+      void this.refreshLagSnipeKlinesIfEnabled();
+      const ev = this.evaluateLagSnipeDisplay();
+      const base = { prediction: ev.prediction, confidence: ev.confidence, ts: Date.now() };
+      const recommendation = ev.recommendation;
+      const reason = ev.reason;
+      const next: Prediction = { ...base, recommendation, reason };
+      let nextPhase: BotPhase;
+      let nextPhaseReason: string;
+      if (recommendation === "NO_TRADE" && reason.includes("Live books not tradable")) {
+        nextPhase = "MARKET_NOT_TRADABLE";
+        nextPhaseReason = reason;
+      } else if (recommendation === "TRADE") {
+        nextPhase = "SIGNAL_READY";
+        nextPhaseReason = `Lag Snipe: ${base.prediction} (${base.confidence.toFixed(0)}%)`;
+      } else {
+        nextPhase = "SIGNAL_READY";
+        nextPhaseReason = reason;
+      }
+      const predKey = `${next.prediction}|${next.recommendation}|${next.reason}|${Math.round(next.confidence)}`;
+      const phaseKey = `${nextPhase}|${nextPhaseReason}`;
+      const signalUnchanged = predKey === this.lastBroadcastPredKey && phaseKey === this.lastBroadcastPhaseKey;
+      this.prediction = next;
+      if (!signalUnchanged) {
+        this.lastBroadcastPredKey = predKey;
+        this.lastBroadcastPhaseKey = phaseKey;
+        this.setPhase(nextPhase, nextPhaseReason);
+        this.onPrediction?.(this.prediction);
+      }
+      if (recommendation === "NO_TRADE" && fromTimer) this.noTradeSignals += 1;
+      if (fromTimer && !signalUnchanged) {
+        this.log(
+          "SIGNAL",
+          `${this.prediction.prediction} ${this.prediction.confidence}% (${this.prediction.recommendation})`
+        );
+      }
+      return;
+    }
+
+    const es = this.effectiveEntryStrategy();
+    if (es === "ola") {
+      const ev = this.getOlaEntryEvaluation();
+      const core = this.getOlaSignalCore();
+      const base = {
+        prediction: ev.skipReason ? core.prediction : ev.direction,
+        confidence: core.confidence,
+        ts: Date.now()
+      };
+      let recommendation: "TRADE" | "NO_TRADE" = ev.skipReason ? "NO_TRADE" : "TRADE";
+      let reason = ev.skipReason ?? ev.reasonLine;
+
+      if (this.wallet.hasLiveMarketData() && this.directionalContext) {
+        const upT = this.liveBookTradability(this.directionalContext.up);
+        const downT = this.liveBookTradability(this.directionalContext.down);
+        if (!upT.ok && !downT.ok) {
+          recommendation = "NO_TRADE";
+          reason = `Live books not tradable (both sides): UP — ${upT.detail}; DOWN — ${downT.detail}`;
+        }
+      }
+
+      const next: Prediction = { ...base, recommendation, reason };
+      let nextPhase: BotPhase;
+      let nextPhaseReason: string;
+      if (recommendation === "NO_TRADE" && reason.includes("Live books not tradable")) {
+        nextPhase = "MARKET_NOT_TRADABLE";
+        nextPhaseReason = reason;
+      } else if (recommendation === "TRADE") {
+        nextPhase = "SIGNAL_READY";
+        nextPhaseReason = `Signal: ${base.prediction} (${base.confidence.toFixed(0)}%)`;
+      } else {
+        nextPhase = "SIGNAL_READY";
+        nextPhaseReason = reason;
+      }
+
+      const predKey = `${next.prediction}|${next.recommendation}|${next.reason}|${Math.round(next.confidence)}`;
+      const phaseKey = `${nextPhase}|${nextPhaseReason}`;
+      const signalUnchanged = predKey === this.lastBroadcastPredKey && phaseKey === this.lastBroadcastPhaseKey;
+
+      this.prediction = next;
+      if (!signalUnchanged) {
+        this.lastBroadcastPredKey = predKey;
+        this.lastBroadcastPhaseKey = phaseKey;
+        this.setPhase(nextPhase, nextPhaseReason);
+        this.onPrediction?.(this.prediction);
+      }
+
+      if (recommendation === "NO_TRADE" && fromTimer) this.noTradeSignals += 1;
+      if (fromTimer && !signalUnchanged) {
+        this.log(
+          "SIGNAL",
+          `${this.prediction.prediction} ${this.prediction.confidence}% (${this.prediction.recommendation})`
+        );
+      }
+      return;
+    }
+
+    const base = this.basePredict();
+    const volLb = Math.max(4, Math.min(50, envNum("MOMENTUM_VOLATILITY_LOOKBACK", 12)));
+    const recent = this.marketData.slice(-volLb);
+    const moves = recent.map((r) => r.movement);
+    const avgMove = moves.length ? moves.reduce((a, b) => a + b, 0) / moves.length : 0;
+    const volatility = moves.length ? Math.sqrt(moves.reduce((a, b) => a + b * b, 0) / moves.length) : 0;
+    let recommendation: "TRADE" | "NO_TRADE" =
+      base.confidence < 94 || volatility > PREDICTION_VOLATILITY_USD ? "NO_TRADE" : "TRADE";
+    let reason =
+      recommendation === "NO_TRADE"
+        ? base.confidence < 94
+          ? "Signal confidence too low"
+          : `Short-term volatility high (~$${volatility.toFixed(1)} tick stdev)`
+        : es === "mean_revert"
+          ? `Mean-revert: ${base.prediction} (${base.confidence.toFixed(0)}%)`
+          : es === "chart"
+            ? `Chart tilt: ${base.prediction} (${base.confidence.toFixed(0)}%)`
+            : es === "orderbook"
+              ? `Order book: ${base.prediction} (${base.confidence.toFixed(0)}%)`
+              : es === "whale_edge"
+                ? `Whale edge tilt: ${base.prediction} (${base.confidence.toFixed(0)}%)`
+                : es === "ensemble"
+                  ? `Ensemble: ${base.prediction} (${base.confidence.toFixed(0)}%)`
+              : avgMove >= 0
+                ? "Momentum supports UP bias"
+                : "Momentum supports DOWN bias";
+
+    if (this.wallet.hasLiveMarketData() && this.directionalContext) {
+      const upT = this.liveBookTradability(this.directionalContext.up);
+      const downT = this.liveBookTradability(this.directionalContext.down);
+      if (!upT.ok && !downT.ok) {
+        recommendation = "NO_TRADE";
+        reason = `Live books not tradable (both sides): UP — ${upT.detail}; DOWN — ${downT.detail}`;
+      }
+    }
+
+    const next: Prediction = { ...base, recommendation, reason };
+    let nextPhase: BotPhase;
+    let nextPhaseReason: string;
+    if (recommendation === "NO_TRADE" && reason.includes("Live books not tradable")) {
+      nextPhase = "MARKET_NOT_TRADABLE";
+      nextPhaseReason = reason;
+    } else if (recommendation === "TRADE") {
+      nextPhase = "SIGNAL_READY";
+      nextPhaseReason = `Signal: ${base.prediction} (${base.confidence.toFixed(0)}%)`;
+    } else {
+      nextPhase = "SIGNAL_READY";
+      nextPhaseReason = reason;
+    }
+
+    const predKey = `${next.prediction}|${next.recommendation}|${next.reason}|${Math.round(next.confidence)}`;
+    const phaseKey = `${nextPhase}|${nextPhaseReason}`;
+    const signalUnchanged = predKey === this.lastBroadcastPredKey && phaseKey === this.lastBroadcastPhaseKey;
+
+    this.prediction = next;
+    if (!signalUnchanged) {
+      this.lastBroadcastPredKey = predKey;
+      this.lastBroadcastPhaseKey = phaseKey;
+      this.setPhase(nextPhase, nextPhaseReason);
+      this.onPrediction?.(this.prediction);
+    }
+
+    if (recommendation === "NO_TRADE" && fromTimer) this.noTradeSignals += 1;
+    if (fromTimer && !signalUnchanged) {
+      this.log(
+        "SIGNAL",
+        `${this.prediction.prediction} ${this.prediction.confidence}% (${this.prediction.recommendation})`
+      );
+    }
+  }
+
+  private composeUpdownWindows(): TradingState["updownWindows"] {
+    const m = this.multiSlotBooks;
+    const summary = this.wallet.getDiscoveredWindowsSummary();
+    const snapByAsset = new Map(this.wallet.getDiscoveredSlotsSnapshot().map((s) => [s.asset, s]));
+    return summary.map((w) => {
+      const snap = m?.[w.asset];
+      const g = this.gammaDisplayByAsset.get(w.asset);
+      const slot = snapByAsset.get(w.asset);
+      const spot = this.oracleSpotUsdForAsset(w.asset);
+      const ptbMap = this.priceToBeatByAsset.get(w.asset);
+      const ptbGamma = g?.priceToBeat;
+      const isBtc = w.asset.trim().toUpperCase() === "BTC";
+      const ptb = isBtc
+        ? ptbMap != null && Number.isFinite(ptbMap)
+          ? ptbMap
+          : null
+        : ptbMap != null && Number.isFinite(ptbMap)
+          ? ptbMap
+          : ptbGamma != null && Number.isFinite(ptbGamma)
+            ? ptbGamma
+            : null;
+      const endParsed = slot?.endDateIso ? new Date(slot.endDateIso).getTime() : NaN;
+      const secondsToExpiry =
+        slot?.endDateIso && !Number.isNaN(endParsed)
+          ? Math.floor((endParsed - Date.now()) / 1000)
+          : null;
+      const upMid =
+        g != null && Number.isFinite(g.up) ? g.up : snap != null ? snap.up.mid : null;
+      const downMid =
+        g != null && Number.isFinite(g.down) ? g.down : snap != null ? snap.down.mid : null;
+      return {
+        asset: w.asset,
+        slug: w.slug,
+        label: w.label,
+        upMid,
+        downMid,
+        upSpread: snap?.up.spread ?? null,
+        downSpread: snap?.down.spread ?? null,
+        upBadge: snap?.up.badge ?? null,
+        downBadge: snap?.down.badge ?? null,
+        oddsSource: g ? "gamma" : snap ? "clob" : null,
+        oracleSpotUsd: spot ?? null,
+        priceToBeatUsd: ptb,
+        diffUsd: spot != null && ptb != null ? spot - ptb : null,
+        secondsToExpiry
+      };
+    });
+  }
+
   private bookQuality(book: MarketContext | null): { badge: string; detail: string; spread: number } {
     if (!book) return { badge: "no_book", detail: "No order book loaded yet", spread: 0 };
     const t = this.liveBookTradability(book);
@@ -276,6 +1526,9 @@ export class TradingEngine {
       clobAuthenticated: this.wallet.isClobAuthenticated(),
       autoDiscoverEnabled: this.wallet.isAutoDiscoverEnabled(),
       lastBookRefreshMs: this.lastBookRefreshMs,
+      updownAssetsConfigured: this.wallet.getUpdownAssetsConfigured(),
+      assetAutoTradeEnabled: this.getAssetAutoTradeEnabledSnapshot(),
+      updownWindows: this.composeUpdownWindows(),
       market: meta
         ? {
             label: meta.label,
@@ -302,11 +1555,46 @@ export class TradingEngine {
       books: {
         up: up ? { spread: qu.spread, badge: qu.badge, detail: qu.detail } : null,
         down: down ? { spread: qd.spread, badge: qd.badge, detail: qd.detail } : null
+      },
+      riskSettings: this.getRiskSettingsSnapshot(),
+      entryStrategy: this.getEntryStrategyState(),
+      lagSnipeEnabled: this.lagSnipeEnabled,
+      lagSnipeBanner: this.lagSnipeEnabled ? "Lag Snipe: HOLD Manual Exit" : undefined,
+      liveEngine: {
+        phase: this.phase,
+        phaseReason: this.phaseReason,
+        running: this.running,
+        autoTrading: this.autoTrading,
+        lastBookRefreshMs: this.lastBookRefreshMs,
+        secondsSinceBookRefresh:
+          this.lastBookRefreshMs != null
+            ? Math.max(0, Math.round((Date.now() - this.lastBookRefreshMs) / 1000))
+            : null,
+        discoveredSlotCount: this.wallet.getDiscoveredSlotCount(),
+        hasLiveMarketData: this.wallet.hasLiveMarketData(),
+        rtdsConnected: this.polymarketRtds.isSocketOpen(),
+        lagSnipeEnabled: this.lagSnipeEnabled
+      },
+      predictionLive: {
+        prediction: this.prediction.prediction,
+        confidence: this.prediction.confidence,
+        ts: this.prediction.ts,
+        recommendation: this.prediction.recommendation,
+        reason: this.prediction.reason
       }
     };
   }
 
   private chooseDirectionalEntry(): { direction: Direction; reason: string } {
+    /** OLA must never use book-only or momentum fallbacks — oracle + snipe only. */
+    if (this.effectiveEntryStrategy() === "ola") {
+      const ev = this.getOlaEntryEvaluation();
+      if (ev.skipReason) {
+        return { direction: ev.direction, reason: ev.skipReason };
+      }
+      return { direction: ev.direction, reason: ev.reasonLine };
+    }
+
     if (this.wallet.hasLiveMarketData() && this.directionalContext) {
       const { up, down } = this.directionalContext;
       const upOk = this.liveBookTradability(up).ok;
@@ -317,6 +1605,52 @@ export class TradingEngine {
       if (!upOk && downOk) {
         return { direction: "DOWN", reason: "Books: only DOWN passes filters (UP untradeable)" };
       }
+    }
+
+    if (this.effectiveEntryStrategy() === "ensemble") {
+      if (this.directionalContext && this.wallet.hasLiveMarketData()) {
+        const { up, down } = this.directionalContext;
+        const upOk = this.liveBookTradability(up).ok;
+        const downOk = this.liveBookTradability(down).ok;
+        if (upOk && downOk) {
+          const r = this.buildEnsembleResult();
+          return {
+            direction: r.direction,
+            reason: `ensemble score=${r.score.toFixed(3)} | ${r.parts.join(" · ")}`
+          };
+        }
+      }
+      const r = this.buildEnsembleResult();
+      return {
+        direction: r.direction,
+        reason: `ensemble(fallback) score=${r.score.toFixed(3)} | ${r.parts.join(" · ")}`
+      };
+    }
+
+    const esChoose = this.effectiveEntryStrategy();
+    if ((esChoose === "orderbook" || esChoose === "whale_edge") && this.directionalContext) {
+      const { up, down } = this.directionalContext;
+      const upOk = this.liveBookTradability(up).ok;
+      const downOk = this.liveBookTradability(down).ok;
+      if (upOk && downOk) {
+        const direction: Direction = up.mid >= down.mid ? "UP" : "DOWN";
+        const edge = Math.abs(up.mid - down.mid);
+        return {
+          direction,
+          reason:
+            esChoose === "whale_edge"
+              ? `whale_edge: UP=${up.mid.toFixed(4)} DN=${down.mid.toFixed(4)} edge=${edge.toFixed(4)}`
+              : `orderbook: mid UP=${up.mid.toFixed(4)} DOWN=${down.mid.toFixed(4)}`
+        };
+      }
+    }
+
+    const strat = this.effectiveEntryStrategy();
+    if (strat === "mean_revert" || strat === "chart") {
+      return {
+        direction: this.prediction.prediction,
+        reason: `${strat}: signal ${this.prediction.prediction} @ ${this.prediction.confidence.toFixed(1)}%`
+      };
     }
 
     let scoreUp = 0;
@@ -339,12 +1673,383 @@ export class TradingEngine {
     return { direction, reason: reasons.join(" | ") };
   }
 
-  onMarket?: (data: MarketPoint[]) => void;
+  private getEnsembleSamplesForActive(): MidSample[] {
+    const slug = this.wallet.getActiveDiscoveredSlug() ?? "_default";
+    return [...(this.ensembleMidBySlug.get(slug) ?? [])];
+  }
+
+  private pushEnsembleSampleForSlug(slug: string, upMid: number, downMid: number) {
+    const row: MidSample = { t: Date.now(), upMid, downMid };
+    let ring = this.ensembleMidBySlug.get(slug) ?? [];
+    ring = [...ring, row];
+    const maxR = Math.max(8, Math.min(80, envNum("ENSEMBLE_MID_RING_MAX", 40)));
+    while (ring.length > maxR) ring.shift();
+    this.ensembleMidBySlug.set(slug, ring);
+    while (this.ensembleMidBySlug.size > 36) {
+      const k = this.ensembleMidBySlug.keys().next().value;
+      if (k) this.ensembleMidBySlug.delete(k);
+      else break;
+    }
+  }
+
+  /** One sample per asset/slug each book refresh (multi-asset round-robin gets correct history). */
+  private recordEnsembleRingsForAllSlots(
+    slots: Array<{ asset: string; slug: string }>,
+    entries: Array<readonly [string, { up: { mid: number }; down: { mid: number } }]>
+  ) {
+    const byAsset = new Map<string, { up: { mid: number }; down: { mid: number } }>(entries);
+    for (const s of slots) {
+      const b = byAsset.get(s.asset);
+      if (!b) continue;
+      this.pushEnsembleSampleForSlug(s.slug, b.up.mid, b.down.mid);
+    }
+  }
+
+  private recordEnsembleMidSample() {
+    if (!this.directionalContext) return;
+    const slug = this.wallet.getActiveDiscoveredSlug() ?? "_default";
+    const { up, down } = this.directionalContext;
+    this.pushEnsembleSampleForSlug(slug, up.mid, down.mid);
+  }
+
+  /** OLA: Binance last trade vs engine price-to-beat (Gamma / RTDS anchor). */
+  private getOlaSignalCore(): {
+    prediction: Direction;
+    confidence: number;
+    oracle: ReturnType<typeof olaOracleVersusTarget>;
+    binance: number | null;
+    target: number | null;
+    asset: string | null;
+    binanceStale: boolean;
+  } {
+    const asset = this.wallet.getActiveDiscoveredAsset();
+    const staleMax = envNum("OLA_BINANCE_MAX_STALE_MS", 3000);
+    if (!asset) {
+      return {
+        prediction: "UP",
+        confidence: 55,
+        oracle: { kind: "flat", edgeUsd: 0 },
+        binance: null,
+        target: null,
+        asset: null,
+        binanceStale: true
+      };
+    }
+    const bin = this.binanceAgg.getPrice(asset);
+    const stale = bin == null || this.binanceAgg.ageMs(asset) > staleMax;
+    const targetN = this.priceToBeatByAsset.get(asset);
+    const target = targetN != null && Number.isFinite(targetN) && targetN > 0 ? targetN : null;
+    const th = olaThresholdUsd();
+    const oracle =
+      bin != null && target != null ? olaOracleVersusTarget(bin, target, th) : { kind: "flat" as const, edgeUsd: 0 };
+    const dir = olaDirectionFromOracle(oracle) ?? ("UP" as Direction);
+    const edgeUsd = oracle.edgeUsd;
+    const confBase = oracle.kind === "flat" ? 58 : 84;
+    const confidence = Math.min(
+      99,
+      Number((confBase + Math.min(14, edgeUsd / Math.max(1, (target ?? 1) * 0.00015))).toFixed(2))
+    );
+    return {
+      prediction: dir,
+      confidence,
+      oracle,
+      binance: bin,
+      target,
+      asset,
+      binanceStale: stale
+    };
+  }
+
+  /** OLA entry path: oracle direction + CLOB “discount” snipe on the winning side. */
+  private getOlaEntryEvaluation(): {
+    skipReason: string | null;
+    direction: Direction;
+    reasonLine: string;
+  } {
+    const core = this.getOlaSignalCore();
+    if (!this.wallet.hasLiveMarketData() || !this.directionalContext) {
+      return {
+        skipReason: "OLA_SKIP: live UP/DOWN books required",
+        direction: core.prediction,
+        reasonLine: ""
+      };
+    }
+    if (!core.asset) {
+      return { skipReason: "OLA_SKIP: no active asset", direction: "UP", reasonLine: "" };
+    }
+    if (core.binanceStale || core.binance == null) {
+      return {
+        skipReason: "OLA_SKIP: Binance aggTrade stale or missing",
+        direction: core.prediction,
+        reasonLine: ""
+      };
+    }
+    if (core.target == null) {
+      return {
+        skipReason: "OLA_SKIP: no price-to-beat",
+        direction: core.prediction,
+        reasonLine: ""
+      };
+    }
+    const oracleDir = olaDirectionFromOracle(core.oracle);
+    if (!oracleDir) {
+      return {
+        skipReason: `OLA_SKIP: oracle flat (within ±$${olaThresholdUsd()})`,
+        direction: core.prediction,
+        reasonLine: ""
+      };
+    }
+    const { up, down } = this.directionalContext;
+    const snipe = olaBookSnipeAllowed(oracleDir, up, down, olaSnipeAskCap());
+    if (!snipe.ok) {
+      return { skipReason: snipe.detail, direction: oracleDir, reasonLine: "" };
+    }
+    const reasonLine =
+      `OLA: ${oracleDir} Binance=${core.binance.toFixed(2)} target=${core.target.toFixed(2)} edge~${core.oracle.edgeUsd.toFixed(2)} USD | UPmid=${up.mid.toFixed(3)} DNmid=${down.mid.toFixed(3)}`;
+    return { skipReason: null, direction: oracleDir, reasonLine };
+  }
+
+  private maybeRecordOlaPnlAndCheckKill(trade: Trade, pnl: number) {
+    const dr = trade.decisionReason ?? "";
+    if (!dr.startsWith("OLA:") || dr.startsWith("OLA_SKIP")) return;
+    const now = Date.now();
+    const winStart = now - OLA_KILL_WINDOW_MS;
+    this.olaPnlHourly = this.olaPnlHourly.filter((e) => e.t > winStart);
+    this.olaPnlHourly.push({ t: now, pnl });
+    const net = this.olaPnlHourly.reduce((s, e) => s + e.pnl, 0);
+    const bal = Math.max(1, this.balance);
+    const thrLoss = bal * OLA_KILL_SWITCH_LOSS_FRAC;
+    if (net <= -thrLoss) {
+      this.olaKillTriggered = true;
+      this.running = false;
+      this.autoTrading = false;
+      this.log(
+        "ERROR",
+        `OLA_KILL_SWITCH: 1h net PnL $${net.toFixed(2)} (≤ -${(OLA_KILL_SWITCH_LOSS_FRAC * 100).toFixed(0)}% of balance ~$${thrLoss.toFixed(2)}) — engine stopped (admin alert)`
+      );
+      this.setPhase("ERROR", "OLA hourly loss kill switch");
+    }
+  }
+
+  private buildEnsembleResult() {
+    const samples = this.getEnsembleSamplesForActive();
+    const predictLb = envNum("MOMENTUM_PREDICT_LOOKBACK", 10);
+    const mt = this.momentumScalar(predictLb);
+    const div = momentumMode() === "from_open" ? 500 : 120;
+    const momNorm = Math.max(-1, Math.min(1, mt / div));
+    const last = this.marketData.at(-1);
+    const chartUp = last?.up ?? null;
+    const useCtr = String(process.env.ENSEMBLE_USE_CONTRARIAN_MOMENTUM ?? "false").toLowerCase() === "true";
+    const meta = this.wallet.getDiscoveredMeta();
+    let secondsToExpiry: number | null = null;
+    if (meta?.endDateIso) {
+      const end = new Date(meta.endDateIso).getTime();
+      if (!Number.isNaN(end)) secondsToExpiry = Math.floor((end - Date.now()) / 1000);
+    }
+    if (!this.directionalContext) {
+      const direction: Direction = momNorm >= 0 ? "UP" : "DOWN";
+      return { score: momNorm, direction, parts: [`mom_only:${momNorm.toFixed(2)}`] };
+    }
+    const { up, down } = this.directionalContext;
+    return computeEnsemble({
+      samples,
+      up,
+      down,
+      secondsToExpiry,
+      momentumTrend: momNorm,
+      chartUpPct: chartUp,
+      useContrarianMomentum: useCtr
+    });
+  }
+
+  /** Auto-trade: whale_edge gates, or ensemble + ENSEMBLE_APPLY_WHALE_FILTER. */
+  private whaleEdgeGateOrOk(direction: Direction): { ok: true } | { ok: false; reason: string } {
+    if (this.lagSnipeEnabled) return { ok: true };
+    const strat = this.effectiveEntryStrategy();
+    const useWhale =
+      strat === "whale_edge" ||
+      (strat === "ensemble" && ensembleApplyWhaleFilter()) ||
+      (strat === "ola" && olaUseWhaleFilter());
+    if (!useWhale) return { ok: true };
+    if (!this.directionalContext || !this.wallet.hasLiveMarketData()) {
+      return {
+        ok: false,
+        reason: strat === "ensemble" ? "ensemble_whale: need live UP/DOWN books" : "whale_edge: need live UP/DOWN books"
+      };
+    }
+    const timing = this.wallet.getTimingForBetLog();
+    const meta = this.wallet.getDiscoveredMeta();
+    let secondsToExpiry: number | null = null;
+    if (meta?.endDateIso) {
+      const end = new Date(meta.endDateIso).getTime();
+      if (!Number.isNaN(end)) secondsToExpiry = Math.floor((end - Date.now()) / 1000);
+    }
+    const asset = this.wallet.getActiveDiscoveredAsset();
+    let oracleDiffUsd: number | null = null;
+    if (asset) {
+      const spot = this.oracleSpotUsdForAsset(asset);
+      const ptb = this.priceToBeatByAsset.get(asset);
+      if (spot != null && ptb != null && Number.isFinite(spot) && Number.isFinite(ptb)) {
+        oracleDiffUsd = spot - ptb;
+      }
+    }
+    const { up, down } = this.directionalContext;
+    return evaluateWhaleEdgeGate({
+      direction,
+      up,
+      down,
+      secondsSinceWindowStart: timing.secondsSinceWindowStart,
+      secondsToExpiry,
+      warmupWindow: timing.warmupWindow,
+      oracleDiffUsd
+    });
+  }
+
+  /**
+   * Paper: optional take-profit while waiting for settle timer — exit when mid ≥ entry×(1+WHALE_PAPER_TP_RELATIVE).
+   * Example: WHALE_PAPER_TP_RELATIVE=0.5 → ~50% lift in implied probability vs entry VWAP before simulated exit.
+   */
+  private schedulePaperExitWithWhaleTp(tradeId: string, tokenId: string, entryVwap: number) {
+    const delayRaw = Number(process.env.PAPER_SETTLE_DELAY_MS ?? process.env.SIM_RESOLVE_MS ?? 5000);
+    const delayMs = Number.isFinite(delayRaw) ? Math.max(500, delayRaw) : 5000;
+    const tpRaw = process.env.WHALE_PAPER_TP_RELATIVE;
+    const tpRel = tpRaw !== undefined && String(tpRaw).trim() !== "" ? Number(tpRaw) : NaN;
+    const useTp = Number.isFinite(tpRel) && tpRel > 0;
+    if (!useTp) {
+      setTimeout(() => this.resolveTrade(tradeId), delayMs);
+      return;
+    }
+    void this.pollPaperTakeProfitThenSettle(tradeId, tokenId, entryVwap, delayMs, tpRel);
+  }
+
+  private async pollPaperTakeProfitThenSettle(
+    tradeId: string,
+    tokenId: string,
+    entryVwap: number,
+    maxWaitMs: number,
+    tpRelative: number
+  ) {
+    const target = whalePaperTakeProfitMid(entryVwap, tpRelative);
+    const pollMs = Math.max(500, Number(process.env.WHALE_PAPER_TP_POLL_MS ?? 2000));
+    const t0 = Date.now();
+    while (Date.now() - t0 < maxWaitMs) {
+      await new Promise((r) => setTimeout(r, pollMs));
+      const idx = this.trades.findIndex((t) => t.id === tradeId && t.status === "PENDING");
+      if (idx < 0) return;
+      try {
+        const raw = await this.wallet.getRawOrderBook(tokenId);
+        const nb = normalizeRawOrderBook(raw);
+        if (!nb || nb.bestBid == null || nb.bestAsk == null) continue;
+        const mid = (nb.bestBid + nb.bestAsk) / 2;
+        if (mid >= target - 1e-9) {
+          this.log(
+            "TRADE",
+            `PAPER whale TP: mid ${mid.toFixed(4)} ≥ ${target.toFixed(4)} (entryVWAP ${entryVwap.toFixed(4)}, +${(tpRelative * 100).toFixed(0)}% rel)`
+          );
+          this.resolveTrade(tradeId);
+          return;
+        }
+      } catch {
+        /* next poll */
+      }
+    }
+    this.resolveTrade(tradeId);
+  }
+
+  onMarket?: (data: MarketWsPayload) => void;
   onPrediction?: (data: Prediction) => void;
   onTrades?: (data: Trade[]) => void;
   onStatus?: (data: Status) => void;
   onLog?: (data: { ts: number; level: LogLevel; message: string }) => void;
   onBetLog?: (data: BetLogEntry) => void;
+
+  /**
+   * Auto-trade tick. When `olaFastLane` is true, only runs if ENTRY_STRATEGY is OLA (fast poll, default 250ms).
+   * Otherwise runs on the 5s cadence for all non-OLA strategies.
+   */
+  private async runAutoTradeOnce(olaFastLane: boolean) {
+    if (!this.running || !this.autoTrading) return;
+    if (this.olaKillTriggered) return;
+    const isOla = this.effectiveEntryStrategy() === "ola";
+    if (this.lagSnipeEnabled) {
+      if (olaFastLane) return;
+    } else if (olaFastLane !== isOla) {
+      return;
+    }
+    if (this.bookRefreshInFlight) return;
+    const n = this.wallet.getDiscoveredSlotCount();
+    try {
+      if (this.lagSnipeEnabled) {
+        await this.refreshLagSnipeKlinesIfEnabled();
+      }
+      if (n > 0) {
+        const slots = this.wallet.getDiscoveredSlotsSnapshot();
+        let enabledIndices = slots
+          .map((s, i) => (this.isAssetAutoTradeEnabled(s.asset) ? i : -1))
+          .filter((i) => i >= 0);
+        if (this.lagSnipeEnabled) {
+          enabledIndices = enabledIndices.filter(
+            (i) => slots[i]?.asset === "BTC" || slots[i]?.asset === "ETH"
+          );
+        }
+        if (enabledIndices.length === 0) {
+          return;
+        }
+        const pick = enabledIndices[this.autoTradeSlotRotation % enabledIndices.length];
+        this.autoTradeSlotRotation += 1;
+        this.wallet.setActiveSlot(pick);
+        this.directionalContext = await this.wallet.getDirectionalContext();
+        const sel = this.wallet.getDiscoveredSelection();
+        if (sel) {
+          this.selectedMarket = { tokenID: sel.tokenID, label: sel.label, outcome: "AUTO" };
+        }
+      }
+      const choice = this.chooseDirectionalEntry();
+      if (choice.reason.startsWith("OLA_SKIP:") || choice.reason.startsWith("LAG_SNIPE_SKIP:")) {
+        return;
+      }
+      const direction = choice.direction;
+      /** OLA ignores global NO_TRADE from chart/volatility — entries follow oracle+book snipe only. */
+      if (
+        !isOla &&
+        !this.lagSnipeEnabled &&
+        this.prediction.recommendation === "NO_TRADE" &&
+        !this.canIgnoreNoTradeForBookOnlyBlock("AUTO")
+      ) {
+        this.log("SIGNAL", `Auto-trade skipped (${this.prediction.reason ?? "direction mismatch"})`);
+        return;
+      }
+      const whaleGate = this.whaleEdgeGateOrOk(direction);
+      if (!whaleGate.ok) {
+        this.log("SIGNAL", whaleGate.reason);
+        return;
+      }
+      const { amount: riskAmount, budget } = await this.computeAutoTradeAmount();
+      if (riskAmount < this.effMinTrade()) {
+        if (!budget) {
+          this.log(
+            "SIGNAL",
+            `Skipped because budget unavailable (wallet.getAvailableCollateralBudget() returned null). MIN_TRADE=${this.effMinTrade()}`
+          );
+        } else {
+          const total = budget.balanceUsdc;
+          const reserved = budget.reservedUsdc;
+          const available = budget.availableUsdc;
+          this.log(
+            "SIGNAL",
+            `Skipped because available collateral ${available.toFixed(6)} < MIN_TRADE ${this.effMinTrade()} (total ${total.toFixed(
+              6
+            )}; reserved ${reserved.toFixed(6)})`
+          );
+        }
+        return;
+      }
+      const result = await this.trade(direction, riskAmount, "AUTO", choice.reason);
+      if (!result.accepted) this.log("ERROR", `Auto-trade blocked: ${result.reason ?? "unknown"}`);
+    } finally {
+      this.wallet.setActiveSlot(0);
+    }
+  }
 
   async init() {
     const autoStart = String(process.env.AUTO_START_BOT ?? "true").toLowerCase() === "true";
@@ -360,116 +2065,216 @@ export class TradingEngine {
     } catch {
       this.log("ERROR", "Could not load markets, using fallback market list");
     }
-    this.log("SIGNAL", `Engine initialized in ${this.wallet.getMode()} mode`);
+    const updAssets = process.env.UPDOWN_ASSETS ?? process.env.UPDOWN_ASSET ?? "BTC";
+    const eff = parseEnvEntryStrategy();
+    const stratNote =
+      eff === "ola"
+        ? "OLA=oracle+Binance only (MOMENTUM_MODE ignored)"
+        : `MOMENTUM_MODE=${momentumMode()}`;
+    this.log(
+      "SIGNAL",
+      `Engine initialized in ${this.wallet.getMode()} mode (ENTRY_STRATEGY=${eff}${this.entryStrategyRuntime ? ` override=${this.entryStrategyRuntime}` : ""}, ${stratNote}, UPDOWN_5M=${updAssets})`
+    );
+    const boneActive = ["BONE_HIGH_CONF", "BONE_EQ", "BONE_LONGSHOT", "BONE_LATENCY"].filter((k) => boneEnvTrue(k));
+    if (boneActive.length) {
+      this.log("SIGNAL", `BONE entry filters enabled: ${boneActive.join(", ")}`);
+    }
+    this.polymarketRtds.start();
+    this.syncAssetAutoTradeKeysFromConfigured();
+    this.binanceAgg.start(this.wallet.getUpdownAssetsConfigured());
     this.running = autoStart;
     this.autoTrading = autoStart;
     this.setPhase(autoStart ? "STARTING" : "STOPPED", autoStart ? "AutoStart enabled" : undefined);
     if (autoStart) {
       this.log("TRADE", "Auto-trading enabled on startup");
     }
-    this.prediction = { ...this.basePredict(), recommendation: "TRADE", reason: "Warm start" };
+    if (this.effectiveEntryStrategy() === "ola") {
+      const core = this.getOlaSignalCore();
+      this.prediction = {
+        prediction: core.prediction,
+        confidence: core.confidence,
+        ts: Date.now(),
+        recommendation: "TRADE",
+        reason: "OLA: Binance + price-to-beat (no momentum blend)"
+      };
+    } else {
+      this.prediction = { ...this.basePredict(), recommendation: "TRADE", reason: "Warm start" };
+    }
     this.onPrediction?.(this.prediction);
     const tickBtcChart = async () => {
+      if (this.chartPollInFlight) return;
+      this.chartPollInFlight = true;
       try {
-        const p = await fetchBtcUsd();
-        this.pushMarketPointFromLiveBtc(p);
-        this.onMarket?.(this.marketData);
+        try {
+          await this.refreshSpotAnchorsForConfiguredAssets();
+        } catch (e) {
+          this.log("ERROR", `Multi-asset spot feed: ${e instanceof Error ? e.message : String(e)}`);
+        }
+        const cfgs = this.wallet.getUpdownAssetsConfigured();
+        for (const sym of cfgs) {
+          const s = this.lastSpotUsdByAsset.get(sym);
+          if (s != null && Number.isFinite(s) && s > 0) {
+            this.pushAssetSpotChartPoint(sym, s);
+          }
+        }
+        const primarySym = cfgs[0] ?? "BTC";
+        let primarySpot = this.lastSpotUsdByAsset.get(primarySym);
+        if (primarySpot == null || !Number.isFinite(primarySpot) || primarySpot <= 0) {
+          try {
+            primarySpot = primarySym === "BTC" ? await fetchBtcUsd() : await fetchUsdSpot(primarySym);
+            this.lastSpotUsdByAsset.set(primarySym, primarySpot);
+          } catch (e) {
+            this.log(
+              "ERROR",
+              `Chart primary feed (${primarySym}): ${e instanceof Error ? e.message : String(e)}`
+            );
+            this.onMarket?.(this.buildMarketWsPayload());
+            return;
+          }
+        }
+        this.pushMarketPointFromLiveBtc(primarySpot);
+        this.onMarket?.(this.buildMarketWsPayload());
       } catch (e) {
-        this.log("ERROR", `BTC chart feed: ${e instanceof Error ? e.message : String(e)}`);
+        this.log("ERROR", `Chart feed: ${e instanceof Error ? e.message : String(e)}`);
+      } finally {
+        this.chartPollInFlight = false;
       }
     };
     void tickBtcChart();
     setInterval(() => void tickBtcChart(), CHART_POLL_MS);
     setInterval(() => {
-      const base = this.basePredict();
-      const recent = this.marketData.slice(-12);
-      const moves = recent.map((r) => r.movement);
-      const avgMove = moves.length ? moves.reduce((a, b) => a + b, 0) / moves.length : 0;
-      const volatility = moves.length ? Math.sqrt(moves.reduce((a, b) => a + b * b, 0) / moves.length) : 0;
-      let recommendation: "TRADE" | "NO_TRADE" =
-        this.prediction.confidence < 94 || volatility > PREDICTION_VOLATILITY_USD ? "NO_TRADE" : "TRADE";
-      let reason =
-        recommendation === "NO_TRADE"
-          ? this.prediction.confidence < 94
-            ? "Signal confidence too low"
-            : `Short-term volatility high (~$${volatility.toFixed(1)} tick stdev)`
-          : avgMove >= 0
-            ? "Momentum supports UP bias"
-            : "Momentum supports DOWN bias";
-
-      if (this.wallet.hasLiveMarketData() && this.directionalContext) {
-        const upT = this.liveBookTradability(this.directionalContext.up);
-        const downT = this.liveBookTradability(this.directionalContext.down);
-        if (!upT.ok && !downT.ok) {
-          recommendation = "NO_TRADE";
-          reason = `Live books not tradable (both sides): UP — ${upT.detail}; DOWN — ${downT.detail}`;
-        }
-      }
-
-      this.prediction = { ...base, recommendation, reason };
-      if (recommendation === "NO_TRADE" && reason.includes("Live books not tradable")) {
-        this.setPhase("MARKET_NOT_TRADABLE", reason);
-      } else if (recommendation === "TRADE") {
-        this.setPhase("SIGNAL_READY", `Signal: ${base.prediction} (${base.confidence.toFixed(0)}%)`);
-      } else {
-        // Signal generator blocked; execution will also block.
-        this.setPhase("SIGNAL_READY", reason);
-      }
-      if (recommendation === "NO_TRADE") this.noTradeSignals += 1;
-      this.onPrediction?.(this.prediction);
-      this.log(
-        "SIGNAL",
-        `${this.prediction.prediction} ${this.prediction.confidence}% (${this.prediction.recommendation})`
-      );
+      this.synchronizeLivePredictionAndPhase(true);
     }, 5000);
+    setInterval(() => void this.runAutoTradeOnce(false), 5000);
+    setInterval(() => void this.runAutoTradeOnce(true), Math.max(50, envNum("OLA_AUTO_MS", 250)));
     setInterval(async () => {
-      if (!this.running || !this.autoTrading) return;
-      const choice = this.chooseDirectionalEntry();
-      const direction = choice.direction;
-      if (this.prediction.recommendation === "NO_TRADE") {
-        this.log("SIGNAL", `Auto-trade skipped (${this.prediction.reason ?? "direction mismatch"})`);
-        return;
-      }
-      const { amount: riskAmount, budget } = await this.computeAutoTradeAmount();
-      if (riskAmount < MIN_TRADE) {
-        if (!budget) {
-          this.log(
-            "SIGNAL",
-            `Skipped because budget unavailable (wallet.getAvailableCollateralBudget() returned null). MIN_TRADE=${MIN_TRADE}`
-          );
-        } else {
-          const total = budget.balanceUsdc;
-          const reserved = budget.reservedUsdc;
-          const available = budget.availableUsdc;
-          this.log(
-            "SIGNAL",
-            `Skipped because available collateral ${available.toFixed(6)} < MIN_TRADE ${MIN_TRADE} (total ${total.toFixed(
-              6
-            )}; reserved ${reserved.toFixed(6)})`
-          );
-        }
-        return;
-      }
-      const result = await this.trade(direction, riskAmount, "AUTO", choice.reason);
-      if (!result.accepted) this.log("ERROR", `Auto-trade blocked: ${result.reason ?? "unknown"}`);
-    }, 5000);
-    setInterval(async () => {
+      if (this.bookRefreshInFlight) return;
+      this.bookRefreshInFlight = true;
       try {
         const rolled = await this.wallet.refreshActiveUpDownMarket();
         if (rolled) {
           this.setPhase("ROLLOVER", "Active 5m window rolled; refreshing token IDs");
+          this.lastBroadcastPredKey = "";
+          this.lastBroadcastPhaseKey = "";
           const sel = this.wallet.getDiscoveredSelection();
           if (sel) {
             this.selectedMarket = { tokenID: sel.tokenID, label: sel.label, outcome: "AUTO" };
             this.log("SIGNAL", `Active market rolled: ${sel.label}`);
           }
         }
-        this.setPhase("BOOK_LOADING", "Refreshing order books / directional contexts");
-        this.marketContext = await this.wallet.getMarketContext(this.selectedMarket.tokenID);
-        this.directionalContext = await this.wallet.getDirectionalContext();
-        this.lastBookRefreshMs = Date.now();
+        this.wallet.setActiveSlot(0);
+        const sel0 = this.wallet.getDiscoveredSelection();
+        if (sel0) {
+          this.selectedMarket = { tokenID: sel0.tokenID, label: sel0.label, outcome: "AUTO" };
+        }
+        const bookIds = new Set<string>();
+        if (this.selectedMarket.tokenID) bookIds.add(this.selectedMarket.tokenID);
+        for (const s of this.wallet.getDiscoveredSlotsSnapshot()) {
+          bookIds.add(s.tokenIdUp);
+          bookIds.add(s.tokenIdDown);
+        }
+        await this.wallet.primeBooksForTokens([...bookIds]);
+        try {
+          const [mc, dc] = await Promise.all([
+            this.wallet.getMarketContext(this.selectedMarket.tokenID),
+            this.wallet.getDirectionalContext()
+          ]);
+          this.marketContext = mc;
+          this.directionalContext = dc;
+          const slots = this.wallet.getDiscoveredSlotsSnapshot();
+          this.syncAssetAutoTradeKeysFromConfigured();
+          if (slots.length > 0) {
+            this.polymarketRtds.start();
+            const wantChainlinkBtc = slots.some((s) => s.asset.trim().toUpperCase() === "BTC");
+            const [entries, gammaResults] = await Promise.all([
+              Promise.all(
+                slots.map(async (s) => {
+                  const [up, down] = await Promise.all([
+                    this.wallet.getMarketContext(s.tokenIdUp),
+                    this.wallet.getMarketContext(s.tokenIdDown)
+                  ]);
+                  const qu = this.bookQuality(up);
+                  const qd = this.bookQuality(down);
+                  return [
+                    s.asset,
+                    {
+                      up: { mid: up.mid, spread: qu.spread, badge: qu.badge },
+                      down: { mid: down.mid, spread: qd.spread, badge: qd.badge }
+                    }
+                  ] as const;
+                })
+              ),
+              Promise.all(
+                slots.map(async (s) => {
+                  const g = await fetchGammaDisplayStats(s.slug);
+                  return { s, g } as const;
+                })
+              )
+            ]);
+            const chainlinkBtcTick = wantChainlinkBtc
+              ? await this.chainlinkFeed.getLatestUsdPrice("BTC")
+              : null;
+            if (chainlinkBtcTick) this.chainlinkUsdByAsset.set("BTC", chainlinkBtcTick);
+            this.multiSlotBooks = Object.fromEntries(entries);
+            this.recordEnsembleRingsForAllSlots(slots, entries);
+
+            for (const { s, g } of gammaResults) {
+              const assetUpper = s.asset.trim().toUpperCase();
+              if (g) {
+                this.gammaDisplayByAsset.set(assetUpper, {
+                  up: g.up,
+                  down: g.down,
+                  priceToBeat: g.priceToBeat,
+                  updatedMs: Date.now()
+                });
+              }
+              const ws = s.windowStartSec;
+              if (ws == null) continue;
+              const prevWs = this.oracleWindowTrackedByAsset.get(assetUpper);
+              const windowBumped = prevWs !== ws;
+
+              if (assetUpper === "BTC") {
+                // BTC strike is authoritative from on-chain Chainlink; no Gamma fallback.
+                if (windowBumped) this.priceToBeatByAsset.delete(assetUpper);
+                if (windowBumped && chainlinkBtcTick) {
+                  const ageMs = Date.now() - chainlinkBtcTick.updatedAt;
+                  if (chainlinkBtcTick.price > 0 && ageMs <= this.chainlinkStaleMs()) {
+                    this.priceToBeatByAsset.set(assetUpper, chainlinkBtcTick.price);
+                    this.oracleWindowTrackedByAsset.set(assetUpper, ws);
+                    this.log(
+                      "SIGNAL",
+                      `[CHAINLINK] strike captured asset=${assetUpper} windowSec=${ws} price=$${chainlinkBtcTick.price.toFixed(2)}`
+                    );
+                  }
+                }
+              } else {
+                if (g?.priceToBeat != null && Number.isFinite(g.priceToBeat)) {
+                  this.priceToBeatByAsset.set(assetUpper, g.priceToBeat);
+                  this.oracleWindowTrackedByAsset.set(assetUpper, ws);
+                } else if (windowBumped) {
+                  const spot = this.polymarketRtds.getUsdForAsset(assetUpper);
+                  if (spot != null) this.priceToBeatByAsset.set(assetUpper, spot);
+                  this.oracleWindowTrackedByAsset.set(assetUpper, ws);
+                }
+              }
+            }
+          } else {
+            this.multiSlotBooks = null;
+            this.gammaDisplayByAsset.clear();
+            this.priceToBeatByAsset.clear();
+            this.oracleWindowTrackedByAsset.clear();
+            this.chainlinkUsdByAsset.clear();
+            this.recordEnsembleMidSample();
+          }
+          this.lastBookRefreshMs = Date.now();
+          this.synchronizeLivePredictionAndPhase(false);
+        } finally {
+          this.wallet.clearBookPrime();
+        }
       } catch {
         this.log("ERROR", "Failed to refresh market context");
+      } finally {
+        this.bookRefreshInFlight = false;
       }
     }, 4000);
   }
@@ -521,8 +2326,24 @@ export class TradingEngine {
       } else {
         this.selectedMarket = this.markets[0] ?? this.selectedMarket;
       }
-      this.marketContext = await this.wallet.getMarketContext(this.selectedMarket.tokenID);
-      this.directionalContext = await this.wallet.getDirectionalContext();
+      const bookIds = new Set<string>();
+      if (this.selectedMarket.tokenID) bookIds.add(this.selectedMarket.tokenID);
+      for (const s of this.wallet.getDiscoveredSlotsSnapshot()) {
+        bookIds.add(s.tokenIdUp);
+        bookIds.add(s.tokenIdDown);
+      }
+      await this.wallet.primeBooksForTokens([...bookIds]);
+      try {
+        const [mc2, dc2] = await Promise.all([
+          this.wallet.getMarketContext(this.selectedMarket.tokenID),
+          this.wallet.getDirectionalContext()
+        ]);
+        this.marketContext = mc2;
+        this.directionalContext = dc2;
+        this.recordEnsembleMidSample();
+      } finally {
+        this.wallet.clearBookPrime();
+      }
     } catch {
       this.log("ERROR", "Could not refresh markets after mode change");
     }
@@ -540,8 +2361,9 @@ export class TradingEngine {
       autoTrading: this.autoTrading,
       mode: this.wallet.getMode(),
       balance: this.balance,
-      cooldownMs: COOLDOWN_MS,
+      cooldownMs: this.effCooldownMs(),
       stopLossTriggered: this.stopLossTriggered,
+      olaKillTriggered: this.olaKillTriggered,
       phase: this.phase,
       phaseReason: this.phaseReason
     };
@@ -576,12 +2398,22 @@ export class TradingEngine {
     return this.wallet.getMarketContext(tokenID);
   }
 
+  /** Polymarket + spot + RPC + CLOB book (engine) latency snapshot for dashboard. */
+  runConnectivityPings() {
+    return runConnectivityPings({
+      getMarketContext: (tokenID) => this.wallet.getMarketContext(tokenID),
+      getClobHost: () => this.wallet.getClobHostForPing(),
+      getSampleTokenId: () =>
+        this.wallet.getSampleTokenIdForPing() ?? this.selectedMarket.tokenID ?? null
+    });
+  }
+
   getClobSigningConfig() {
     return this.wallet.getPublicSigningConfig();
   }
 
-  getMarketData() {
-    return this.marketData;
+  getMarketData(): MarketWsPayload {
+    return this.buildMarketWsPayload();
   }
 
   getPrediction() {
@@ -602,7 +2434,7 @@ export class TradingEngine {
   }
 
   getInsights(): Insights {
-    const finished = this.trades.filter((t) => t.status !== "PENDING");
+    const finished = this.trades.filter((t) => t.status !== "PENDING" && !t.paper?.missed);
     const wins = finished.filter((t) => t.status === "WIN");
     const losses = finished.filter((t) => t.status === "LOSS");
     const grouped = new Map<string, { wins: number; total: number }>();
@@ -622,7 +2454,14 @@ export class TradingEngine {
         winRate: v.total ? (v.wins / v.total) * 100 : 0,
         trades: v.total
       })),
-      gtcExit: { ...this.gtcMetrics }
+      gtcExit: { ...this.gtcMetrics },
+      highConfMidBlocked: this.highConfMidBlocked,
+      boneEntryFilters: {
+        highConf: this.boneHighConfBlocked,
+        equilibrium: this.boneEqBlocked,
+        longshot: this.boneLongshotBlocked,
+        latency: this.boneLatencyBlocked
+      }
     };
   }
 
@@ -638,9 +2477,43 @@ export class TradingEngine {
     return [...this.betLogs];
   }
 
+  getBotTradeHistory(): BotTradeHistoryRecord[] {
+    return [...this.botTradeHistory];
+  }
+
+  private pushBotTradeHistory(row: BotTradeHistoryRecord) {
+    this.botTradeHistory = [row, ...this.botTradeHistory].slice(0, 250);
+  }
+
   private pushBetLog(entry: BetLogEntry) {
     this.betLogs = [entry, ...this.betLogs].slice(0, 80);
     this.onBetLog?.(entry);
+  }
+
+  /** Snapshot of pair mids + asset at trade entry (for history / UI). */
+  private tradeEntrySnapshot(): {
+    asset?: string;
+    upPriceAtEntry?: number;
+    downPriceAtEntry?: number;
+  } {
+    const asset = this.wallet.getActiveDiscoveredAsset() ?? undefined;
+    const dc = this.directionalContext;
+    if (dc && this.wallet.hasLiveMarketData()) {
+      return {
+        asset,
+        upPriceAtEntry: dc.up.mid,
+        downPriceAtEntry: dc.down.mid
+      };
+    }
+    const last = this.marketData.at(-1);
+    if (last) {
+      return {
+        asset,
+        upPriceAtEntry: last.up / 100,
+        downPriceAtEntry: last.down / 100
+      };
+    }
+    return { asset };
   }
 
   private buildBetLog(
@@ -677,6 +2550,158 @@ export class TradingEngine {
     return this.marketContext;
   }
 
+  /**
+   * Incremental entry filters (BONE_* env flags). When enabled, all enabled gates must pass.
+   * Does not replace SIGNAL_MODE / risk limits / execution or exits.
+   */
+  private checkBoneEntryFilters(
+    direction: Direction,
+    book: MarketContext
+  ): { ok: true } | { ok: false; code: string; detail: string } {
+    if (this.lagSnipeEnabled) return { ok: true };
+    if (this.effectiveEntryStrategy() === "ola") return { ok: true };
+    const c = this.prediction.confidence;
+    const conf01 = c > 1 ? c / 100 : c;
+
+    if (boneEnvTrue("BONE_HIGH_CONF")) {
+      const minPctRaw = envNum("BONE_HIGH_CONF_MIN_PCT", BONE_SCALP_MIN_CONF_PCT);
+      const minPct =
+        !Number.isFinite(minPctRaw) || minPctRaw < 50 || minPctRaw > 100 ? BONE_SCALP_MIN_CONF_PCT : minPctRaw;
+      const minCmRaw = envNum("BONE_HIGH_CONF_MIN_CM", BONE_SCALP_MIN_CONF_TIMES_MID);
+      const minCmEff =
+        !Number.isFinite(minCmRaw) || minCmRaw <= 0 || minCmRaw > 1
+          ? BONE_SCALP_MIN_CONF_TIMES_MID
+          : minCmRaw;
+      const midThr = highConfMidThreshold();
+      if (c < minPct) {
+        this.boneHighConfBlocked += 1;
+        return { ok: false, code: "BONE_HIGH_CONF", detail: `conf ${c.toFixed(2)}% < min ${minPct}% (scalp)` };
+      }
+      const prod = conf01 * book.mid;
+      const bookHighConf = book.mid >= midThr || prod >= minCmEff;
+      if (!bookHighConf) {
+        this.boneHighConfBlocked += 1;
+        return {
+          ok: false,
+          code: "BONE_HIGH_CONF",
+          detail:
+            `scalp book gate: need mid≥${midThr} OR conf×mid≥${minCmEff} — got mid=${book.mid.toFixed(4)} conf×mid=${prod.toFixed(4)}`
+        };
+      }
+      const ctx = this.directionalContext;
+      if (ctx && this.wallet.hasLiveMarketData()) {
+        const whaleFrac = envNum("BONE_HIGH_CONF_WHALE_FRAC", BONE_SCALP_WHALE_FRAC);
+        const wf =
+          !Number.isFinite(whaleFrac) || whaleFrac <= 0 || whaleFrac > 1 ? BONE_SCALP_WHALE_FRAC : whaleFrac;
+        const maxL = Math.max(ctx.up.liquidity, ctx.down.liquidity);
+        const sideL = direction === "UP" ? ctx.up.liquidity : ctx.down.liquidity;
+        if (maxL > 0 && sideL < wf * maxL) {
+          this.boneHighConfBlocked += 1;
+          return {
+            ok: false,
+            code: "BONE_HIGH_CONF",
+            detail: `side liquidity ${sideL.toFixed(0)} < ${(wf * 100).toFixed(0)}% of pair max ${maxL.toFixed(0)} (whale-depth)`
+          };
+        }
+      }
+    }
+
+    if (boneEnvTrue("BONE_EQ")) {
+      const band = envNum("BONE_EQ_BAND", 0.08);
+      const b = !Number.isFinite(band) || band <= 0 || band > 0.5 ? 0.08 : band;
+      const ctx = this.directionalContext;
+      if (ctx && this.wallet.hasLiveMarketData()) {
+        if (Math.abs(ctx.up.mid - 0.5) > b || Math.abs(ctx.down.mid - 0.5) > b) {
+          this.boneEqBlocked += 1;
+          return {
+            ok: false,
+            code: "BONE_EQ",
+            detail: `UP/DOWN mids not in equilibrium band ±${b} around 0.5`
+          };
+        }
+      } else if (Math.abs(book.mid - 0.5) > b) {
+        this.boneEqBlocked += 1;
+        return {
+          ok: false,
+          code: "BONE_EQ",
+          detail: `mid ${book.mid.toFixed(4)} outside ±${b} of 0.5 (SIM/single book)`
+        };
+      }
+    }
+
+    if (boneEnvTrue("BONE_LONGSHOT")) {
+      const mode = String(process.env.BONE_LONGSHOT_MODE ?? "cheap").toLowerCase();
+      if (mode === "favorite" || mode === "rich") {
+        const minMid = envNum("BONE_LONGSHOT_MIN_MID", 0.58);
+        const mm = !Number.isFinite(minMid) || minMid <= 0 || minMid >= 1 ? 0.58 : minMid;
+        if (book.mid < mm) {
+          this.boneLongshotBlocked += 1;
+          return {
+            ok: false,
+            code: "BONE_LONGSHOT",
+            detail: `mid ${book.mid.toFixed(4)} < ${mm} (favorite-only mode)`
+          };
+        }
+      } else {
+        const maxMid = envNum("BONE_LONGSHOT_MAX_MID", 0.42);
+        const xm = !Number.isFinite(maxMid) || maxMid <= 0 || maxMid >= 1 ? 0.42 : maxMid;
+        if (book.mid > xm) {
+          this.boneLongshotBlocked += 1;
+          return {
+            ok: false,
+            code: "BONE_LONGSHOT",
+            detail: `mid ${book.mid.toFixed(4)} > ${xm} (longshot/cheap-side only)`
+          };
+        }
+      }
+    }
+
+    if (boneEnvTrue("BONE_LATENCY")) {
+      const minBps = envNum("BONE_LATENCY_MIN_MOVE_BPS", 5);
+      const need = !Number.isFinite(minBps) || minBps < 0 ? 5 : minBps;
+      const sym = this.wallet.getActiveDiscoveredAsset();
+      if (sym) {
+        const lastUsd = this.lastSpotUsdByAsset.get(sym);
+        const win = this.spotWindowByAsset.get(sym);
+        if (lastUsd != null && win != null && win.openUsd > 0) {
+          const bps = (Math.abs(lastUsd - win.openUsd) / win.openUsd) * 10_000;
+          if (bps < need) {
+            this.boneLatencyBlocked += 1;
+            return {
+              ok: false,
+              code: "BONE_LATENCY",
+              detail: `window ${sym} move ${bps.toFixed(2)} bps < min ${need} bps (latency proxy)`
+            };
+          }
+        } else {
+          this.boneLatencyBlocked += 1;
+          return {
+            ok: false,
+            code: "BONE_LATENCY",
+            detail: `missing ${sym} spot or window-open ref for move bps`
+          };
+        }
+      } else {
+        const last = this.marketData[this.marketData.length - 1];
+        if (last?.btcUsd == null || this.btcTargetUsd == null || this.btcTargetUsd <= 0) {
+          this.boneLatencyBlocked += 1;
+          return { ok: false, code: "BONE_LATENCY", detail: "missing BTC or window-open ref for move bps" };
+        }
+        const bps = (Math.abs(last.btcUsd - this.btcTargetUsd) / this.btcTargetUsd) * 10_000;
+        if (bps < need) {
+          this.boneLatencyBlocked += 1;
+          return {
+            ok: false,
+            code: "BONE_LATENCY",
+            detail: `window BTC move ${bps.toFixed(2)} bps < min ${need} bps (latency proxy)`
+          };
+        }
+      }
+    }
+
+    return { ok: true };
+  }
+
   getGtcExitMetrics(): GtcExitMetrics {
     return { ...this.gtcMetrics };
   }
@@ -692,6 +2717,8 @@ export class TradingEngine {
     direction: Direction,
     tradeId: string
   ) {
+    const row = this.trades.find((t) => t.id === tradeId);
+    if (row?.lagSnipeHold) return;
     if (!gtcExitEnabled()) return;
     this.gtcMetrics.postsAttempted += 1;
     const maxShares = envNum("MAX_GTC_SIZE", 100);
@@ -802,11 +2829,21 @@ export class TradingEngine {
 
   async trade(direction: Direction, amount: number, source: "MANUAL" | "AUTO" = "MANUAL", decisionReason?: string) {
     if (!this.running) return { accepted: false, reason: "Engine is stopped" };
+    const strat = this.effectiveEntryStrategy();
+    const botCfg = loadBotFiltersConfig();
     if (this.stopLossTriggered) {
       this.setPhase("ERROR", "Stop loss triggered");
       return { accepted: false, reason: "Stop loss triggered" };
     }
-    if (amount < MIN_TRADE || amount > MAX_TRADE) {
+    if (this.olaKillTriggered) {
+      this.setPhase("ERROR", "OLA hourly kill switch");
+      return { accepted: false, reason: "OLA hourly kill switch triggered" };
+    }
+    if (this.lagSnipeEnabled) {
+      // User override: lock Lag Snipe to fixed $1 entries.
+      amount = 1;
+    }
+    if (amount < this.effMinTrade() || amount > this.effMaxTrade()) {
       this.setPhase("RISK_BLOCKED", "Trade limits violated");
       return { accepted: false, reason: "Trade limits violated" };
     }
@@ -814,16 +2851,72 @@ export class TradingEngine {
       this.setPhase("RISK_BLOCKED", "Insufficient balance");
       return { accepted: false, reason: "Insufficient balance" };
     }
-    if (Date.now() - this.lastTradeAt < COOLDOWN_MS) {
+    const cdKey = this.wallet.getActiveDiscoveredSlug() ?? "__default__";
+    const lastCd = this.lastTradeAtBySlug.get(cdKey) ?? 0;
+    if (Date.now() - lastCd < this.effCooldownMs()) {
       this.setPhase("RISK_BLOCKED", "Cooldown active");
       return { accepted: false, reason: "Cooldown active" };
     }
 
-    if (this.prediction.recommendation === "NO_TRADE") {
+    if (strat === "ola") {
+      const meta = this.wallet.getDiscoveredMeta();
+      const endParsed = meta?.endDateIso ? new Date(meta.endDateIso).getTime() : NaN;
+      const secLeft = !Number.isNaN(endParsed) ? Math.floor((endParsed - Date.now()) / 1000) : null;
+      if (olaSecondsToExpiryAbort(secLeft)) {
+        this.setPhase("RISK_BLOCKED", "OLA: <10s to expiry");
+        return { accepted: false, reason: "OLA: <10s to window end — no new trades" };
+      }
+    }
+
+    if (this.lagSnipeEnabled) {
+      const ev = this.evaluateLagSnipeDisplay();
+      if (ev.recommendation !== "TRADE" || ev.prediction !== direction) {
+        this.setPhase("SIGNAL_READY", ev.reason);
+        return { accepted: false, reason: ev.reason };
+      }
+    }
+
+    if (
+      strat !== "ola" &&
+      !this.lagSnipeEnabled &&
+      this.prediction.recommendation === "NO_TRADE" &&
+      !this.canIgnoreNoTradeForBookOnlyBlock(source)
+    ) {
       this.setPhase("SIGNAL_READY", this.prediction.reason);
       return { accepted: false, reason: `No-trade signal: ${this.prediction.reason}` };
     }
+
+    const cfgGate = this.checkConfigTradeFilters(strat, botCfg);
+    if (!cfgGate.ok) {
+      this.setPhase("RISK_BLOCKED", cfgGate.reason);
+      return { accepted: false, reason: cfgGate.reason };
+    }
+
     const book = this.liveBookForDirection(direction);
+    if (strat !== "ola" && !this.lagSnipeEnabled && signalModeHighConf()) {
+      const thr = highConfMidThreshold();
+      const mid = book.mid;
+      const c = this.prediction.confidence;
+      const conf01 = c > 1 ? c / 100 : c;
+      const prod = conf01 * mid;
+      const passes = mid >= thr || prod >= thr;
+      if (!passes) {
+        this.highConfMidBlocked += 1;
+        const projectedSimWin = amount * (this.prediction.confidence / 100);
+        this.log(
+          "SIGNAL",
+          `LOW_CONF_MID mid=${mid.toFixed(4)} conf=${c.toFixed(2)}% conf×mid=${prod.toFixed(4)} need≥${thr} ` +
+            `| proj.simWinPnL_if_taken=$${projectedSimWin.toFixed(2)} on $${amount.toFixed(2)} stake | blocked#${this.highConfMidBlocked}`
+        );
+        this.setPhase("RISK_BLOCKED", "LOW_CONF_MID");
+        this.pushBetLog(
+          this.buildBetLog("blocked", direction, book, {
+            blockReason: `LOW_CONF_MID: mid=${mid.toFixed(4)} conf×mid=${prod.toFixed(4)} < ${thr} (proj.simWinPnL $${projectedSimWin.toFixed(2)})`
+          })
+        );
+        return { accepted: false, reason: "LOW_CONF_MID" };
+      }
+    }
     const exec = this.liveBookTradability(book);
     if (!exec.ok) {
       this.setPhase("MARKET_NOT_TRADABLE", `Execution gate failed: ${exec.detail}`);
@@ -838,24 +2931,40 @@ export class TradingEngine {
       };
     }
 
+    const bone = this.checkBoneEntryFilters(direction, book);
+    if (!bone.ok) {
+      this.setPhase("RISK_BLOCKED", bone.code);
+      const replay = `BONE_BLOCK ${bone.code}: ${bone.detail}`;
+      this.log("SIGNAL", replay);
+      this.pushBetLog(
+        this.buildBetLog("blocked", direction, book, {
+          blockReason: replay
+        })
+      );
+      return { accepted: false, reason: bone.detail };
+    }
+
     let effectiveAmount = amount;
+    if (this.lagSnipeEnabled) {
+      effectiveAmount = 1;
+    }
     if (this.wallet.getMode() === "LIVE") {
       const budget = await this.wallet.getAvailableCollateralBudget();
       if (budget) {
-        if (budget.availableUsdc < MIN_TRADE) {
-          const reason = `Skipped because available collateral ${budget.availableUsdc.toFixed(6)} < MIN_TRADE ${MIN_TRADE}`;
+        if (budget.availableUsdc < this.effMinTrade()) {
+          const reason = `Skipped because available collateral ${budget.availableUsdc.toFixed(6)} < MIN_TRADE ${this.effMinTrade()}`;
           this.log(
             "SIGNAL",
             `Collateral filter: total=${budget.balanceUsdc.toFixed(6)} reserved=${budget.reservedUsdc.toFixed(
               6
-            )} available=${budget.availableUsdc.toFixed(6)} MIN_TRADE=${MIN_TRADE}`
+            )} available=${budget.availableUsdc.toFixed(6)} MIN_TRADE=${this.effMinTrade()}`
           );
           this.setPhase("RISK_BLOCKED", reason);
           return { accepted: false, reason };
         }
 
         effectiveAmount = Math.min(amount, budget.availableUsdc);
-        effectiveAmount = Math.min(MAX_TRADE, Math.max(MIN_TRADE, effectiveAmount));
+        effectiveAmount = Math.min(this.effMaxTrade(), Math.max(this.effMinTrade(), effectiveAmount));
         if (effectiveAmount < amount) {
           this.log(
             "SIGNAL",
@@ -865,7 +2974,49 @@ export class TradingEngine {
       }
     }
 
-    this.lastTradeAt = Date.now();
+    if (strat === "ola") {
+      const slug = this.wallet.getActiveDiscoveredSlug();
+      const wk = this.wallet.getDiscoveredMeta()?.windowStartSec;
+      if (slug != null) {
+        const spendKey = `${slug}|${wk ?? "_"}`;
+        const cap = olaWindowSpendCap();
+        const cur = this.olaSpendByWindowKey.get(spendKey) ?? 0;
+        if (cur + effectiveAmount > cap + 1e-9) {
+          this.setPhase("RISK_BLOCKED", "OLA window cap");
+          return {
+            accepted: false,
+            reason: `OLA: per-window cap (${cur.toFixed(2)} + ${effectiveAmount.toFixed(2)} > $${cap} USDC)`
+          };
+        }
+      }
+      const olaAsset = this.wallet.getActiveDiscoveredAsset();
+      if (olaAsset) {
+        const p0 = this.binanceAgg.getPrice(olaAsset);
+        const txMs = Math.max(0, envNum("OLA_TRANSMIT_SIM_MS", 25));
+        if (txMs > 0) await new Promise((r) => setTimeout(r, txMs));
+        const p1 = this.binanceAgg.getPrice(olaAsset);
+        const slipFrac = slippageFracFromConfig(botCfg, OLA_SLIPPAGE_FRAC);
+        if (p0 != null && p1 != null && olaSlippageExceeded(p0, p1, slipFrac)) {
+          this.setPhase("RISK_BLOCKED", "OLA Binance slippage");
+          return {
+            accepted: false,
+            reason: `OLA: Binance moved >${(slipFrac * 100).toFixed(2)}% during transmit (aborted)`
+          };
+        }
+      }
+    }
+
+    this.lastTradeAtBySlug.set(cdKey, Date.now());
+    const entrySnap = this.tradeEntrySnapshot();
+    const entryAsset = (entrySnap.asset ?? this.wallet.getActiveDiscoveredAsset() ?? "").toUpperCase();
+    const targetAtEntry =
+      entryAsset && Number.isFinite(this.priceToBeatByAsset.get(entryAsset) ?? NaN)
+        ? Number(this.priceToBeatByAsset.get(entryAsset))
+        : undefined;
+    const spotAtEntry =
+      entryAsset && Number.isFinite(this.oracleSpotUsdForAsset(entryAsset) ?? NaN)
+        ? Number(this.oracleSpotUsdForAsset(entryAsset))
+        : undefined;
     const pending: Trade = {
       id: randomUUID(),
       time: new Date().toLocaleTimeString(),
@@ -879,9 +3030,26 @@ export class TradingEngine {
       pnl: 0,
       status: "PENDING",
       direction,
-      decisionReason
+      asset: entrySnap.asset,
+      upPriceAtEntry: entrySnap.upPriceAtEntry,
+      downPriceAtEntry: entrySnap.downPriceAtEntry,
+      targetPriceUsdAtEntry: targetAtEntry,
+      spotPriceUsdAtEntry: spotAtEntry,
+      decisionReason,
+      ...(this.lagSnipeEnabled ? { lagSnipeHold: true as const } : {})
     };
     this.trades = [pending, ...this.trades].slice(0, 250);
+    if (strat === "ola") {
+      const slug = this.wallet.getActiveDiscoveredSlug();
+      const wk = this.wallet.getDiscoveredMeta()?.windowStartSec;
+      if (slug != null) {
+        const spendKey = `${slug}|${wk ?? "_"}`;
+        this.olaSpendByWindowKey.set(
+          spendKey,
+          (this.olaSpendByWindowKey.get(spendKey) ?? 0) + effectiveAmount
+        );
+      }
+    }
     this.onTrades?.(this.trades);
     this.log("TRADE", `[${source}] Placed ${direction} $${effectiveAmount.toFixed(2)}`);
     this.setPhase("EXECUTING", `Submitting order (${source})`);
@@ -917,8 +3085,14 @@ export class TradingEngine {
         }
         void this.reconcileServerOrder(pending.id, oid);
         const entryShares = Number(order.sizeFilled);
-        const skipGtcBecauseClose = liveCloseEntryOnFill();
-        if (Number.isFinite(entryShares) && entryShares > 0 && gtcExitEnabled() && !skipGtcBecauseClose) {
+        const skipGtcBecauseClose = liveCloseEntryOnFill() && !pending.lagSnipeHold;
+        if (
+          Number.isFinite(entryShares) &&
+          entryShares > 0 &&
+          gtcExitEnabled() &&
+          !skipGtcBecauseClose &&
+          !pending.lagSnipeHold
+        ) {
           await this.postGtcExit(book.tokenID, entryShares, "BUY", direction, pending.id);
         }
         this.setPhase("WAITING_RESOLUTION", "Live order posted; waiting for CLOB fill");
@@ -937,9 +3111,350 @@ export class TradingEngine {
     }
 
     this.pushBetLog(this.buildBetLog("placed", direction, book, {}));
+    const tid = String(book.tokenID ?? "");
+    if (this.wallet.hasLiveMarketData() && tid && !tid.toLowerCase().startsWith("sim-")) {
+      this.setPhase("EXECUTING", "Paper: limit fill vs live CLOB depth");
+      void this.resolvePaperTradeAsync(pending.id, book, effectiveAmount);
+      return { accepted: true, trade: pending };
+    }
     this.setPhase("WAITING_RESOLUTION", "Trade accepted; waiting 5s for resolution");
     setTimeout(() => this.resolveTrade(pending.id), 5000);
     return { accepted: true, trade: pending };
+  }
+
+  /** Paper: live book + virtual fill (latency, walk, timeout, fees, rejection coin-flip). */
+  private async resolvePaperTradeAsync(tradeId: string, book: MarketContext, collateralUsd: number) {
+    const tokenId = book.tokenID;
+    const limitPrice = book.mid;
+    const targetShares = limitPrice > 0 ? collateralUsd / limitPrice : 0;
+    const sizeShares = Number(Math.max(1e-12, targetShares).toFixed(6));
+
+    let fill: Awaited<ReturnType<typeof executePaperLimitBuyOrder>>;
+    try {
+      fill = await executePaperLimitBuyOrder({
+        limitPrice,
+        sizeShares,
+        fetchBook: () => this.wallet.getRawOrderBook(tokenId)
+      });
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      this.log("ERROR", `PAPER entry exception: ${msg}`);
+      fill = { ok: false, reason: `exception:${msg}`, latencyMs: 0 };
+    }
+
+    const idx = this.trades.findIndex((t) => t.id === tradeId && t.status === "PENDING");
+    if (idx < 0) return;
+
+    if (!fill.ok) {
+      this.trades[idx] = {
+        ...this.trades[idx],
+        status: "LOSS",
+        pnl: 0,
+        paper: { missed: true, tokenId },
+        decisionReason: `PAPER: ${fill.reason}`
+      };
+      this.pushBotTradeHistory({
+        ts: Date.now(),
+        mode: "paper",
+        trade_id: tradeId,
+        token_id: tokenId,
+        side: "buy",
+        phase: "missed",
+        missed: true,
+        latency_ms: fill.latencyMs,
+        reason: fill.reason
+      });
+      this.log("SIGNAL", `PAPER missed entry ${tradeId.slice(0, 8)}… ${fill.reason}`);
+      this.setPhase("SIGNAL_READY");
+      this.onTrades?.([...this.trades]);
+      this.pushStatus();
+      return;
+    }
+
+    this.trades[idx] = {
+      ...this.trades[idx],
+      price: fill.vwap,
+      paper: {
+        missed: false,
+        tokenId,
+        entryVwap: fill.vwap,
+        entryShares: fill.filledShares,
+        entryCostUsd: fill.notionalUsd,
+        entryFeesUsd: fill.feesUsd,
+        entrySlippageBps: fill.slippageBps,
+        entryLatencyMs: fill.latencyMs
+      },
+      clobOrderId: `paper-${tradeId.slice(0, 8)}`
+    };
+    this.pushBotTradeHistory({
+      ts: Date.now(),
+      mode: "paper",
+      trade_id: tradeId,
+      token_id: tokenId,
+      side: "buy",
+      phase: "entry",
+      entry_price: limitPrice,
+      fill_price_actual: fill.vwap,
+      slippage_bps: fill.slippageBps,
+      partial_fill: fill.partial,
+      latency_ms: fill.latencyMs,
+      fees: fill.feesUsd,
+      size_shares: fill.filledShares,
+      notional_usd: fill.notionalUsd
+    });
+    this.log(
+      "TRADE",
+      `PAPER entry vwap=${fill.vwap.toFixed(4)} shares=${fill.filledShares.toFixed(4)} slip=${fill.slippageBps}bps`
+    );
+    this.setPhase("WAITING_RESOLUTION", "Paper position; settlement vs live book");
+    this.onTrades?.([...this.trades]);
+    this.pushStatus();
+
+    const row = this.trades[idx];
+    if (row?.lagSnipeHold) {
+      this.scheduleLagSnipePaperSettlement(tradeId);
+    } else {
+      this.schedulePaperExitWithWhaleTp(tradeId, tokenId, fill.vwap);
+    }
+  }
+
+  /** Paper + Lag Snipe: settle at window end vs oracle / PTB (no simulated market exit). */
+  private scheduleLagSnipePaperSettlement(tradeId: string) {
+    const meta = this.wallet.getDiscoveredMeta();
+    const endParsed = meta?.endDateIso ? new Date(meta.endDateIso).getTime() : NaN;
+    const delayMs = !Number.isNaN(endParsed)
+      ? Math.max(1500, endParsed - Date.now() + 1200)
+      : Math.max(5000, Number(process.env.PAPER_SETTLE_DELAY_MS ?? 8000));
+    setTimeout(() => this.resolveTrade(tradeId), delayMs);
+    this.log(
+      "TRADE",
+      `Lag Snipe PAPER: settlement in ~${Math.round(delayMs / 1000)}s (window end / hold)`
+    );
+  }
+
+  /**
+   * Session-close outcome source of truth:
+   * - UP wins only when close spot > target.
+   * - DOWN wins only when close spot < target.
+   * Uses oracle spot (BTC from on-chain Chainlink) + per-window price-to-beat.
+   * If feed is stale/missing, caller should retry shortly.
+   */
+  private evaluateSessionCloseOutcome(
+    direction: Direction,
+    asset: string,
+    targetFallbackUsd?: number
+  ): { ready: true; isWin: boolean } | { ready: false; reason: string } {
+    const a = asset.trim().toUpperCase();
+    const ptb = this.priceToBeatByAsset.get(a) ?? targetFallbackUsd ?? null;
+    if (ptb == null || !Number.isFinite(ptb) || ptb <= 0) {
+      return { ready: false, reason: `target missing for ${a}` };
+    }
+    const spot = this.oracleSpotUsdForAsset(a);
+    if (spot == null || !Number.isFinite(spot) || spot <= 0) {
+      return { ready: false, reason: `spot missing for ${a}` };
+    }
+    const ageMs = this.oracleAgeMsForAsset(a);
+    const staleMs = this.oracleStaleMsForAsset(a);
+    if (ageMs != null && ageMs > staleMs) {
+      return { ready: false, reason: `spot stale for ${a}: ${ageMs}ms > ${staleMs}ms` };
+    }
+    if (direction === "UP") {
+      return { ready: true, isWin: spot > ptb };
+    }
+    return { ready: true, isWin: spot < ptb };
+  }
+
+  private scheduleSettleRetry(tradeId: string, reason: string, waitMs = 1200, prefix = "Settle waiting feed") {
+    if (this.settleRetryTimerByTradeId.has(tradeId)) return;
+    this.log("SIGNAL", `${prefix}: ${reason}; retry in ${waitMs}ms`);
+    const timer = setTimeout(() => {
+      this.settleRetryTimerByTradeId.delete(tradeId);
+      this.resolveTrade(tradeId);
+    }, waitMs);
+    this.settleRetryTimerByTradeId.set(tradeId, timer);
+  }
+
+  private async finalizeLagSnipePaperHold(idx: number) {
+    const t = this.trades[idx];
+    if (!t || t.status !== "PENDING") return;
+    const asset = (t.asset ?? "BTC").toUpperCase();
+    const settle = this.evaluateSessionCloseOutcome(t.direction, asset, t.targetPriceUsdAtEntry);
+    if (!settle.ready) {
+      this.scheduleSettleRetry(t.id, settle.reason, 1200, "Lag Snipe settle waiting feed");
+      return;
+    }
+    const isWin = settle.isWin;
+    const shares = Number(t.paper?.entryShares ?? 0);
+    const vwap = Number(t.paper?.entryVwap ?? 0.5);
+    const fees = Number(t.paper?.entryFeesUsd ?? 0);
+    const cost = Number(t.paper?.entryCostUsd ?? shares * vwap);
+    const entryTotal = cost + fees;
+    const pnl = isWin ? Number((shares * (1 - vwap) - fees).toFixed(2)) : Number((-entryTotal).toFixed(2));
+    const settled: Trade = {
+      ...t,
+      status: isWin ? "WIN" : "LOSS",
+      pnl,
+      paper: { ...t.paper!, exitPartial: false }
+    };
+    this.balance += settled.pnl;
+    this.trades[idx] = settled;
+    this.maybeRecordOlaPnlAndCheckKill(settled, settled.pnl);
+    const drawdown = START_BALANCE - this.balance;
+    if (drawdown >= this.effStopLossUsd()) {
+      this.stopLossTriggered = true;
+      this.running = false;
+      this.autoTrading = false;
+      this.log("ERROR", "Stop loss reached, engine stopped");
+    }
+    this.onTrades?.([...this.trades]);
+    this.pushStatus();
+    this.log(
+      isWin ? "WIN" : "ERROR",
+      `PAPER Lag Snipe settle ${settled.direction} P&L $${settled.pnl.toFixed(2)} (oracle vs PTB)`
+    );
+    if (this.stopLossTriggered) {
+      this.setPhase("ERROR", "Stop loss reached; engine stopped");
+    } else {
+      this.setPhase("SIGNAL_READY");
+    }
+  }
+
+  private async finalizePaperTradeExit(idx: number) {
+    const t = this.trades[idx];
+    if (!t) return;
+    const tokenId = t.paper?.tokenId;
+    const shares = t.paper?.entryShares;
+    if (!tokenId || shares == null || shares <= 0) {
+      this.applyLegacySimSettlement(idx);
+      return;
+    }
+
+    let fill: Awaited<ReturnType<typeof simulatePaperMarketSell>>;
+    try {
+      fill = await simulatePaperMarketSell({
+        sizeShares: shares,
+        fetchBook: () => this.wallet.getRawOrderBook(tokenId)
+      });
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      this.log("ERROR", `PAPER exit exception: ${msg}`);
+      fill = { ok: false, reason: `exception:${msg}`, latencyMs: 0 };
+    }
+
+    const entryTotal = (t.paper?.entryCostUsd ?? 0) + (t.paper?.entryFeesUsd ?? 0);
+    let pnl = 0;
+    if (fill.ok) {
+      const sold = fill.filledShares;
+      const frac = shares > 0 ? Math.min(1, sold / shares) : 1;
+      const costAlloc = entryTotal * frac;
+      const exitNet = fill.notionalUsd - fill.feesUsd;
+      pnl = exitNet - costAlloc;
+      this.pushBotTradeHistory({
+        ts: Date.now(),
+        mode: "paper",
+        trade_id: t.id,
+        token_id: tokenId,
+        side: "sell",
+        phase: "exit",
+        exit_price: fill.referencePrice,
+        fill_price_actual: fill.vwap,
+        slippage_bps: fill.slippageBps,
+        partial_fill: fill.partial,
+        latency_ms: fill.latencyMs,
+        fees: fill.feesUsd,
+        pnl_usd: Number(pnl.toFixed(4)),
+        size_shares: fill.filledShares
+      });
+    } else {
+      pnl = -entryTotal;
+      this.pushBotTradeHistory({
+        ts: Date.now(),
+        mode: "paper",
+        trade_id: t.id,
+        token_id: tokenId,
+        side: "sell",
+        phase: "error",
+        missed: false,
+        latency_ms: fill.latencyMs,
+        reason: fill.reason,
+        pnl_usd: Number(pnl.toFixed(4))
+      });
+      this.log("ERROR", `PAPER exit failed ${fill.reason} — marking full loss of entry premium`);
+    }
+
+    const status = pnl >= 0 ? "WIN" : "LOSS";
+    const settled: Trade = {
+      ...t,
+      status,
+      pnl: Number(pnl.toFixed(2)),
+      paper: {
+        ...t.paper!,
+        exitVwap: fill.ok ? fill.vwap : undefined,
+        exitProceedsUsd: fill.ok ? fill.notionalUsd : undefined,
+        exitFeesUsd: fill.ok ? fill.feesUsd : undefined,
+        exitSlippageBps: fill.ok ? fill.slippageBps : undefined,
+        exitLatencyMs: fill.ok ? fill.latencyMs : undefined,
+        exitPartial: fill.ok ? fill.partial : undefined
+      }
+    };
+    this.balance += settled.pnl;
+    this.trades[idx] = settled;
+    this.maybeRecordOlaPnlAndCheckKill(settled, settled.pnl);
+
+    const drawdown = START_BALANCE - this.balance;
+    if (drawdown >= this.effStopLossUsd()) {
+      this.stopLossTriggered = true;
+      this.running = false;
+      this.autoTrading = false;
+      this.log("ERROR", "Stop loss reached, engine stopped");
+    }
+
+    this.onTrades?.([...this.trades]);
+    this.pushStatus();
+    this.log(
+      status === "WIN" ? "WIN" : "ERROR",
+      `PAPER settle ${settled.direction} P&L $${settled.pnl.toFixed(2)} (book VWAP)`
+    );
+
+    if (this.stopLossTriggered) {
+      this.setPhase("ERROR", "Stop loss reached; engine stopped");
+    } else {
+      this.setPhase("SIGNAL_READY");
+    }
+  }
+
+  /** Synthetic book settlement (no live token). GTC already cancelled in resolveTrade. */
+  private applyLegacySimSettlement(idx: number) {
+    const t = this.trades[idx];
+    if (!t || t.status !== "PENDING") return;
+    const asset = (t.asset ?? this.wallet.getActiveDiscoveredAsset() ?? "BTC").toUpperCase();
+    const settle = this.evaluateSessionCloseOutcome(t.direction, asset, t.targetPriceUsdAtEntry);
+    if (!settle.ready) {
+      this.scheduleSettleRetry(t.id, settle.reason, 1200, "Settle waiting feed");
+      return;
+    }
+    const isWin = settle.isWin;
+    const entryPx = Math.min(1, Math.max(0, Number(t.price ?? 0.5)));
+    const pnl = isWin ? t.amount * (1 - entryPx) : -(t.amount * entryPx);
+    const settled: Trade = { ...t, status: isWin ? "WIN" : "LOSS", pnl: Number(pnl.toFixed(2)) };
+    this.balance += settled.pnl;
+    this.trades[idx] = settled;
+    this.maybeRecordOlaPnlAndCheckKill(settled, settled.pnl);
+    const drawdown = START_BALANCE - this.balance;
+    if (drawdown >= this.effStopLossUsd()) {
+      this.stopLossTriggered = true;
+      this.running = false;
+      this.autoTrading = false;
+      this.log("ERROR", "Stop loss reached, engine stopped");
+    }
+    this.onTrades?.([...this.trades]);
+    this.pushStatus();
+    this.log(isWin ? "WIN" : "ERROR", `${settled.status} ${settled.direction} P&L $${settled.pnl.toFixed(2)}`);
+    if (this.stopLossTriggered) {
+      this.setPhase("ERROR", "Stop loss reached; engine stopped");
+    } else {
+      this.setPhase("SIGNAL_READY");
+    }
   }
 
   /** Poll CLOB until entry BUY is matched; optionally market-SELL shares before dashboard settle. */
@@ -954,8 +3469,15 @@ export class TradingEngine {
       const filled = orig > 0 && matched >= orig * 0.999;
       if (filled) {
         this.log("TRADE", `CLOB order ${orderId.slice(0, 10)}… filled (${matched}/${orig})`);
+        const holdRow = this.trades.find((t) => t.id === tradeId);
+        const skipLiveFlatten = holdRow?.lagSnipeHold === true;
         let okToSettle = true;
-        if (this.wallet.getMode() === "LIVE" && !this.externalExecution && liveCloseEntryOnFill()) {
+        if (
+          this.wallet.getMode() === "LIVE" &&
+          !this.externalExecution &&
+          liveCloseEntryOnFill() &&
+          !skipLiveFlatten
+        ) {
           const assetId = String((o as { asset_id?: string }).asset_id ?? "");
           if (assetId && matched > 0) {
             okToSettle = await this.flattenLiveEntryPosition(tradeId, assetId, matched);
@@ -967,7 +3489,21 @@ export class TradingEngine {
             );
           }
         }
-        if (okToSettle) {
+        if (skipLiveFlatten) {
+          this.log(
+            "TRADE",
+            "Lag Snipe: entry filled — HOLD Manual Exit (no auto-flatten; settling at window end)"
+          );
+          const meta = this.wallet.getDiscoveredMeta();
+          const endParsed = meta?.endDateIso ? new Date(meta.endDateIso).getTime() : NaN;
+          const delayMs = !Number.isNaN(endParsed) && endParsed > Date.now() ? Math.max(1500, endParsed - Date.now() + 1200) : 5000;
+          this.log(
+            "TRADE",
+            `Lag Snipe: live settlement scheduled in ~${Math.round(delayMs / 1000)}s (window end)`
+          );
+          this.setPhase("WAITING_RESOLUTION", "Lag Snipe: HOLD Manual Exit");
+          setTimeout(() => this.resolveTrade(tradeId), delayMs);
+        } else if (okToSettle) {
           this.resolveTrade(tradeId);
         } else {
           this.log(
@@ -1045,9 +3581,28 @@ export class TradingEngine {
 
   private resolveTrade(tradeId: string) {
     const idx = this.trades.findIndex((t) => t.id === tradeId);
-    if (idx < 0) return;
+    if (idx < 0) {
+      const staleTimer = this.settleRetryTimerByTradeId.get(tradeId);
+      if (staleTimer) {
+        clearTimeout(staleTimer);
+        this.settleRetryTimerByTradeId.delete(tradeId);
+      }
+      return;
+    }
     const t = this.trades[idx];
-    if (t.status !== "PENDING") return;
+    if (t.status !== "PENDING") {
+      const staleTimer = this.settleRetryTimerByTradeId.get(tradeId);
+      if (staleTimer) {
+        clearTimeout(staleTimer);
+        this.settleRetryTimerByTradeId.delete(tradeId);
+      }
+      return;
+    }
+    const existingRetry = this.settleRetryTimerByTradeId.get(tradeId);
+    if (existingRetry) {
+      clearTimeout(existingRetry);
+      this.settleRetryTimerByTradeId.delete(tradeId);
+    }
 
     if (t.gtcExitOrderId) {
       void this.wallet.cancelClobOrder(t.gtcExitOrderId);
@@ -1055,23 +3610,42 @@ export class TradingEngine {
       this.log("TRADE", `GTC_CANCEL: reason=settle order=${t.gtcExitOrderId}`);
     }
 
-    const predictedDirection = this.prediction.prediction;
-    const isWin = t.direction === predictedDirection;
-
-    let pnl = 0;
-    if (this.wallet.getMode() === "SIMULATION") {
-      pnl = isWin ? t.amount * (this.prediction.confidence / 100) : -t.amount;
-    } else {
-      const price = 0.5;
-      pnl = isWin ? (1 - price) * t.amount : -(price * t.amount);
+    if (
+      this.wallet.getMode() === "SIMULATION" &&
+      t.paper &&
+      !t.paper.missed &&
+      t.paper.entryVwap != null &&
+      t.paper.entryShares != null
+    ) {
+      if (t.lagSnipeHold) {
+        void this.finalizeLagSnipePaperHold(idx);
+      } else {
+        void this.finalizePaperTradeExit(idx);
+      }
+      return;
     }
 
+    if (this.wallet.getMode() === "SIMULATION") {
+      this.applyLegacySimSettlement(idx);
+      return;
+    }
+
+    const asset = (t.asset ?? this.wallet.getActiveDiscoveredAsset() ?? "BTC").toUpperCase();
+    const settle = this.evaluateSessionCloseOutcome(t.direction, asset, t.targetPriceUsdAtEntry);
+    if (!settle.ready) {
+      this.scheduleSettleRetry(t.id, settle.reason, 1200, "Live settle waiting feed");
+      return;
+    }
+    const isWin = settle.isWin;
+    const entryPx = Math.min(1, Math.max(0, Number(t.price ?? 0.5)));
+    const pnl = isWin ? (1 - entryPx) * t.amount : -(entryPx * t.amount);
     const settled: Trade = { ...t, status: isWin ? "WIN" : "LOSS", pnl: Number(pnl.toFixed(2)) };
     this.balance += settled.pnl;
     this.trades[idx] = settled;
+    this.maybeRecordOlaPnlAndCheckKill(settled, settled.pnl);
 
     const drawdown = START_BALANCE - this.balance;
-    if (drawdown >= STOP_LOSS) {
+    if (drawdown >= this.effStopLossUsd()) {
       this.stopLossTriggered = true;
       this.running = false;
       this.autoTrading = false;
