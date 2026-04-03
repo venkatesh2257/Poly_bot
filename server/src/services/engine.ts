@@ -356,7 +356,10 @@ export class TradingEngine {
       const tick = this.chainlinkUsdByAsset.get(a);
       if (tick && Number.isFinite(tick.price) && tick.price > 0) return tick.price;
       // If Chainlink tick is missing/stale, fall back to RTDS spot.
-      return this.polymarketRtds.getUsdForAsset(asset);
+      const rtdsSpot = this.polymarketRtds.getUsdForAsset(asset);
+      if (rtdsSpot != null) return rtdsSpot;
+      const spotAnchor = this.lastSpotUsdByAsset.get(a);
+      return spotAnchor != null && Number.isFinite(spotAnchor) && spotAnchor > 0 ? spotAnchor : null;
     }
     return this.polymarketRtds.getUsdForAsset(asset);
   }
@@ -2301,27 +2304,37 @@ export class TradingEngine {
                       this.chainlinkUsdByAsset.set(assetUpper, tick);
                     } else {
                       const rtdsSpot = this.polymarketRtds.getUsdForAsset(assetUpper);
+                      const spotAnchor = this.lastSpotUsdByAsset.get(assetUpper);
+                      const fallbackSpot =
+                        rtdsSpot != null ? rtdsSpot : spotAnchor != null ? spotAnchor : null;
                       this.chainlinkUsdByAsset.delete(assetUpper);
-                      if (rtdsSpot != null) {
-                        this.priceToBeatByAsset.set(assetUpper, rtdsSpot);
+                      if (fallbackSpot != null && Number.isFinite(fallbackSpot) && fallbackSpot > 0) {
+                        this.priceToBeatByAsset.set(assetUpper, fallbackSpot);
                         this.oracleWindowTrackedByAsset.set(assetUpper, ws);
                       }
                       this.log(
                         "SIGNAL",
-                        `[CHAINLINK][STALE] asset=${assetUpper} ageMs=${ageMs} > ${staleMs} — fallback strike from RTDS mid=$${(rtdsSpot ?? NaN).toFixed(2)} (windowSec=${ws})`
+                        `[CHAINLINK][STALE] asset=${assetUpper} ageMs=${ageMs} > ${staleMs} — fallback strike=$${(fallbackSpot ?? NaN).toFixed(
+                          2
+                        )} (windowSec=${ws})`
                       );
                     }
                   } else {
                     // Missing tick: fail safe to RTDS mid.
                     const rtdsSpot = this.polymarketRtds.getUsdForAsset(assetUpper);
+                    const spotAnchor = this.lastSpotUsdByAsset.get(assetUpper);
+                    const fallbackSpot =
+                      rtdsSpot != null ? rtdsSpot : spotAnchor != null ? spotAnchor : null;
                     this.chainlinkUsdByAsset.delete(assetUpper);
-                    if (rtdsSpot != null) {
-                      this.priceToBeatByAsset.set(assetUpper, rtdsSpot);
+                    if (fallbackSpot != null && Number.isFinite(fallbackSpot) && fallbackSpot > 0) {
+                      this.priceToBeatByAsset.set(assetUpper, fallbackSpot);
                       this.oracleWindowTrackedByAsset.set(assetUpper, ws);
                     }
                     this.log(
                       "SIGNAL",
-                      `[CHAINLINK][MISSING] asset=${assetUpper} no tick — fallback strike from RTDS mid=$${(rtdsSpot ?? NaN).toFixed(2)} (windowSec=${ws})`
+                      `[CHAINLINK][MISSING] asset=${assetUpper} no tick — fallback strike=$${(fallbackSpot ?? NaN).toFixed(
+                        2
+                      )} (windowSec=${ws})`
                     );
                   }
                 }

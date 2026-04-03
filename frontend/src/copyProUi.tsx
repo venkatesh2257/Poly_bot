@@ -367,7 +367,7 @@ export function SnipeAssetCardsRow(props: {
   const { secsLeft, upMid, downMid, priceToBeat, currentBtc, diffUsd, statusLine } = props;
 
   /**
-   * Always union the five strip symbols with the server list so legacy `UPDOWN_ASSET=BTC`
+   * Always union the 4 strip symbols with the server list so legacy `UPDOWN_ASSET=BTC`
    * (API returns only ["BTC"]) does not show ETH/SOL/XRP/DOGE as Off.
    */
   const cfgRaw = props.updownAssetsConfigured ?? [];
