@@ -32,12 +32,36 @@ export interface MarketPoint {
   btcTargetUsd?: number;
 }
 
+/** WebSocket `market` message: primary series (first UPDOWN asset, momentum engine) + per-asset spot charts. */
+export interface MarketWsPayload {
+  primary: MarketPoint[];
+  byAsset: Record<string, MarketPoint[]>;
+}
+
 export interface Prediction {
   prediction: Direction;
   confidence: number;
   ts: number;
   recommendation: "TRADE" | "NO_TRADE";
   reason: string;
+}
+
+/** Virtual fills on live CLOB books (SIMULATION); mirrors live sizing/fees/slippage. */
+export interface TradePaperLeg {
+  missed?: boolean;
+  tokenId?: string;
+  entryVwap?: number;
+  entryShares?: number;
+  entryCostUsd?: number;
+  entryFeesUsd?: number;
+  entrySlippageBps?: number;
+  entryLatencyMs?: number;
+  exitVwap?: number;
+  exitProceedsUsd?: number;
+  exitFeesUsd?: number;
+  exitSlippageBps?: number;
+  exitLatencyMs?: number;
+  exitPartial?: boolean;
 }
 
 export interface Trade {
@@ -49,6 +73,16 @@ export interface Trade {
   pnl: number;
   status: TradeStatus;
   direction: Direction;
+  /** Active Up/Down asset symbol (e.g. BTC, ETH) when known from discovery. */
+  asset?: string;
+  /** CLOB mid (0–1) for the UP outcome token at entry; pair snapshot when bot opened. */
+  upPriceAtEntry?: number;
+  /** CLOB mid (0–1) for the DOWN outcome token at entry. */
+  downPriceAtEntry?: number;
+  /** Session target (price-to-beat) snapshot captured at entry. */
+  targetPriceUsdAtEntry?: number;
+  /** Oracle spot snapshot captured at entry (for auditing only). */
+  spotPriceUsdAtEntry?: number;
   decisionReason?: string;
   /** Set after CLOB accepts an order (server or browser). */
   clobOrderId?: string;
@@ -56,6 +90,32 @@ export interface Trade {
   gtcExitOrderId?: string;
   gtcExitTargetShares?: number;
   gtcProfitLocked?: boolean;
+  /** Lag Snipe: no auto GTC / live flatten; paper settles at window without simulated exit sell. */
+  lagSnipeHold?: boolean;
+  /** Paper path: live book simulation metadata (entry/exit). */
+  paper?: TradePaperLeg;
+}
+
+/** Structured log for paper vs live comparison (`GET /paper-trade-history`). */
+export interface BotTradeHistoryRecord {
+  ts: number;
+  mode: "paper";
+  trade_id: string;
+  token_id: string;
+  side: "buy" | "sell";
+  phase: "entry" | "exit" | "missed" | "error";
+  entry_price?: number;
+  exit_price?: number;
+  fill_price_actual?: number;
+  slippage_bps?: number;
+  partial_fill?: boolean;
+  missed?: boolean;
+  latency_ms?: number;
+  fees?: number;
+  pnl_usd?: number;
+  size_shares?: number;
+  notional_usd?: number;
+  reason?: string;
 }
 
 export interface Status {
@@ -65,8 +125,57 @@ export interface Status {
   balance: number;
   cooldownMs: number;
   stopLossTriggered: boolean;
+  /** OLA: net loss in rolling 1h exceeded 5% of balance — engine halted. */
+  olaKillTriggered?: boolean;
   phase: BotPhase;
   phaseReason?: string;
+}
+
+/** Effective + env defaults for auto size, limits, cooldown, paper stop (runtime overrides via API). */
+/** Engine / .env entry strategy union. */
+export type EntryStrategyKind =
+  | "momentum"
+  | "spot_poly_lag"
+  | "contrarian"
+  | "orderbook"
+  | "mean_revert"
+  | "chart"
+  | "whale_edge"
+  | "ensemble"
+  | "ola";
+
+/** Dashboard-selectable strategies (API); contrarian also via ENTRY_STRATEGY in .env. */
+export type DashboardEntryStrategyId =
+  | "momentum"
+  | "spot_poly_lag"
+  | "orderbook"
+  | "mean_revert"
+  | "chart"
+  | "whale_edge"
+  | "ensemble"
+  | "ola";
+
+export interface EntryStrategyState {
+  effective: EntryStrategyKind;
+  runtimeOverride: DashboardEntryStrategyId | null;
+  fromEnv: EntryStrategyKind;
+  label: string;
+}
+
+export interface RiskSettingsSnapshot {
+  entryUsd: number;
+  minTrade: number;
+  maxTrade: number;
+  stopLossUsd: number;
+  cooldownMs: number;
+  env: {
+    entryUsd: number;
+    minTrade: number;
+    maxTrade: number;
+    stopLossUsd: number;
+    cooldownMs: number;
+  };
+  overridesActive: boolean;
 }
 
 /** Rich dashboard payload: market window, book quality, auth hints. */
@@ -94,6 +203,63 @@ export interface TradingState {
     up: { spread: number; badge: string; detail: string } | null;
     down: { spread: number; badge: string; detail: string } | null;
   };
+  /** From `UPDOWN_ASSETS` / `UPDOWN_ASSET` in server `.env`. */
+  updownAssetsConfigured: string[];
+  /**
+   * Per configured asset: whether **auto-trading** may enter that market (round-robin respects only enabled).
+   * Manual trades are unchanged. Omitted keys default to true until toggled.
+   */
+  assetAutoTradeEnabled: Record<string, boolean>;
+  /** Gamma-resolved 5m windows (parallel markets). Odds/oracle aligned with Polymarket (Gamma + RTDS). */
+  updownWindows: Array<{
+    asset: string;
+    slug: string;
+    label: string;
+    upMid?: number | null;
+    downMid?: number | null;
+    upSpread?: number | null;
+    downSpread?: number | null;
+    upBadge?: string | null;
+    downBadge?: string | null;
+    /** `gamma` = Gamma outcomePrices (same as site headline); else CLOB mid. */
+    oddsSource?: "gamma" | "clob" | null;
+    /** Polymarket RTDS Chainlink (BTC/ETH/SOL/XRP) or Binance (DOGE). */
+    oracleSpotUsd?: number | null;
+    /** Age of the oracle tick used for `oracleSpotUsd` (ms). */
+    oracleAgeMs?: number | null;
+    /** Gamma eventMetadata or RTDS snapshot at window open. */
+    priceToBeatUsd?: number | null;
+    diffUsd?: number | null;
+    /** Per-market expiry; falls back in UI to primary `market.secondsToExpiry`. */
+    secondsToExpiry?: number | null;
+  }>;
+  riskSettings: RiskSettingsSnapshot;
+  entryStrategy: EntryStrategyState;
+  /** Dashboard toggle: isolated BTC 5m last-30s snipe; disables auto-exit (GTC + LIVE flatten). */
+  lagSnipeEnabled: boolean;
+  lagSnipeBanner?: string;
+  /**
+   * Compact engine snapshot aligned with CLOB book refresh + signal logic.
+   * Lets `/trading-state` polling stay in sync with live APIs when WebSocket is quiet.
+   */
+  liveEngine: LiveEngineSnapshot;
+  /** Same payload as WS `prediction` — REST parity when socket is slow or disconnected. */
+  predictionLive: Pick<Prediction, "prediction" | "confidence" | "ts" | "recommendation" | "reason">;
+}
+
+/** Feed-aligned status (books, discovery, RTDS) bundled for dashboard polling. */
+export interface LiveEngineSnapshot {
+  phase: BotPhase;
+  phaseReason?: string;
+  running: boolean;
+  autoTrading: boolean;
+  lastBookRefreshMs: number | null;
+  /** Seconds since `lastBookRefreshMs` (server clock); null if never refreshed. */
+  secondsSinceBookRefresh: number | null;
+  discoveredSlotCount: number;
+  hasLiveMarketData: boolean;
+  rtdsConnected: boolean;
+  lagSnipeEnabled: boolean;
 }
 
 export interface MarketOption {
@@ -152,6 +318,14 @@ export interface GtcExitMetrics {
   fillRatioSum: number;
 }
 
+/** Entry-only BONE_* filter blocks (SIM + LIVE); execution/exits unchanged. */
+export interface BoneFilterBlocks {
+  highConf: number;
+  equilibrium: number;
+  longshot: number;
+  latency: number;
+}
+
 export interface Insights {
   totalTrades: number;
   wins: number;
@@ -159,4 +333,7 @@ export interface Insights {
   noTradeSignals: number;
   marketWinRates: Array<{ market: string; winRate: number; trades: number }>;
   gtcExit: GtcExitMetrics;
+  /** Trades blocked by SIGNAL_MODE=highConf when mid & conf×mid gates fail. */
+  highConfMidBlocked: number;
+  boneEntryFilters: BoneFilterBlocks;
 }

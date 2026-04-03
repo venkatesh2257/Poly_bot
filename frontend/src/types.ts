@@ -48,6 +48,12 @@ export interface MarketPoint {
   btcTargetUsd?: number;
 }
 
+/** WebSocket `market` payload (server may still send a bare `MarketPoint[]` for older builds). */
+export interface MarketWsPayload {
+  primary: MarketPoint[];
+  byAsset: Record<string, MarketPoint[]>;
+}
+
 export interface Prediction {
   prediction: Direction;
   confidence: number;
@@ -65,11 +71,16 @@ export interface Trade {
   pnl: number;
   status: TradeStatus;
   direction: Direction;
+  asset?: string;
+  /** CLOB mid (0–1) for UP / DOWN tokens at entry. */
+  upPriceAtEntry?: number;
+  downPriceAtEntry?: number;
   decisionReason?: string;
   clobOrderId?: string;
   gtcExitOrderId?: string;
   gtcExitTargetShares?: number;
   gtcProfitLocked?: boolean;
+  paper?: { missed?: boolean };
 }
 
 export interface BotStatus {
@@ -79,8 +90,51 @@ export interface BotStatus {
   balance: number;
   cooldownMs: number;
   stopLossTriggered: boolean;
+  olaKillTriggered?: boolean;
   phase: BotPhase;
   phaseReason?: string;
+}
+
+export interface RiskSettingsSnapshot {
+  entryUsd: number;
+  minTrade: number;
+  maxTrade: number;
+  stopLossUsd: number;
+  cooldownMs: number;
+  env: {
+    entryUsd: number;
+    minTrade: number;
+    maxTrade: number;
+    stopLossUsd: number;
+    cooldownMs: number;
+  };
+  overridesActive: boolean;
+}
+
+export type DashboardEntryStrategyId =
+  | "ensemble"
+  | "momentum"
+  | "orderbook"
+  | "mean_revert"
+  | "chart"
+  | "whale_edge"
+  | "ola";
+
+export type EntryStrategyKind =
+  | "momentum"
+  | "contrarian"
+  | "orderbook"
+  | "mean_revert"
+  | "chart"
+  | "whale_edge"
+  | "ensemble"
+  | "ola";
+
+export interface EntryStrategyState {
+  effective: EntryStrategyKind;
+  runtimeOverride: DashboardEntryStrategyId | null;
+  fromEnv: EntryStrategyKind;
+  label: string;
 }
 
 export interface TradingState {
@@ -105,6 +159,50 @@ export interface TradingState {
     up: { spread: number; badge: string; detail: string } | null;
     down: { spread: number; badge: string; detail: string } | null;
   };
+  /** From server `UPDOWN_ASSETS` (optional for older API responses). */
+  updownAssetsConfigured?: string[];
+  /** Per asset: auto-trade on/off (server `assetAutoTradeEnabled`). */
+  assetAutoTradeEnabled?: Record<string, boolean>;
+  updownWindows?: Array<{
+    asset: string;
+    slug: string;
+    label: string;
+    upMid?: number | null;
+    downMid?: number | null;
+    upSpread?: number | null;
+    downSpread?: number | null;
+    upBadge?: string | null;
+    downBadge?: string | null;
+    oddsSource?: "gamma" | "clob" | null;
+    oracleSpotUsd?: number | null;
+    /** Age of the oracle tick used for `oracleSpotUsd` (ms). */
+    oracleAgeMs?: number | null;
+    priceToBeatUsd?: number | null;
+    diffUsd?: number | null;
+    secondsToExpiry?: number | null;
+  }>;
+  /** Server auto-trade limits (runtime API overrides .env until reset or process restart). */
+  riskSettings?: RiskSettingsSnapshot;
+  entryStrategy?: EntryStrategyState;
+  lagSnipeEnabled?: boolean;
+  lagSnipeBanner?: string;
+  /** CLOB/Gamma/RTDS-aligned snapshot (matches `/api/status` phase when polling). */
+  liveEngine?: LiveEngineSnapshot;
+  /** Mirrors WS `prediction` for REST clients (newer servers). */
+  predictionLive?: Pick<Prediction, "prediction" | "confidence" | "ts" | "recommendation" | "reason">;
+}
+
+export interface LiveEngineSnapshot {
+  phase: BotPhase;
+  phaseReason?: string;
+  running: boolean;
+  autoTrading: boolean;
+  lastBookRefreshMs: number | null;
+  secondsSinceBookRefresh?: number | null;
+  discoveredSlotCount: number;
+  hasLiveMarketData: boolean;
+  rtdsConnected: boolean;
+  lagSnipeEnabled?: boolean;
 }
 
 export interface WalletSummary {
@@ -119,6 +217,34 @@ export interface WalletSummary {
   connected: boolean;
   /** CLOB collateral balance (USDC), LIVE only */
   polymarketUsdc?: number | null;
+}
+
+export interface TradeLogRow {
+  id: string;
+  timeIso: string;
+  asset: string;
+  strategy: string;
+  side: "UP" | "DOWN";
+  prob: number | null;
+  entry: number;
+  exit: number | null;
+  pnl: number;
+  status: "WIN" | "LOSS";
+}
+
+export interface TradeLogStats {
+  total: number;
+  wins: number;
+  winRate: number;
+  pnl: number;
+  avgPnl: number;
+  bestAsset: string | null;
+  bestStrategy: string | null;
+}
+
+export interface TradeLogQueryResponse {
+  rows: TradeLogRow[];
+  stats: TradeLogStats;
 }
 
 export interface AuthNonceResponse {
@@ -159,6 +285,13 @@ export interface GtcExitMetrics {
   fillRatioSum: number;
 }
 
+export interface BoneFilterBlocks {
+  highConf: number;
+  equilibrium: number;
+  longshot: number;
+  latency: number;
+}
+
 export interface Insights {
   totalTrades: number;
   wins: number;
@@ -166,7 +299,25 @@ export interface Insights {
   noTradeSignals: number;
   marketWinRates: Array<{ market: string; winRate: number; trades: number }>;
   gtcExit: GtcExitMetrics;
+  highConfMidBlocked: number;
+  boneEntryFilters: BoneFilterBlocks;
 }
+
+export type PingResultRow = {
+  id: string;
+  label: string;
+  url: string;
+  ms: number;
+  ok: boolean;
+  httpStatus: number;
+  error?: string;
+  note?: string;
+};
+
+export type PingResponse = {
+  ts: number;
+  results: PingResultRow[];
+};
 
 export interface PolymarketAccountSummary {
   connected: boolean;

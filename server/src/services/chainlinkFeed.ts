@@ -1,5 +1,5 @@
 import { ethers } from "ethers";
-import { resolvePolygonRpcFallbackUrl, resolvePolygonRpcUrl } from "./rpcEnv.js";
+import { resolvePolygonRpcUrl } from "./rpcEnv.js";
 
 // AggregatorV3Interface (latestRoundData + decimals) ABI.
 const AGGREGATOR_V3_ABI = [
@@ -7,10 +7,13 @@ const AGGREGATOR_V3_ABI = [
   "function latestRoundData() view returns (uint80 roundId,int256 answer,uint256 startedAt,uint256 updatedAt,uint80 answeredInRound)"
 ] as const;
 
-// BTC/USD feed on Polygon (AggregatorV3Interface address).
-// Extend this map later with ETH/SOL/XRP equivalents.
+// Chainlink AggregatorV3Interface feed addresses on Polygon mainnet.
+// Extend this map later with additional assets (must match getLatestUsdPrice() asset symbols).
 const CHAINLINK_FEED_BY_ASSET: Record<string, { feedAddress: string }> = {
-  BTC: { feedAddress: "0xc907E116054Ad103354f2D350FD2514433D57F6f" }
+  BTC: { feedAddress: "0xc907E116054Ad103354f2D350FD2514433D57F6f" },
+  ETH: { feedAddress: "0xF9680D99D6C9589E2A93A78A04A279E509205945" },
+  SOL: { feedAddress: "0x10C8264C0935b3B9870013e057f330Ff3e9C56dC" },
+  XRP: { feedAddress: "0x785ba89291f676b5386652eB12b30cF361020694" }
 };
 
 export type ChainlinkUsdPriceTick = {
@@ -27,6 +30,7 @@ export class ChainlinkFeedService {
   private contractByFeed = new Map<string, ethers.Contract>();
   private inflight = new Map<string, Promise<ChainlinkUsdPriceTick | null>>();
   private lastByAsset = new Map<string, { tick: ChainlinkUsdPriceTick; fetchedAtMs: number }>();
+  private lastFailByAsset = new Map<string, number>();
   private connectedLogged = false;
 
   private staleMaxMs(): number {
@@ -43,7 +47,9 @@ export class ChainlinkFeedService {
 
   private resolveProvider(): ethers.JsonRpcProvider | null {
     if (this.provider) return this.provider;
-    const rpcUrl = resolvePolygonRpcUrl() || resolvePolygonRpcFallbackUrl() || "";
+    // For production-safety, require an explicit, non-placeholder RPC URL.
+    // Public fallbacks may require API keys and cause repeated unauthorized errors.
+    const rpcUrl = resolvePolygonRpcUrl();
     if (!rpcUrl) return null;
     this.provider = new ethers.JsonRpcProvider(rpcUrl);
     return this.provider;
@@ -79,6 +85,9 @@ export class ChainlinkFeedService {
     const now = Date.now();
     if (cached && now - cached.fetchedAtMs <= this.cacheMs()) return cached.tick;
 
+    const lastFail = this.lastFailByAsset.get(a);
+    if (lastFail && now - lastFail <= this.cacheMs()) return null;
+
     const existing = this.inflight.get(a);
     if (existing) return existing;
 
@@ -93,7 +102,10 @@ export class ChainlinkFeedService {
             this.contractByFeed.set(feedAddress, c);
           }
           decimals = Number(await c.decimals());
-          if (!Number.isFinite(decimals)) return null;
+          if (!Number.isFinite(decimals)) {
+            this.lastFailByAsset.set(a, now);
+            return null;
+          }
           this.decimalsByFeed.set(feedAddress, decimals);
         }
 
@@ -113,12 +125,18 @@ export class ChainlinkFeedService {
 
         // updatedAt is uint256 timestamp; typically seconds.
         let updatedAtMs = Number(updatedAtRaw);
-        if (!Number.isFinite(updatedAtMs) || updatedAtMs <= 0) return null;
+        if (!Number.isFinite(updatedAtMs) || updatedAtMs <= 0) {
+          this.lastFailByAsset.set(a, now);
+          return null;
+        }
         if (updatedAtMs < 1e12) updatedAtMs *= 1000;
 
         const rawAnswer = answer.toString();
         const price = Number(ethers.formatUnits(answer, decimals));
-        if (!Number.isFinite(price) || price <= 0) return null;
+        if (!Number.isFinite(price) || price <= 0) {
+          this.lastFailByAsset.set(a, now);
+          return null;
+        }
 
         const ageMs = now - updatedAtMs;
         console.log(
@@ -141,6 +159,7 @@ export class ChainlinkFeedService {
         this.lastByAsset.set(a, { tick, fetchedAtMs: now });
         return tick;
       } catch (e) {
+        this.lastFailByAsset.set(a, now);
         console.warn(
           `[CHAINLINK] failed latest ${a}/USD: ${e instanceof Error ? e.message : String(e)}`
         );

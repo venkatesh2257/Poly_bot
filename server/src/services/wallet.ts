@@ -4,6 +4,7 @@ import { AssetType, ClobClient, OrderType, Side } from "@polymarket/clob-client"
 import type { DirectionalContext, MarketContext, MarketOption } from "../types/index.js";
 import { signatureTypeModeName } from "../constants/signatureType.js";
 import { resolveActiveUpDown5m } from "./marketDiscovery.js";
+import { batchBook } from "./clobService.js";
 
 export class WalletService {
   private mode = (process.env.MODE as "SIMULATION" | "LIVE") || "SIMULATION";
@@ -27,6 +28,20 @@ export class WalletService {
   private clobApiSecret = process.env.POLY_API_SECRET;
   private clobApiPassphrase = process.env.POLY_PASSPHRASE ?? process.env.POLY_API_PASSPHRASE;
 
+  /** Concurrent `getMarketContext(token)` coalesces to one CLOB/public HTTP round-trip per token. */
+  private bookInflight = new Map<string, Promise<MarketContext>>();
+  private readonly clobPublicBookTimeoutMs = (() => {
+    const n = Number(process.env.CLOB_PUBLIC_BOOK_TIMEOUT_MS ?? 8_000);
+    return Number.isFinite(n) && n >= 2_000 && n <= 30_000 ? n : 8_000;
+  })();
+  private readonly clobBooksBatchChunk = (() => {
+    const n = Number(process.env.CLOB_BOOKS_BATCH_CHUNK ?? 50);
+    return Number.isFinite(n) && n >= 2 && n <= 80 ? n : 50;
+  })();
+
+  /** Single refresh wave: POST /books fills this map; `getMarketContext` reads it before HTTP. */
+  private bookPrime: Map<string, MarketContext> | null = null;
+
   private static readSignatureTypeFromEnv(): number {
     const raw = process.env.SIGNATURE_TYPE ?? process.env.CLOB_SIGNATURE_TYPE ?? "0";
     const s = String(raw).trim();
@@ -40,46 +55,137 @@ export class WalletService {
     return Math.trunc(n);
   }
 
-  /** Set by Gamma auto-discovery when AUTO_DISCOVER_UPDOWN is true (LIVE). */
-  private discoveredUpDown: {
+  /** One resolved 5m Up/Down window from Gamma (AUTO_DISCOVER_UPDOWN). */
+  private discoveredSlots: Array<{
+    asset: string;
     tokenIdUp: string;
     tokenIdDown: string;
     label: string;
     slug: string;
-    /** ISO end time from Gamma (market window expiry). */
     endDateIso: string;
-    /** From slug …-updown-5m-{unix}; used for “time since rollover”. */
     windowStartSec?: number;
-  } | null = null;
+  }> = [];
+
+  /** Index into `discoveredSlots` for books, orders, and UI primary market. */
+  private activeSlotIndex = 0;
 
   private autoDiscoverUpDownEnabled() {
     return String(process.env.AUTO_DISCOVER_UPDOWN ?? "true").toLowerCase() !== "false";
   }
 
-  private upDownAssetFromEnv() {
-    return process.env.UPDOWN_ASSET ?? "BTC";
+  /** Parsed `UPDOWN_ASSETS` / `UPDOWN_ASSET` for UI and engine. */
+  getUpdownAssetsConfigured(): string[] {
+    return this.upDownAssetsFromEnv().map((a) => a.trim().toUpperCase());
+  }
+
+  /**
+   * Comma list from `UPDOWN_ASSETS`, else single `UPDOWN_ASSET`, else all five 5m majors.
+   * Precedence avoids legacy `.env` lines like `UPDOWN_ASSET=BTC` silently overriding a multi list.
+   */
+  private upDownAssetsFromEnv(): string[] {
+    const allowed = ["BTC", "ETH", "SOL", "XRP"];
+    const multi = process.env.UPDOWN_ASSETS?.trim();
+    if (multi) {
+      const parts = multi
+        .split(/[,\s]+/)
+        .map((s) => s.trim().toUpperCase())
+        .filter(Boolean);
+      const filtered = parts.filter((p) => allowed.includes(p));
+      return filtered.length ? filtered : allowed;
+    }
+    const single = process.env.UPDOWN_ASSET?.trim();
+    if (single) {
+      const s = single.toUpperCase();
+      if (allowed.includes(s)) {
+        // Legacy single-symbol env should still enable the full 4-asset set.
+        return [...allowed];
+      }
+      return allowed;
+    }
+    return allowed;
+  }
+
+  private activeSlot() {
+    if (this.discoveredSlots.length === 0) return null;
+    const i = Math.max(0, Math.min(this.activeSlotIndex, this.discoveredSlots.length - 1));
+    return this.discoveredSlots[i] ?? null;
+  }
+
+  /** How many active 5m markets were resolved (for round-robin auto-trading). */
+  getDiscoveredSlotCount(): number {
+    return this.discoveredSlots.length;
+  }
+
+  /** Gamma slugs/labels per discovered asset (dashboard multi-pair strip). */
+  getDiscoveredWindowsSummary(): Array<{ asset: string; slug: string; label: string }> {
+    return this.discoveredSlots.map((s) => ({
+      asset: s.asset,
+      slug: s.slug,
+      label: s.label
+    }));
+  }
+
+  /** Snapshot for parallel CLOB reads (token ids per asset). */
+  getDiscoveredSlotsSnapshot(): Array<{
+    asset: string;
+    slug: string;
+    label: string;
+    tokenIdUp: string;
+    tokenIdDown: string;
+    endDateIso: string;
+    windowStartSec?: number;
+  }> {
+    return this.discoveredSlots.map((s) => ({
+      asset: s.asset,
+      slug: s.slug,
+      label: s.label,
+      tokenIdUp: s.tokenIdUp,
+      tokenIdDown: s.tokenIdDown,
+      endDateIso: s.endDateIso,
+      windowStartSec: s.windowStartSec
+    }));
+  }
+
+  /** Set which discovered market drives CLOB token ids and `getDiscoveredMeta*` (0 = first in UPDOWN_ASSETS). */
+  setActiveSlot(index: number) {
+    if (this.discoveredSlots.length === 0) return;
+    const n = this.discoveredSlots.length;
+    this.activeSlotIndex = ((index % n) + n) % n;
+  }
+
+  /** Slug of the currently active slot (per-market cooldown key). */
+  getActiveDiscoveredSlug(): string | null {
+    return this.activeSlot()?.slug ?? null;
+  }
+
+  /** Canonical symbol (BTC, ETH, …) for the active discovered slot — used for per-asset spot / BONE_LATENCY. */
+  getActiveDiscoveredAsset(): string | null {
+    return this.activeSlot()?.asset ?? null;
   }
 
   /** CLOB token id for UP outcome (auto-resolved or CLOB_TOKEN_ID_UP / CLOB_TOKEN_ID). */
   private activeTokenUp(): string | undefined {
-    if (this.discoveredUpDown?.tokenIdUp) return this.discoveredUpDown.tokenIdUp;
+    const s = this.activeSlot();
+    if (s?.tokenIdUp) return s.tokenIdUp;
     return this.clobTokenIdUp || this.clobTokenId;
   }
 
   /** CLOB token id for DOWN outcome (auto-resolved or CLOB_TOKEN_ID_DOWN / CLOB_TOKEN_ID). */
   private activeTokenDown(): string | undefined {
-    if (this.discoveredUpDown?.tokenIdDown) return this.discoveredUpDown.tokenIdDown;
+    const s = this.activeSlot();
+    if (s?.tokenIdDown) return s.tokenIdDown;
     return this.clobTokenIdDown || this.clobTokenId;
   }
 
   getDiscoveredMarketLabel(): string | null {
-    return this.discoveredUpDown?.label ?? null;
+    return this.activeSlot()?.label ?? null;
   }
 
   /** For UI / engine: primary token id + label when auto-discovery is active. */
   getDiscoveredSelection(): { tokenID: string; label: string } | null {
-    if (!this.discoveredUpDown) return null;
-    return { tokenID: this.discoveredUpDown.tokenIdUp, label: this.discoveredUpDown.label };
+    const s = this.activeSlot();
+    if (!s) return null;
+    return { tokenID: s.tokenIdUp, label: s.label };
   }
 
   /** Gamma metadata for the active auto-discovered window (LIVE + discovery only). */
@@ -93,8 +199,8 @@ export class WalletService {
         tokenIdDown: string;
       }
     | null {
-    if (!this.discoveredUpDown) return null;
-    const d = this.discoveredUpDown;
+    const d = this.activeSlot();
+    if (!d) return null;
     return {
       label: d.label,
       slug: d.slug,
@@ -113,9 +219,23 @@ export class WalletService {
     return Boolean(this.client) && this.clobApiKeyReady;
   }
 
+  getClobHostForPing(): string {
+    return this.clobHost;
+  }
+
+  /** Real CLOB token id for connectivity ping; null if only synthetic ids. */
+  getSampleTokenIdForPing(): string | null {
+    const up = this.activeTokenUp();
+    if (up && !/^sim-/i.test(up) && up !== "unknown") return up;
+    const down = this.activeTokenDown();
+    if (down && !/^sim-/i.test(down) && down !== "unknown") return down;
+    if (this.clobTokenId && !/^sim-/i.test(this.clobTokenId)) return this.clobTokenId;
+    return null;
+  }
+
   /** Seconds since current 5m window started (auto-discovery only); null if manual tokens. */
   getTimingForBetLog(): { secondsSinceWindowStart: number | null; warmupWindow: boolean } {
-    const ws = this.discoveredUpDown?.windowStartSec;
+    const ws = this.activeSlot()?.windowStartSec;
     if (ws == null) return { secondsSinceWindowStart: null, warmupWindow: false };
     const elapsed = Date.now() / 1000 - ws;
     const warmupSec = Number(process.env.MARKET_WARMUP_SEC ?? 90);
@@ -130,24 +250,53 @@ export class WalletService {
    * @returns true if UP/DOWN token ids changed (new window).
    */
   async refreshActiveUpDownMarket(): Promise<boolean> {
-    if (!this.client || !this.clobApiKeyReady || !this.autoDiscoverUpDownEnabled()) {
+    /** Gamma is public; do not require CLOB keys — SIM / failed LIVE still get slugs + token ids for UI + public books. */
+    if (!this.autoDiscoverUpDownEnabled()) {
       return false;
     }
-    const resolved = await resolveActiveUpDown5m(this.upDownAssetFromEnv());
-    if (!resolved) return false;
-    const prev = this.discoveredUpDown;
-    const changed =
-      !prev || prev.tokenIdUp !== resolved.tokenIdUp || prev.tokenIdDown !== resolved.tokenIdDown;
-    const wm = /-updown-5m-(\d+)$/.exec(resolved.slug);
-    const windowStartSec = wm ? Number(wm[1]) : undefined;
-    this.discoveredUpDown = {
-      tokenIdUp: resolved.tokenIdUp,
-      tokenIdDown: resolved.tokenIdDown,
-      label: resolved.label,
-      slug: resolved.slug,
-      endDateIso: resolved.endDate,
-      windowStartSec
-    };
+    const assets = this.upDownAssetsFromEnv();
+    const pairs = await Promise.all(
+      assets.map(async (raw) => {
+        const resolved = await resolveActiveUpDown5m(raw);
+        return { raw, resolved };
+      })
+    );
+    const next: typeof this.discoveredSlots = [];
+    for (const { raw, resolved } of pairs) {
+      if (!resolved) continue;
+      const wm = /-updown-5m-(\d+)$/.exec(resolved.slug);
+      const windowStartSec = wm ? Number(wm[1]) : undefined;
+      const asset = raw.trim().toUpperCase();
+      next.push({
+        asset,
+        tokenIdUp: resolved.tokenIdUp,
+        tokenIdDown: resolved.tokenIdDown,
+        label: resolved.label,
+        slug: resolved.slug,
+        endDateIso: resolved.endDate,
+        windowStartSec
+      });
+    }
+    const prev = this.discoveredSlots;
+    if (next.length === 0) {
+      const cleared = prev.length > 0;
+      this.discoveredSlots = [];
+      this.activeSlotIndex = 0;
+      return cleared;
+    }
+
+    let changed = prev.length !== next.length;
+    if (!changed) {
+      const prevByAsset = new Map(prev.map((s) => [s.asset, `${s.tokenIdUp}|${s.tokenIdDown}`]));
+      for (const s of next) {
+        if (prevByAsset.get(s.asset) !== `${s.tokenIdUp}|${s.tokenIdDown}`) {
+          changed = true;
+          break;
+        }
+      }
+    }
+    this.discoveredSlots = next;
+    if (this.activeSlotIndex >= this.discoveredSlots.length) this.activeSlotIndex = 0;
     return changed;
   }
 
@@ -180,9 +329,12 @@ export class WalletService {
     return this.mode;
   }
 
-  /** True when CLOB is connected for live order books (LIVE mode or demo paper + DEMO_LIVE_MARKETS). */
+  /**
+   * True when we can use real CLOB books: authenticated client, or Gamma-resolved markets (public /book fetch).
+   */
   hasLiveMarketData(): boolean {
-    return Boolean(this.client) && this.clobApiKeyReady;
+    if (Boolean(this.client) && this.clobApiKeyReady) return true;
+    return this.discoveredSlots.length > 0;
   }
 
   getDemoLiveMarkets(): boolean {
@@ -225,7 +377,8 @@ export class WalletService {
     this.client = undefined;
     this.wallet = undefined;
     this.clobApiKeyReady = false;
-    this.discoveredUpDown = null;
+    this.discoveredSlots = [];
+    this.activeSlotIndex = 0;
   }
 
   /** Connect CLOB + L2; on failure sets mode to SIMULATION (same as startup). */
@@ -300,8 +453,14 @@ export class WalletService {
   }
 
   async init() {
-    if (this.mode !== "LIVE" && !this.demoLiveMarkets) return;
-    await this.connectLive();
+    if (this.mode === "LIVE" || this.demoLiveMarkets) {
+      await this.connectLive();
+    }
+    if (this.autoDiscoverUpDownEnabled()) {
+      await this.refreshActiveUpDownMarket().catch((e) =>
+        console.warn(`[WalletService] Gamma discovery on init: ${e instanceof Error ? e.message : String(e)}`)
+      );
+    }
   }
 
   /**
@@ -379,38 +538,69 @@ export class WalletService {
       })
       .filter((m: MarketOption) => m.tokenID)
       .slice(0, limit);
-    if (this.discoveredUpDown) {
-      const d = this.discoveredUpDown;
-      discovered.unshift({
-        tokenID: d.tokenIdUp,
-        label: d.label,
-        outcome: "AUTO"
-      });
+    if (this.discoveredSlots.length > 0) {
+      for (let i = this.discoveredSlots.length - 1; i >= 0; i--) {
+        const d = this.discoveredSlots[i]!;
+        discovered.unshift({
+          tokenID: d.tokenIdUp,
+          label: `[${d.asset}] ${d.label}`,
+          outcome: "AUTO"
+        });
+      }
     }
     if (discovered.length > 0) return discovered;
     const preferred = this.activeTokenUp() || this.clobTokenId || this.activeTokenDown() || "unknown";
     return [{ tokenID: preferred, label: "Configured Market (Bot decides UP/DOWN)", outcome: "AUTO" }];
   }
 
-  async getMarketContext(tokenID: string): Promise<MarketContext> {
-    if (!this.client) {
-      const bestBid = 0.49;
-      const bestAsk = 0.51;
-      return {
-        tokenID,
-        mid: 0.5,
-        spread: 0.02,
-        liquidity: 1500,
-        bestBid,
-        bestAsk
-      };
+  /** CLOB order book is public — use when there is no authenticated client (SIM, or read-only dashboard). */
+  private async fetchPublicOrderBook(tokenID: string): Promise<any | null> {
+    try {
+      const url = `${this.clobHost}/book?token_id=${encodeURIComponent(tokenID)}`;
+      const r = await fetch(url, {
+        headers: { Accept: "application/json", "User-Agent": "PolyBot/1.0 (public book)" },
+        signal: AbortSignal.timeout(this.clobPublicBookTimeoutMs)
+      });
+      if (!r.ok) return null;
+      return await r.json();
+    } catch {
+      return null;
     }
-    const book: any = await this.client.getOrderBook(tokenID);
+  }
+
+  /**
+   * Raw CLOB depth (same as live bot). Used by paper execution to walk the book; not a mid fallback.
+   */
+  async getRawOrderBook(tokenID: string): Promise<any | null> {
+    const id = String(tokenID ?? "").trim();
+    if (!id || id === "unknown") return null;
+    if (this.client) {
+      try {
+        return await this.client.getOrderBook(id);
+      } catch {
+        /* fall through */
+      }
+    }
+    return this.fetchPublicOrderBook(id);
+  }
+
+  private syntheticMarketContext(tokenID: string): MarketContext {
+    const bestBid = 0.49;
+    const bestAsk = 0.51;
+    return {
+      tokenID,
+      mid: 0.5,
+      spread: 0.02,
+      liquidity: 1500,
+      bestBid,
+      bestAsk
+    };
+  }
+
+  private rawOrderBookToMarketContext(tokenID: string, book: any): MarketContext {
     const bidsRaw = Array.isArray(book?.bids) ? book.bids : [];
     const asksRaw = Array.isArray(book?.asks) ? book.asks : [];
 
-    // Some orderbook responses are not guaranteed to be sorted.
-    // We must compute the best bid as MAX(price) and best ask as MIN(price).
     const toPrice = (x: any) => Number(x?.price ?? x?.p ?? x?.px ?? NaN);
     const toSize = (x: any) => Number(x?.size ?? x?.s ?? 0);
 
@@ -421,8 +611,8 @@ export class WalletService {
       .map((a: any) => ({ ...a, _price: toPrice(a) }))
       .filter((a: any) => Number.isFinite(a._price));
 
-    bids.sort((a: any, b: any) => b._price - a._price); // highest bid first
-    asks.sort((a: any, b: any) => a._price - b._price); // lowest ask first
+    bids.sort((a: any, b: any) => b._price - a._price);
+    asks.sort((a: any, b: any) => a._price - b._price);
 
     const bestBid = bids.length > 0 ? Number(bids[0]._price) : 0.49;
     const bestAsk = asks.length > 0 ? Number(asks[0]._price) : 0.51;
@@ -430,7 +620,6 @@ export class WalletService {
     const mid = (bestBid + bestAsk) / 2;
     const spread = Math.max(0, bestAsk - bestBid);
 
-    // For “liquidity” we approximate depth at the best side (top 5 levels).
     const bidDepth = bids.slice(0, 5).reduce((a: number, b: any) => a + toSize(b), 0);
     const askDepth = asks.slice(0, 5).reduce((a: number, b: any) => a + toSize(b), 0);
     return {
@@ -441,6 +630,88 @@ export class WalletService {
       bestBid: Number(bestBid.toFixed(4)),
       bestAsk: Number(bestAsk.toFixed(4))
     };
+  }
+
+  /** POST `/books` once per refresh; `getMarketContext` hits this map for listed ids. */
+  async primeBooksForTokens(tokenIds: string[]): Promise<void> {
+    const unique = [...new Set(tokenIds.map((t) => String(t).trim()).filter((t) => t && t !== "unknown"))];
+    const map = new Map<string, MarketContext>();
+    if (unique.length === 0) {
+      this.bookPrime = map;
+      return;
+    }
+
+    const rawById = new Map<string, any>();
+
+    if (this.client) {
+      try {
+        const books = await this.client.getOrderBooks(unique.map((token_id) => ({ token_id, side: Side.BUY })));
+        if (Array.isArray(books)) {
+          for (const book of books) {
+            if (book?.asset_id != null) rawById.set(String(book.asset_id), book);
+          }
+        }
+      } catch {
+        /* fall through to public batch */
+      }
+    }
+
+    const missing = unique.filter((id) => !rawById.has(id));
+    if (missing.length > 0) {
+      const pub = await batchBook(
+        this.clobHost,
+        missing,
+        this.clobPublicBookTimeoutMs,
+        this.clobBooksBatchChunk
+      );
+      for (const id of missing) {
+        const b = pub.get(id);
+        if (b) rawById.set(id, b);
+      }
+    }
+
+    for (const id of unique) {
+      const book = rawById.get(id);
+      map.set(id, book ? this.rawOrderBookToMarketContext(id, book) : this.syntheticMarketContext(id));
+    }
+
+    this.bookPrime = map;
+  }
+
+  clearBookPrime(): void {
+    this.bookPrime = null;
+  }
+
+  async getMarketContext(tokenID: string): Promise<MarketContext> {
+    const primed = this.bookPrime?.get(tokenID);
+    if (primed) return primed;
+
+    let p = this.bookInflight.get(tokenID);
+    if (!p) {
+      p = this.loadMarketContextUncached(tokenID).finally(() => {
+        this.bookInflight.delete(tokenID);
+      });
+      this.bookInflight.set(tokenID, p);
+    }
+    return p;
+  }
+
+  private async loadMarketContextUncached(tokenID: string): Promise<MarketContext> {
+    let book: any = null;
+    if (this.client) {
+      try {
+        book = await this.client.getOrderBook(tokenID);
+      } catch {
+        book = null;
+      }
+    }
+    if (!book) {
+      book = await this.fetchPublicOrderBook(tokenID);
+    }
+    if (!book) {
+      return this.syntheticMarketContext(tokenID);
+    }
+    return this.rawOrderBookToMarketContext(tokenID, book);
   }
 
   async getDirectionalContext(): Promise<DirectionalContext | null> {
