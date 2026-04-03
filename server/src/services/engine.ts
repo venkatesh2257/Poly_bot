@@ -26,6 +26,7 @@ import {
   normalizeRawOrderBook,
   simulatePaperMarketSell
 } from "./paperExecution.js";
+import { logRealSettlement, settleReal } from "./polymarketSettlement.js";
 import { computeEnsemble, type MidSample } from "./ensembleStrategy.js";
 import { evaluateWhaleEdgeGate, whalePaperTakeProfitMid } from "./whaleStrategy.js";
 import { runConnectivityPings } from "./apiPings.js";
@@ -89,6 +90,8 @@ const CHART_POLL_MS = Number(process.env.CHART_POLL_MS ?? 4000);
 const CHART_MAX_POINTS = Number(process.env.CHART_MAX_POINTS ?? 75);
 /** USD short-term volatility cap for NO_TRADE (live tick-to-tick deltas). */
 const PREDICTION_VOLATILITY_USD = Number(process.env.PREDICTION_VOLATILITY_USD ?? 15);
+/** Auto-trade focuses one asset per wall-clock bucket (default 300s = 5m), in this order. */
+const UPDOWN_ROTATION_ASSETS = ["BTC", "ETH", "SOL", "XRP"] as const;
 
 /** Read in methods that use env (after dotenv in index). */
 function envNum(key: string, fallback: number) {
@@ -113,6 +116,15 @@ function highConfMidThreshold() {
   const t = envNum("HIGH_CONF_MID_THRESHOLD", 0.92);
   if (!Number.isFinite(t) || t <= 0 || t > 1) return 0.92;
   return t;
+}
+
+/** Default true: paper fills settle vs oracle/PTB at $1/share (avoids thin-bid market-exit losses). Set false to use simulated book SELL. */
+function paperBinarySettleEnabled() {
+  return String(process.env.PAPER_BINARY_SETTLE ?? "true").toLowerCase() !== "false";
+}
+
+function simKellySizingEnabled() {
+  return String(process.env.KELLY_SIZING ?? "true").toLowerCase() !== "false";
 }
 
 function clampGtcPrice(): number {
@@ -214,7 +226,11 @@ export class TradingEngine {
   };
   /** Cooldown keyed by Gamma slug (separate 5m markets can trade in parallel). */
   private lastTradeAtBySlug = new Map<string, number>();
-  private autoTradeSlotRotation = 0;
+  /** Last `AUTO_TRADE_ROTATION_SEC` bucket we logged `ASSET_DEBUG` for (throttle). */
+  private lastAssetDebugBucket: number | null = null;
+  /** Multi-asset: last time we forced rotation among `enabledIndices` (see `ROTATION_FORCE_MS`). */
+  private lastMultiAssetForcedRotateMs = Date.now();
+  private multiAssetForcedCursor = 0;
   private stopLossTriggered = false;
   private noTradeSignals = 0;
   private markets: MarketOption[] = [
@@ -369,6 +385,130 @@ export class TradingEngine {
       return Math.max(500, parsed);
     }
     return 120_000;
+  }
+
+  /** Wall-clock bucket length for which asset is “in focus” (default 300s = 5m). */
+  private autoTradeRotationSec(): number {
+    return Math.max(60, envNum("AUTO_TRADE_ROTATION_SEC", 300));
+  }
+
+  private buildEnabledAutoTradeIndices(slots: Array<{ asset: string }>): number[] {
+    let enabledIndices = slots
+      .map((s, i) => (this.isAssetAutoTradeEnabled(s.asset) ? i : -1))
+      .filter((i) => i >= 0);
+    if (this.lagSnipeEnabled) {
+      enabledIndices = enabledIndices.filter(
+        (i) => slots[i]?.asset === "BTC" || slots[i]?.asset === "ETH"
+      );
+    }
+    return enabledIndices;
+  }
+
+  /** Max ms on one discovered slot before advancing among `enabledIndices` (multi-asset only). */
+  private rotationForceMs(): number {
+    return Math.max(15_000, envNum("ROTATION_FORCE_MS", 60_000));
+  }
+
+  private rotationDebugLogs(): boolean {
+    return String(process.env.ROTATION_DEBUG_LOGS ?? "true").toLowerCase() !== "false";
+  }
+
+  /**
+   * Pick active slot from `UPDOWN_ROTATION_ASSETS` order × time bucket — not per-tick round-robin
+   * (so fast OLA polls don’t starve ETH/SOL/XRP when BTC has stronger books).
+   * When several markets are discovered, also advance every `ROTATION_FORCE_MS` so BTC slot 0 cannot monopolize.
+   */
+  private pickAutoTradeSlotIndex(slots: Array<{ asset: string }>, enabledIndices: number[]): number {
+    if (enabledIndices.length === 0) return 0;
+    const now = Date.now();
+    const forceMs = this.rotationForceMs();
+    // 1) Periodic advance across discovered markets (stops BTC slot-0 monopoly when Gamma returns many assets).
+    if (enabledIndices.length > 1 && now - this.lastMultiAssetForcedRotateMs >= forceMs) {
+      this.lastMultiAssetForcedRotateMs = now;
+      this.multiAssetForcedCursor = (this.multiAssetForcedCursor + 1) % enabledIndices.length;
+      return enabledIndices[this.multiAssetForcedCursor]!;
+    }
+    // 2) Otherwise: 5m wall-clock bucket → preferred asset.
+    const rotSec = this.autoTradeRotationSec();
+    const bucket = Math.floor(now / 1000 / rotSec);
+    const desired = UPDOWN_ROTATION_ASSETS[bucket % UPDOWN_ROTATION_ASSETS.length];
+    let pick = enabledIndices.find((i) => slots[i]?.asset === desired);
+    if (pick == null) {
+      for (const want of UPDOWN_ROTATION_ASSETS) {
+        const f = enabledIndices.find((i) => slots[i]?.asset === want);
+        if (f != null) {
+          pick = f;
+          break;
+        }
+      }
+    }
+    return pick ?? enabledIndices[0]!;
+  }
+
+  /** Book refresh + auto-trade: align active market with rotation bucket (keeps UI/API off BTC-only). */
+  private syncAutoTradeRotationActiveSlot(slots: Array<{ asset: string; slug: string }>) {
+    const dbg = this.rotationDebugLogs();
+    if (slots.length === 0) {
+      if (dbg) {
+        console.log("MARKET_DISCOVERY", { slots: [], note: "no discovered slots — check Gamma / AUTO_DISCOVER_UPDOWN" });
+      }
+      return;
+    }
+    const enabled = this.buildEnabledAutoTradeIndices(slots);
+    const rotSec = this.autoTradeRotationSec();
+    const bucket = Math.floor(Date.now() / 1000 / rotSec);
+    const desired = UPDOWN_ROTATION_ASSETS[bucket % UPDOWN_ROTATION_ASSETS.length];
+
+    if (dbg) {
+      console.log("MARKET_DISCOVERY", {
+        slots: slots.map((s) => `${s.asset}(${s.slug?.slice(-14) ?? "?"})`),
+        slotCount: slots.length
+      });
+    }
+
+    if (enabled.length === 0) {
+      if (dbg) {
+        console.log("ASSET_DEBUG_FULL", {
+          bucket,
+          desired,
+          enabledIndices: [],
+          fallbackAsset: slots[0]?.asset ?? null,
+          reason: "no_auto_trade_enabled_assets",
+          ts: Date.now()
+        });
+      }
+      return;
+    }
+
+    const pick = this.pickAutoTradeSlotIndex(slots, enabled);
+    const fallbackAsset = slots[enabled[0]!]?.asset ?? "?";
+
+    if (dbg) {
+      console.log("ENABLED_INDICES:", enabled.map((i) => `${i}:${slots[i]?.asset ?? "?"}`));
+      console.log("ASSET_DEBUG_FULL", {
+        bucket,
+        desired,
+        enabledIndices: enabled,
+        pickedIndex: pick,
+        pickedAsset: slots[pick]?.asset ?? null,
+        fallbackAsset,
+        rotationForceMs: this.rotationForceMs(),
+        lastForcedAgeMs: Date.now() - this.lastMultiAssetForcedRotateMs
+      });
+    }
+
+    if (this.lastAssetDebugBucket !== bucket) {
+      this.lastAssetDebugBucket = bucket;
+      console.log("ASSET_DEBUG", {
+        asset: slots[pick]?.asset,
+        bucket,
+        rotationSec: rotSec,
+        desired,
+        markets: slots.map((s) => ({ asset: s.asset, slug: s.slug })),
+        ts: Date.now()
+      });
+    }
+    this.wallet.setActiveSlot(pick);
   }
 
   private oracleSpotUsdForAsset(asset: string): number | null {
@@ -1323,7 +1463,10 @@ export class TradingEngine {
         detail: `spread filter: spread ${book.spread.toFixed(4)} > MAX_SPREAD ${maxSpread} | ${ctx}`
       };
     }
-    if (book.liquidity < minLiq) {
+    const paperLiq =
+      this.wallet.getMode() === "SIMULATION" &&
+      String(process.env.PAPER_OVERRIDE_LIQUIDITY_GUARD ?? "true").toLowerCase() === "true";
+    if (book.liquidity < minLiq && !paperLiq) {
       return {
         ok: false,
         detail: `liquidity filter: liquidity ${book.liquidity.toFixed(0)} < MIN_LIQUIDITY ${minLiq} | ${ctx}`
@@ -2173,19 +2316,11 @@ export class TradingEngine {
       }
       if (n > 0) {
         const slots = this.wallet.getDiscoveredSlotsSnapshot();
-        let enabledIndices = slots
-          .map((s, i) => (this.isAssetAutoTradeEnabled(s.asset) ? i : -1))
-          .filter((i) => i >= 0);
-        if (this.lagSnipeEnabled) {
-          enabledIndices = enabledIndices.filter(
-            (i) => slots[i]?.asset === "BTC" || slots[i]?.asset === "ETH"
-          );
-        }
+        const enabledIndices = this.buildEnabledAutoTradeIndices(slots);
         if (enabledIndices.length === 0) {
           return;
         }
-        const pick = enabledIndices[this.autoTradeSlotRotation % enabledIndices.length];
-        this.autoTradeSlotRotation += 1;
+        const pick = this.pickAutoTradeSlotIndex(slots, enabledIndices);
         this.wallet.setActiveSlot(pick);
         this.directionalContext = await this.wallet.getDirectionalContext();
         const sel = this.wallet.getDiscoveredSelection();
@@ -2251,8 +2386,8 @@ export class TradingEngine {
       }
       const result = await this.trade(direction, riskAmount, "AUTO", choice.reason);
       if (!result.accepted) this.log("ERROR", `Auto-trade blocked: ${result.reason ?? "unknown"}`);
-    } finally {
-      this.wallet.setActiveSlot(0);
+    } catch (e) {
+      this.log("ERROR", `Auto-trade tick: ${e instanceof Error ? e.message : String(e)}`);
     }
   }
 
@@ -2403,7 +2538,9 @@ export class TradingEngine {
             this.log("SIGNAL", `Active market rolled: ${sel.label}`);
           }
         }
-        this.wallet.setActiveSlot(0);
+        const slots = this.wallet.getDiscoveredSlotsSnapshot();
+        this.syncAssetAutoTradeKeysFromConfigured();
+        this.syncAutoTradeRotationActiveSlot(slots);
         const sel0 = this.wallet.getDiscoveredSelection();
         if (sel0) {
           this.selectedMarket = { tokenID: sel0.tokenID, label: sel0.label, outcome: "AUTO" };
@@ -2422,8 +2559,6 @@ export class TradingEngine {
           ]);
           this.marketContext = mc;
           this.directionalContext = dc;
-          const slots = this.wallet.getDiscoveredSlotsSnapshot();
-          this.syncAssetAutoTradeKeysFromConfigured();
           if (slots.length > 0) {
             this.polymarketRtds.start();
             const chainlinkAssets = ["BTC", "ETH", "SOL", "XRP"] as const;
@@ -3228,6 +3363,25 @@ export class TradingEngine {
       }
     }
 
+    const minConfPct = Number(process.env.MIN_SIGNAL_CONF_PCT ?? 75);
+    if (
+      !this.lagSnipeEnabled &&
+      source === "AUTO" &&
+      Number.isFinite(minConfPct) &&
+      minConfPct > 0 &&
+      minConfPct <= 100
+    ) {
+      const c = this.prediction.confidence;
+      const conf01 = c > 1 ? c / 100 : c;
+      if (conf01 < minConfPct / 100 - 1e-9) {
+        this.setPhase("RISK_BLOCKED", "Signal below confidence threshold");
+        return {
+          accepted: false,
+          reason: `MIN_SIGNAL_CONF: ${(conf01 * 100).toFixed(1)}% < ${minConfPct}%`
+        };
+      }
+    }
+
     if (
       strat !== "ola" &&
       !this.lagSnipeEnabled &&
@@ -3299,6 +3453,21 @@ export class TradingEngine {
     let effectiveAmount = amount;
     if (this.lagSnipeEnabled) {
       effectiveAmount = 1;
+    }
+    if (
+      this.wallet.getMode() === "SIMULATION" &&
+      !this.lagSnipeEnabled &&
+      simKellySizingEnabled()
+    ) {
+      const bankroll = this.balance;
+      const kFrac = Number(process.env.KELLY_BANKROLL_FRAC ?? 0.02);
+      const mid = book.mid;
+      if (mid > 0 && Number.isFinite(bankroll) && bankroll > 0 && Number.isFinite(kFrac) && kFrac > 0) {
+        const kellyUsd = (kFrac * bankroll) / mid;
+        const maxPos = Number(process.env.MAX_POSITION_USD ?? this.effMaxTrade());
+        const capped = Math.min(kellyUsd, Number.isFinite(maxPos) ? maxPos : this.effMaxTrade(), bankroll);
+        effectiveAmount = Math.min(this.effMaxTrade(), Math.max(this.effMinTrade(), capped));
+      }
     }
     if (this.wallet.getMode() === "LIVE") {
       const budget = await this.wallet.getAvailableCollateralBudget();
@@ -3477,7 +3646,9 @@ export class TradingEngine {
   /** Paper: live book + virtual fill (latency, walk, timeout, fees, rejection coin-flip). */
   private async resolvePaperTradeAsync(tradeId: string, book: MarketContext, collateralUsd: number) {
     const tokenId = book.tokenID;
-    const limitPrice = book.mid;
+    const slipRaw = Number(process.env.SIMULATION_SLIPPAGE_PCT ?? 0.015);
+    const slip = Number.isFinite(slipRaw) ? Math.min(0.5, Math.max(0, slipRaw)) : 0.015;
+    const limitPrice = Math.min(0.999, book.mid * (1 + slip));
     const targetShares = limitPrice > 0 ? collateralUsd / limitPrice : 0;
     const sizeShares = Number(Math.max(1e-12, targetShares).toFixed(6));
 
@@ -3556,32 +3727,52 @@ export class TradingEngine {
     });
     this.log(
       "TRADE",
-      `PAPER entry vwap=${fill.vwap.toFixed(4)} shares=${fill.filledShares.toFixed(4)} slip=${fill.slippageBps}bps`
+      `PAPER entry vwap=${fill.vwap.toFixed(4)} shares=${fill.filledShares.toFixed(4)} slip=${fill.slippageBps}bps (limit×${(1 + slip).toFixed(4)})`
     );
-    this.setPhase("WAITING_RESOLUTION", "Paper position; settlement vs live book");
+    console.log("TRADE_FULL", {
+      phase: "entry",
+      direction: this.trades[idx]!.direction,
+      entryPrice: fill.vwap,
+      pnl: 0,
+      slipPct: slip
+    });
+    this.setPhase(
+      "WAITING_RESOLUTION",
+      paperBinarySettleEnabled()
+        ? "Paper position; oracle settle at window end"
+        : "Paper position; settlement vs live book"
+    );
     this.onTrades?.([...this.trades]);
     this.pushStatus();
 
     const row = this.trades[idx];
     if (row?.lagSnipeHold) {
-      this.scheduleLagSnipePaperSettlement(tradeId);
+      this.schedulePaperSettlementTimer(tradeId);
+    } else if (paperBinarySettleEnabled()) {
+      this.schedulePaperSettlementTimer(tradeId);
     } else {
       this.schedulePaperExitWithWhaleTp(tradeId, tokenId, fill.vwap);
     }
   }
 
-  /** Paper + Lag Snipe: settle at window end vs oracle / PTB (no simulated market exit). */
-  private scheduleLagSnipePaperSettlement(tradeId: string) {
-    const meta = this.wallet.getDiscoveredMeta();
-    const endParsed = meta?.endDateIso ? new Date(meta.endDateIso).getTime() : NaN;
-    const delayMs = !Number.isNaN(endParsed)
-      ? Math.max(1500, endParsed - Date.now() + 1200)
-      : Math.max(5000, Number(process.env.PAPER_SETTLE_DELAY_MS ?? 8000));
+  /**
+   * Paper: dry-run live — real book entry, then oracle $1/$0 redemption.
+   * Default 5m per position (`PAPER_SETTLE_DELAY_MS`); set `PAPER_SETTLE_AT_WINDOW_END=true` to settle at window end instead.
+   */
+  private schedulePaperSettlementTimer(tradeId: string) {
+    const defaultMs = 5 * 60 * 1000;
+    const raw = Number(process.env.PAPER_SETTLE_DELAY_MS ?? defaultMs);
+    const timerMs = Number.isFinite(raw) && raw >= 1000 ? raw : defaultMs;
+    let delayMs = timerMs;
+    if (String(process.env.PAPER_SETTLE_AT_WINDOW_END ?? "").toLowerCase() === "true") {
+      const meta = this.wallet.getDiscoveredMeta();
+      const endParsed = meta?.endDateIso ? new Date(meta.endDateIso).getTime() : NaN;
+      if (!Number.isNaN(endParsed)) {
+        delayMs = Math.max(1500, endParsed - Date.now() + 1200);
+      }
+    }
     setTimeout(() => this.resolveTrade(tradeId), delayMs);
-    this.log(
-      "TRADE",
-      `Lag Snipe PAPER: settlement in ~${Math.round(delayMs / 1000)}s (window end / hold)`
-    );
+    this.log("TRADE", `PAPER: oracle settlement in ~${Math.round(delayMs / 1000)}s`);
   }
 
   /**
@@ -3626,7 +3817,11 @@ export class TradingEngine {
     this.settleRetryTimerByTradeId.set(tradeId, timer);
   }
 
-  private async finalizeLagSnipePaperHold(idx: number) {
+  /**
+   * Paper settlement at $1/share redemption (oracle vs price-to-beat) — same economics as Lag Snipe.
+   * Avoids `finalizePaperTradeExit` market-sell path where extreme bids can flip a winning side to negative P&L.
+   */
+  private async finalizePaperOracleBinarySettlement(idx: number) {
     const t = this.trades[idx];
     if (!t || t.status !== "PENDING") return;
     const asset = (t.asset ?? "BTC").toUpperCase();
@@ -3641,13 +3836,49 @@ export class TradingEngine {
     const fees = Number(t.paper?.entryFeesUsd ?? 0);
     const cost = Number(t.paper?.entryCostUsd ?? shares * vwap);
     const entryTotal = cost + fees;
-    const pnl = isWin ? Number((shares * (1 - vwap) - fees).toFixed(2)) : Number((-entryTotal).toFixed(2));
+    const marketId = this.wallet.getActiveDiscoveredSlug() ?? "";
+    const sr = settleReal({
+      marketId,
+      direction: t.direction,
+      entryPricePerShare: vwap,
+      shares,
+      entryCostUsd: cost,
+      entryFeesUsd: fees,
+      tokenWins: isWin
+    });
+    const pnl = Number(sr.pnl.toFixed(2));
+    logRealSettlement({
+      entry: vwap,
+      outcome: sr.outcome,
+      finalPrice: sr.finalPrice,
+      pnl: sr.pnl,
+      marketId
+    });
+    const exitPricePerShare = sr.finalPrice;
+    const pnlPerShare = isWin ? 1 - vwap - fees / Math.max(shares, 1e-12) : -(entryTotal / Math.max(shares, 1e-12));
+    console.log("EXIT_DEBUG", {
+      mode: "oracle_binary",
+      entryPrice: vwap,
+      exitPrice: exitPricePerShare,
+      pnlPerShare: Number(pnlPerShare.toFixed(6)),
+      shares,
+      entryFeesUsd: fees,
+      isWin
+    });
     const settled: Trade = {
       ...t,
       status: isWin ? "WIN" : "LOSS",
       pnl,
       paper: { ...t.paper!, exitPartial: false }
     };
+    console.log("TRADE_FULL", {
+      direction: settled.direction,
+      asset,
+      entryPrice: vwap,
+      exitPrice: exitPricePerShare,
+      pnl: settled.pnl,
+      settle: isWin ? "WIN" : "LOSS"
+    });
     this.balance += settled.pnl;
     this.trades[idx] = settled;
     this.maybeRecordOlaPnlAndCheckKill(settled, settled.pnl);
@@ -3662,7 +3893,7 @@ export class TradingEngine {
     this.pushStatus();
     this.log(
       isWin ? "WIN" : "ERROR",
-      `PAPER Lag Snipe settle ${settled.direction} P&L $${settled.pnl.toFixed(2)} (oracle vs PTB)`
+      `PAPER oracle-binary settle ${settled.direction} P&L $${settled.pnl.toFixed(2)} (oracle vs PTB)`
     );
     if (this.stopLossTriggered) {
       this.setPhase("ERROR", "Stop loss reached; engine stopped");
@@ -3701,6 +3932,19 @@ export class TradingEngine {
       const costAlloc = entryTotal * frac;
       const exitNet = fill.notionalUsd - fill.feesUsd;
       pnl = exitNet - costAlloc;
+      const entryPrice = shares > 0 ? costAlloc / sold : 0;
+      const exitPrice = fill.vwap;
+      const pnlPerShare = sold > 0 ? pnl / sold : 0;
+      console.log("EXIT_DEBUG", {
+        mode: "market_sell",
+        entryPrice,
+        exitPrice,
+        pnlPerShare: Number(pnlPerShare.toFixed(6)),
+        shares,
+        sold,
+        exitNet,
+        costAlloc
+      });
       this.pushBotTradeHistory({
         ts: Date.now(),
         mode: "paper",
@@ -3719,6 +3963,15 @@ export class TradingEngine {
       });
     } else {
       pnl = -entryTotal;
+      console.log("EXIT_DEBUG", {
+        mode: "market_sell",
+        entryPrice: shares > 0 ? entryTotal / shares : 0,
+        exitPrice: 0,
+        pnlPerShare: shares > 0 ? pnl / shares : 0,
+        shares,
+        sold: 0,
+        reason: fill.reason
+      });
       this.pushBotTradeHistory({
         ts: Date.now(),
         mode: "paper",
@@ -3749,6 +4002,16 @@ export class TradingEngine {
         exitPartial: fill.ok ? fill.partial : undefined
       }
     };
+    const entryPxFull = shares > 0 ? entryTotal / shares : Number(t.paper?.entryVwap ?? 0);
+    console.log("TRADE_FULL", {
+      direction: settled.direction,
+      asset: (t.asset ?? "").toUpperCase(),
+      entryPrice: entryPxFull,
+      exitPrice: fill.ok ? fill.vwap : 0,
+      pnl: settled.pnl,
+      settle: status,
+      mode: "market_sell"
+    });
     this.balance += settled.pnl;
     this.trades[idx] = settled;
     this.maybeRecordOlaPnlAndCheckKill(settled, settled.pnl);
@@ -3787,8 +4050,27 @@ export class TradingEngine {
     }
     const isWin = settle.isWin;
     const entryPx = Math.min(1, Math.max(0, Number(t.price ?? 0.5)));
-    const pnl = isWin ? t.amount * (1 - entryPx) : -(t.amount * entryPx);
-    const settled: Trade = { ...t, status: isWin ? "WIN" : "LOSS", pnl: Number(pnl.toFixed(2)) };
+    const shares = entryPx > 1e-12 ? t.amount / entryPx : 0;
+    const cost = shares * entryPx;
+    const marketId = this.wallet.getActiveDiscoveredSlug() ?? "";
+    const sr = settleReal({
+      marketId,
+      direction: t.direction,
+      entryPricePerShare: entryPx,
+      shares,
+      entryCostUsd: cost,
+      entryFeesUsd: 0,
+      tokenWins: isWin
+    });
+    logRealSettlement({
+      entry: entryPx,
+      outcome: sr.outcome,
+      finalPrice: sr.finalPrice,
+      pnl: sr.pnl,
+      marketId
+    });
+    const pnl = Number(sr.pnl.toFixed(2));
+    const settled: Trade = { ...t, status: isWin ? "WIN" : "LOSS", pnl };
     this.balance += settled.pnl;
     this.trades[idx] = settled;
     this.maybeRecordOlaPnlAndCheckKill(settled, settled.pnl);
@@ -3969,8 +4251,9 @@ export class TradingEngine {
       t.paper.entryVwap != null &&
       t.paper.entryShares != null
     ) {
-      if (t.lagSnipeHold) {
-        void this.finalizeLagSnipePaperHold(idx);
+      const useOracleBinary = Boolean(t.lagSnipeHold) || paperBinarySettleEnabled();
+      if (useOracleBinary) {
+        void this.finalizePaperOracleBinarySettlement(idx);
       } else {
         void this.finalizePaperTradeExit(idx);
       }
@@ -3989,9 +4272,30 @@ export class TradingEngine {
       return;
     }
     const isWin = settle.isWin;
-    const entryPx = Math.min(1, Math.max(0, Number(t.price ?? 0.5)));
-    const pnl = isWin ? (1 - entryPx) * t.amount : -(entryPx * t.amount);
-    const settled: Trade = { ...t, status: isWin ? "WIN" : "LOSS", pnl: Number(pnl.toFixed(2)) };
+    const entryPx = Math.min(1, Math.max(0, Number(t.paper?.entryVwap ?? t.price ?? 0.5)));
+    const shares =
+      t.paper?.entryShares ?? (entryPx > 1e-12 ? t.amount / entryPx : 0);
+    const cost = t.paper?.entryCostUsd ?? shares * entryPx;
+    const fees = t.paper?.entryFeesUsd ?? 0;
+    const marketId = this.wallet.getActiveDiscoveredSlug() ?? "";
+    const sr = settleReal({
+      marketId,
+      direction: t.direction,
+      entryPricePerShare: entryPx,
+      shares,
+      entryCostUsd: cost,
+      entryFeesUsd: fees,
+      tokenWins: isWin
+    });
+    logRealSettlement({
+      entry: entryPx,
+      outcome: sr.outcome,
+      finalPrice: sr.finalPrice,
+      pnl: sr.pnl,
+      marketId
+    });
+    const pnl = Number(sr.pnl.toFixed(2));
+    const settled: Trade = { ...t, status: isWin ? "WIN" : "LOSS", pnl };
     this.balance += settled.pnl;
     this.trades[idx] = settled;
     this.maybeRecordOlaPnlAndCheckKill(settled, settled.pnl);

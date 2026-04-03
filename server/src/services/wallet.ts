@@ -932,3 +932,5 @@ export class WalletService {
     }
   }
 }
+
+export { settleReal, logRealSettlement } from "./polymarketSettlement.js";

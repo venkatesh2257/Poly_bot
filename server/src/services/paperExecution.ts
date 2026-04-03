@@ -74,12 +74,6 @@ function randomLatencyMs(): number {
   return Math.round(a + Math.random() * (b - a));
 }
 
-function simulatedExecutionFailure(): boolean {
-  const pct = envNum("PAPER_EXEC_FAILURE_PCT", 5);
-  const p = Math.min(100, Math.max(0, pct)) / 100;
-  return Math.random() < p;
-}
-
 /** BUY: walk asks up to limitPrice; return vwap and filled shares. */
 function walkBuyLimit(
   asks: NormalizedLevel[],
@@ -164,11 +158,6 @@ export async function simulatePaperLimitBuy(params: PaperLimitBuyParams): Promis
   const limitTimeoutSec = params.limitTimeoutSec ?? envNum("PAPER_LIMIT_TIMEOUT_SEC", 1.5);
   const t0 = Date.now();
   await sleep(randomLatencyMs());
-  const latencyPre = Date.now() - t0;
-
-  if (simulatedExecutionFailure()) {
-    return { ok: false, reason: "simulated_execution_failure", latencyMs: latencyPre };
-  }
 
   const tryOnce = async (): Promise<PaperFillSuccess | null> => {
     const raw = await params.fetchBook();
@@ -202,10 +191,6 @@ export async function simulatePaperLimitBuy(params: PaperLimitBuyParams): Promis
 
   await sleep(Math.max(0, limitTimeoutSec) * 1000);
 
-  if (simulatedExecutionFailure()) {
-    return { ok: false, reason: "simulated_execution_failure_after_wait", latencyMs: Date.now() - t0 };
-  }
-
   const second = await tryOnce();
   if (second) return second;
 
@@ -226,10 +211,6 @@ export async function simulatePaperMarketSell(params: PaperMarketSellParams): Pr
   const minBid = params.minBid ?? envNum("PAPER_EXIT_MIN_BID", 0.01);
   const t0 = Date.now();
   await sleep(randomLatencyMs());
-
-  if (simulatedExecutionFailure()) {
-    return { ok: false, reason: "simulated_execution_failure_exit", latencyMs: Date.now() - t0 };
-  }
 
   const raw = await params.fetchBook();
   const nb = normalizeRawOrderBook(raw);

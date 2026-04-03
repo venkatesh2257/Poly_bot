@@ -60,7 +60,8 @@ export async function resolveActiveUpDown5m(asset: string): Promise<ResolvedUpDo
   const nowSec = Math.floor(Date.now() / 1000);
   const blockStart = Math.floor(nowSec / WINDOW_SEC) * WINDOW_SEC;
   const candidates: number[] = [];
-  for (let k = -10; k <= 10; k++) {
+  const span = Math.max(10, Math.min(40, Number(process.env.GAMMA_5M_CANDIDATE_SPAN ?? 25)));
+  for (let k = -span; k <= span; k++) {
     candidates.push(blockStart + k * WINDOW_SEC);
   }
 
