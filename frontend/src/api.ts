@@ -78,6 +78,11 @@ export const api = {
       method: "POST",
       body: JSON.stringify(body)
     }),
+  setAnchorStrategy: (enabled: boolean) =>
+    request<{ ok: true; anchorStrategy: import("./types").AnchorStrategySnapshot }>("/anchor-strategy", {
+      method: "POST",
+      body: JSON.stringify({ enabled })
+    }),
   setLagSnipe: (enabled: boolean) =>
     request<{ ok: true; lagSnipeEnabled: boolean; banner?: string }>("/lag-snipe", {
       method: "POST",

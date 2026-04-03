@@ -19,7 +19,8 @@ import type {
   RiskSettingsSnapshot,
   Status,
   Trade,
-  TradingState
+  TradingState,
+  AnchorStrategySnapshot
 } from "../types/index.js";
 import {
   executePaperLimitBuyOrder,
@@ -27,6 +28,16 @@ import {
   simulatePaperMarketSell
 } from "./paperExecution.js";
 import { logRealSettlement, settleReal } from "./polymarketSettlement.js";
+import {
+  anchorEntryPreflight,
+  anchorShouldExitDownOnMomentum,
+  anchorShouldExitUpOnMomentum,
+  evaluateAnchorStrategy,
+  loadAnchorConfigFromEnv,
+  type AnchorSignal,
+  type OrderBookSnapshot
+} from "../strategies/anchorStrategy.js";
+import { getChainlinkPriceHistoryBuffer } from "../realtime.js";
 import { computeEnsemble, type MidSample } from "./ensembleStrategy.js";
 import { evaluateWhaleEdgeGate, whalePaperTakeProfitMid } from "./whaleStrategy.js";
 import { runConnectivityPings } from "./apiPings.js";
@@ -348,6 +359,15 @@ export class TradingEngine {
   private stopGtcMonitor: (() => void) | null = null;
   /** Per-trade settle retry timer guard to avoid duplicate loops/log spam. */
   private settleRetryTimerByTradeId = new Map<string, ReturnType<typeof setTimeout>>();
+
+  /** Anchor Strategy: bid-depth imbalance history (5s cadence, max 10). */
+  private anchorImbalanceHistoryUp: number[] = [];
+  private anchorImbalanceHistoryDown: number[] = [];
+  private lastAnchorSignal: AnchorSignal | null = null;
+  private lastAnchorWindowKey: string | null = null;
+  private anchorTradedThisWindow = false;
+  /** UI/API toggle; Anchor still requires ANCHOR_STRATEGY_ENABLED in .env. */
+  private anchorRuntimeEnabled = true;
 
   /** Skip redundant WS `status` when phase copy is unchanged. */
   private lastBroadcastPredKey = "";
@@ -1839,7 +1859,8 @@ export class TradingEngine {
         ts: this.prediction.ts,
         recommendation: this.prediction.recommendation,
         reason: this.prediction.reason
-      }
+      },
+      anchorStrategy: this.buildAnchorStrategySnapshotPayload()
     };
   }
 
@@ -2336,6 +2357,12 @@ export class TradingEngine {
         return;
       }
 
+      this.maybeRotateAnchorWindow();
+      await this.recordAnchorBuffers();
+      if (!olaFastLane) {
+        await this.monitorAnchorExits();
+      }
+
       const choice = this.chooseDirectionalEntry();
       if (choice.reason.startsWith("OLA_SKIP:") || choice.reason.startsWith("LAG_SNIPE_SKIP:")) {
         const asset = this.wallet.getActiveDiscoveredAsset() ?? "?";
@@ -2357,11 +2384,13 @@ export class TradingEngine {
         !this.canIgnoreNoTradeForBookOnlyBlock("AUTO")
       ) {
         this.log("SIGNAL", `Auto-trade skipped (${this.prediction.reason ?? "direction mismatch"})`);
+        await this.maybeRunAnchorStrategy();
         return;
       }
       const whaleGate = this.whaleEdgeGateOrOk(direction);
       if (!whaleGate.ok) {
         this.log("SIGNAL", whaleGate.reason);
+        await this.maybeRunAnchorStrategy();
         return;
       }
       const { amount: riskAmount, budget } = await this.computeAutoTradeAmount();
@@ -2382,12 +2411,328 @@ export class TradingEngine {
             )}; reserved ${reserved.toFixed(6)})`
           );
         }
+        await this.maybeRunAnchorStrategy();
         return;
       }
       const result = await this.trade(direction, riskAmount, "AUTO", choice.reason);
-      if (!result.accepted) this.log("ERROR", `Auto-trade blocked: ${result.reason ?? "unknown"}`);
+      if (!result.accepted) {
+        this.log("ERROR", `Auto-trade blocked: ${result.reason ?? "unknown"}`);
+        await this.maybeRunAnchorStrategy();
+      } else {
+        this.anchorTradedThisWindow = true;
+      }
     } catch (e) {
       this.log("ERROR", `Auto-trade tick: ${e instanceof Error ? e.message : String(e)}`);
+    }
+  }
+
+  private getAnchorWindowKey(): string | null {
+    const meta = this.wallet.getDiscoveredMeta();
+    if (!meta?.slug) return null;
+    return `${meta.slug}|${meta.windowStartSec ?? 0}`;
+  }
+
+  private maybeRotateAnchorWindow() {
+    const key = this.getAnchorWindowKey();
+    if (key !== this.lastAnchorWindowKey) {
+      this.lastAnchorWindowKey = key;
+      this.anchorTradedThisWindow = false;
+    }
+  }
+
+  private sumDepthFromRaw(raw: unknown): { bid: number; ask: number } {
+    const nb = normalizeRawOrderBook(raw);
+    if (!nb) return { bid: 0, ask: 0 };
+    const bid = nb.bids.slice(0, 12).reduce((s, l) => s + l.size, 0);
+    const ask = nb.asks.slice(0, 12).reduce((s, l) => s + l.size, 0);
+    return { bid, ask };
+  }
+
+  private async buildAnchorOrderBookSnapshot(): Promise<OrderBookSnapshot | null> {
+    const ctx = this.directionalContext;
+    if (!ctx) return null;
+    const [rawUp, rawDown] = await Promise.all([
+      this.wallet.getRawOrderBook(ctx.up.tokenID),
+      this.wallet.getRawOrderBook(ctx.down.tokenID)
+    ]);
+    const u = this.sumDepthFromRaw(rawUp);
+    const d = this.sumDepthFromRaw(rawDown);
+    return {
+      bidDepthUp: u.bid,
+      askDepthUp: u.ask,
+      bidDepthDown: d.bid,
+      askDepthDown: d.ask
+    };
+  }
+
+  private async recordAnchorBuffers(): Promise<void> {
+    const spot = this.oracleSpotUsdForAsset("BTC");
+    if (spot != null && Number.isFinite(spot) && spot > 0) {
+      getChainlinkPriceHistoryBuffer().push(spot, Date.now());
+    }
+    const snap = await this.buildAnchorOrderBookSnapshot();
+    if (!snap) return;
+    const upImb =
+      snap.bidDepthUp / (snap.bidDepthUp + snap.askDepthUp + 1e-12);
+    const downImb =
+      snap.bidDepthDown / (snap.bidDepthDown + snap.askDepthDown + 1e-12);
+    this.anchorImbalanceHistoryUp.push(upImb);
+    this.anchorImbalanceHistoryDown.push(downImb);
+    while (this.anchorImbalanceHistoryUp.length > 10) this.anchorImbalanceHistoryUp.shift();
+    while (this.anchorImbalanceHistoryDown.length > 10) this.anchorImbalanceHistoryDown.shift();
+  }
+
+  private buildAnchorStrategySnapshotPayload(): AnchorStrategySnapshot {
+    const cfg = loadAnchorConfigFromEnv();
+    const last = this.lastAnchorSignal;
+    return {
+      envEnabled: cfg.enabled,
+      runtimeEnabled: this.anchorRuntimeEnabled,
+      effectiveEnabled: cfg.enabled && this.anchorRuntimeEnabled,
+      stabilityTicks: cfg.stabilityTicks,
+      ticksRecorded: this.anchorImbalanceHistoryUp.length,
+      lastSignal: last
+        ? {
+            shouldTrade: last.shouldTrade,
+            side: last.side,
+            imbalanceScore: last.imbalanceScore,
+            stabilityMet: last.stabilityMet,
+            chainlinkMom: last.chainlinkMom,
+            anchorPrice: last.anchorPrice,
+            reason: last.reason,
+            skipCategory: last.skipCategory
+          }
+        : null
+    };
+  }
+
+  setAnchorStrategyEnabled(enabled: boolean): { ok: true; anchorStrategy: AnchorStrategySnapshot } {
+    this.anchorRuntimeEnabled = enabled;
+    this.pushStatus();
+    return { ok: true, anchorStrategy: this.buildAnchorStrategySnapshotPayload() };
+  }
+
+  private anchorLogStructured(
+    event: "ANCHOR_SKIP" | "ANCHOR_SIGNAL" | "ANCHOR_ENTRY" | "ANCHOR_EXIT",
+    payload: Record<string, unknown>
+  ) {
+    const cfg = loadAnchorConfigFromEnv();
+    const line = JSON.stringify({ event, ts: Date.now(), ...payload });
+    if (event === "ANCHOR_SIGNAL" && !cfg.anchorDebugLogs) return;
+    this.log(event === "ANCHOR_ENTRY" || event === "ANCHOR_EXIT" ? "TRADE" : "SIGNAL", line);
+  }
+
+  private async maybeRunAnchorStrategy(): Promise<void> {
+    const cfg = loadAnchorConfigFromEnv();
+    if (!cfg.enabled) return;
+    if (!this.anchorRuntimeEnabled) return;
+
+    const meta = this.wallet.getDiscoveredMeta();
+    const endMs = meta?.endDateIso ? new Date(meta.endDateIso).getTime() : NaN;
+    const secs = !Number.isNaN(endMs) ? Math.floor((endMs - Date.now()) / 1000) : null;
+    const hasPending = this.trades.some((t) => t.status === "PENDING");
+
+    const pre = anchorEntryPreflight({
+      cfg,
+      envEnabled: cfg.enabled,
+      runtimeEnabled: this.anchorRuntimeEnabled,
+      lagSnipeEnabled: this.lagSnipeEnabled,
+      hasLiveMarketData: this.wallet.hasLiveMarketData(),
+      hasDirectionalContext: this.directionalContext != null,
+      secondsToExpiry: secs,
+      hasPendingTrade: hasPending,
+      anchorTradedThisWindow: this.anchorTradedThisWindow
+    });
+
+    if (!pre.ok) {
+      this.lastAnchorSignal = {
+        shouldTrade: false,
+        side: null,
+        imbalanceScore: 0,
+        stabilityMet: false,
+        chainlinkMom: 0,
+        anchorPrice: 0,
+        reason: `ANCHOR_SKIP ${pre.category}: ${pre.reason}`,
+        skipCategory: pre.category
+      };
+      if (pre.category !== "DISABLED" || cfg.anchorDebugLogs) {
+        this.anchorLogStructured("ANCHOR_SKIP", {
+          category: pre.category,
+          reason: pre.reason,
+          secondsToExpiry: secs,
+          windowKey: this.getAnchorWindowKey()
+        });
+      }
+      return;
+    }
+
+    const snap = await this.buildAnchorOrderBookSnapshot();
+    if (!snap) {
+      this.lastAnchorSignal = {
+        shouldTrade: false,
+        side: null,
+        imbalanceScore: 0,
+        stabilityMet: false,
+        chainlinkMom: 0,
+        anchorPrice: 0,
+        reason: "ANCHOR_SKIP NO_LIVE_BOOK: snapshot null",
+        skipCategory: "NO_LIVE_BOOK"
+      };
+      this.anchorLogStructured("ANCHOR_SKIP", { category: "NO_LIVE_BOOK", reason: "order book snapshot null" });
+      return;
+    }
+
+    const ctx = this.directionalContext!;
+    const upMid = ctx.up.mid;
+    const downMid = ctx.down.mid;
+    const buf = getChainlinkPriceHistoryBuffer();
+    const hist = buf.snapshot();
+    const tsMs = buf.snapshotTimestampsMs();
+    const oracleAgeMs = this.oracleAgeMsForAsset("BTC");
+
+    const sig = evaluateAnchorStrategy(
+      snap,
+      hist,
+      upMid,
+      downMid,
+      [...this.anchorImbalanceHistoryUp],
+      [...this.anchorImbalanceHistoryDown],
+      cfg,
+      oracleAgeMs,
+      tsMs
+    );
+    this.lastAnchorSignal = sig;
+
+    if (cfg.anchorDebugLogs) {
+      this.anchorLogStructured("ANCHOR_SIGNAL", {
+        sideCandidate: sig.side,
+        upBidDepthShare: sig.upBidDepthShare,
+        downBidDepthShare: sig.downBidDepthShare,
+        chainlinkMom: sig.chainlinkMom,
+        anchorYesPrice: upMid,
+        anchorNoPrice: downMid,
+        stabilityTicksRequired: cfg.stabilityTicks,
+        stabilityDetail: sig.stabilityDetail,
+        oracleAgeMs: oracleAgeMs ?? sig.oracleAgeMs,
+        decision: sig.shouldTrade ? "ENTER" : "SKIP",
+        skipCategory: sig.skipCategory,
+        reason: sig.reason
+      });
+    }
+
+    if (!sig.shouldTrade) {
+      if (sig.skipCategory) {
+        this.anchorLogStructured("ANCHOR_SKIP", {
+          category: sig.skipCategory,
+          reason: sig.reason,
+          upBidDepthShare: sig.upBidDepthShare,
+          downBidDepthShare: sig.downBidDepthShare,
+          chainlinkMom: sig.chainlinkMom
+        });
+      } else {
+        this.log("SIGNAL", sig.reason);
+      }
+      return;
+    }
+
+    const ref = sig.side === "UP" ? ctx.up : ctx.down;
+    const slipEst = Number.isFinite(ref.bestAsk) && Number.isFinite(ref.mid) ? ref.bestAsk - ref.mid : null;
+    const metaNow = this.wallet.getDiscoveredMeta();
+    this.anchorLogStructured("ANCHOR_ENTRY", {
+      side: sig.side,
+      expectedMid: ref.mid,
+      bestBid: ref.bestBid,
+      bestAsk: ref.bestAsk,
+      spread: ref.spread,
+      slippageEstimateVsMid: slipEst,
+      anchorTokenPrice: sig.anchorPrice,
+      imbalanceScore: sig.imbalanceScore,
+      chainlinkMom: sig.chainlinkMom,
+      windowKey: this.getAnchorWindowKey(),
+      marketSlug: metaNow?.slug ?? null
+    });
+
+    const result = await this.trade(sig.side!, cfg.tradeSize, "AUTO", `ANCHOR: ${sig.reason}`);
+    if (result.accepted) {
+      this.anchorTradedThisWindow = true;
+    }
+  }
+
+  private async monitorAnchorExits(): Promise<void> {
+    const cfg = loadAnchorConfigFromEnv();
+    if (!cfg.enabled || !this.anchorRuntimeEnabled) return;
+    const pending = this.trades.filter(
+      (t) => t.status === "PENDING" && String(t.decisionReason ?? "").includes("ANCHOR:")
+    );
+    if (pending.length === 0) return;
+
+    const snap = await this.buildAnchorOrderBookSnapshot();
+    if (!snap) return;
+    const upImb = snap.bidDepthUp / (snap.bidDepthUp + snap.askDepthUp + 1e-12);
+    const downImb = snap.bidDepthDown / (snap.bidDepthDown + snap.askDepthDown + 1e-12);
+    const hist = getChainlinkPriceHistoryBuffer().snapshot();
+    let mom = 0;
+    if (hist.length >= 4) {
+      const now = hist[hist.length - 1]!;
+      const ago = hist[hist.length - 4]!;
+      if (Number.isFinite(now) && Number.isFinite(ago) && ago > 0) mom = (now - ago) / ago;
+    }
+
+    const meta = this.wallet.getDiscoveredMeta();
+    const endMs = meta?.endDateIso ? new Date(meta.endDateIso).getTime() : NaN;
+    const secs = !Number.isNaN(endMs) ? Math.floor((endMs - Date.now()) / 1000) : null;
+
+    for (const t of pending) {
+      const idx = this.trades.findIndex((x) => x.id === t.id);
+      if (idx < 0) continue;
+      let exitCategory: "RESOLUTION_BUFFER" | "IMBALANCE_FLIP" | "MOMENTUM_REVERSAL" | null = null;
+      let why = "";
+      if (secs != null && secs <= cfg.exitBufferSeconds) {
+        exitCategory = "RESOLUTION_BUFFER";
+        why = `resolution buffer (${secs}s <= ${cfg.exitBufferSeconds}s)`;
+      } else if (t.direction === "UP" && upImb < 0.5) {
+        exitCategory = "IMBALANCE_FLIP";
+        why = "imbalance flip (UP book bid share < 0.5)";
+      } else if (t.direction === "DOWN" && downImb > 0.5) {
+        exitCategory = "IMBALANCE_FLIP";
+        why = "imbalance flip (DOWN book bid share > 0.5)";
+      } else if (t.direction === "UP" && anchorShouldExitUpOnMomentum(mom, cfg)) {
+        exitCategory = "MOMENTUM_REVERSAL";
+        why = `Chainlink momentum reversed (${mom.toFixed(6)})`;
+      } else if (t.direction === "DOWN" && anchorShouldExitDownOnMomentum(mom, cfg.chainlinkMomThreshold)) {
+        exitCategory = "MOMENTUM_REVERSAL";
+        why = `Chainlink momentum reversed (${mom.toFixed(6)})`;
+      }
+      if (!exitCategory) continue;
+      this.anchorLogStructured("ANCHOR_EXIT", {
+        category: exitCategory,
+        tradeId: t.id.slice(0, 8),
+        direction: t.direction,
+        reason: why,
+        secondsToExpiry: secs,
+        chainlinkMom: mom,
+        upBidDepthShare: upImb,
+        downBidDepthShare: downImb,
+        entryPrice: t.price,
+        note: "pnl not realized until exit fill confirms"
+      });
+      if (this.wallet.getMode() === "SIMULATION" && t.paper?.entryShares && t.paper?.tokenId) {
+        await this.finalizePaperTradeExit(idx);
+      } else if (this.wallet.getMode() === "LIVE") {
+        const tid =
+          t.direction === "UP"
+            ? this.directionalContext?.up.tokenID
+            : this.directionalContext?.down.tokenID;
+        const sh =
+          t.paper?.entryShares ??
+          (t.price > 1e-9 ? t.amount / t.price : 0);
+        if (tid && sh > 0) {
+          const r = await this.wallet.postMarketSellShares(tid, sh);
+          if (r?.orderID) {
+            this.log("TRADE", `ANCHOR_EXIT LIVE market SELL posted ${r.orderID.slice(0, 12)}…`);
+          }
+        }
+      }
     }
   }
 

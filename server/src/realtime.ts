@@ -238,3 +238,38 @@ export function getRtdsManager(): RtdsManager {
   if (!rtdsSingleton) rtdsSingleton = new RtdsManager();
   return rtdsSingleton;
 }
+
+/** Rolling Chainlink (or oracle) USD samples for Anchor Strategy momentum (max 10, ~5s cadence from engine). */
+export class ChainlinkPriceHistoryBuffer {
+  private readonly prices: number[] = [];
+  private readonly timestampsMs: number[] = [];
+  constructor(readonly maxLen = 10) {}
+  /** Push a sample; `tsMs` defaults to `Date.now()` for freshness checks vs ANCHOR_MAX_ORACLE_AGE_MS. */
+  push(price: number, tsMs?: number): void {
+    if (!Number.isFinite(price) || price <= 0) return;
+    const t = tsMs ?? Date.now();
+    this.prices.push(price);
+    this.timestampsMs.push(t);
+    while (this.prices.length > this.maxLen) {
+      this.prices.shift();
+      this.timestampsMs.shift();
+    }
+  }
+  snapshot(): number[] {
+    return [...this.prices];
+  }
+  snapshotTimestampsMs(): number[] {
+    return [...this.timestampsMs];
+  }
+  clear(): void {
+    this.prices.length = 0;
+    this.timestampsMs.length = 0;
+  }
+}
+
+let chainlinkHistSingleton: ChainlinkPriceHistoryBuffer | null = null;
+
+export function getChainlinkPriceHistoryBuffer(): ChainlinkPriceHistoryBuffer {
+  if (!chainlinkHistSingleton) chainlinkHistSingleton = new ChainlinkPriceHistoryBuffer(10);
+  return chainlinkHistSingleton;
+}

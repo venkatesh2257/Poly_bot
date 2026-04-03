@@ -366,6 +366,7 @@ export function App() {
   const [modeToggleLoading, setModeToggleLoading] = useState(false);
   const [tradingState, setTradingState] = useState<TradingState | null>(null);
   const [assetAutoTradeBusy, setAssetAutoTradeBusy] = useState<string | null>(null);
+  const [anchorBusy, setAnchorBusy] = useState(false);
   const [metaMaskOrderBusy, setMetaMaskOrderBusy] = useState(false);
   const [metaMaskConnected, setMetaMaskConnected] = useState(false);
   const [metaMaskAddress, setMetaMaskAddress] = useState<string | null>(null);
@@ -2024,7 +2025,24 @@ export function App() {
       <main className="mx-auto w-full max-w-[1800px] flex-1 space-y-4 overflow-y-auto p-4 sm:p-5">
         {snipeRoute === "dashboard" && (
           <>
-            <StrategyModulesStrip onOpenStrategies={() => setSnipeRoute("strategies")} />
+            <StrategyModulesStrip
+              onOpenStrategies={() => setSnipeRoute("strategies")}
+              anchor={tradingState?.anchorStrategy}
+              anchorBusy={anchorBusy}
+              onAnchorToggle={(enabled) => {
+                if (!isLoggedIn) {
+                  openLoginModal("Sign in to toggle Anchor Strategy.");
+                  return;
+                }
+                setAnchorBusy(true);
+                void api
+                  .setAnchorStrategy(enabled)
+                  .then(() => api.tradingState())
+                  .then(setTradingState)
+                  .catch((e) => pushLog("ERROR", e instanceof Error ? e.message : String(e)))
+                  .finally(() => setAnchorBusy(false));
+              }}
+            />
             <OverviewSubNav value={overviewSub} onChange={setOverviewSub} />
             {overviewSub === "configuration" ? (
               <div className="card border-copy-border/40">
@@ -2686,7 +2704,24 @@ export function App() {
 
         {snipeRoute === "strategies" && (
           <>
-            <StrategyModulesStrip onOpenStrategies={() => setSnipeRoute("strategies")} />
+            <StrategyModulesStrip
+              onOpenStrategies={() => setSnipeRoute("strategies")}
+              anchor={tradingState?.anchorStrategy}
+              anchorBusy={anchorBusy}
+              onAnchorToggle={(enabled) => {
+                if (!isLoggedIn) {
+                  openLoginModal("Sign in to toggle Anchor Strategy.");
+                  return;
+                }
+                setAnchorBusy(true);
+                void api
+                  .setAnchorStrategy(enabled)
+                  .then(() => api.tradingState())
+                  .then(setTradingState)
+                  .catch((e) => pushLog("ERROR", e instanceof Error ? e.message : String(e)))
+                  .finally(() => setAnchorBusy(false));
+              }}
+            />
             <div className="card border-copy-border/40 p-6">
               <StrategyConfigScreen
                 botRunning={Boolean(status?.running)}

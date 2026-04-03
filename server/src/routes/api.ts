@@ -27,6 +27,7 @@ function shouldInspectApiPath(path: string, method: string): boolean {
         "/risk-settings",
         "/risk-settings/persist-env",
         "/entry-strategy",
+        "/anchor-strategy",
         "/lag-snipe",
         "/spot-poly-lag",
         "/asset-auto-trade",
@@ -284,6 +285,16 @@ export function createApiRouter(
     const out = engine.setEntryStrategy({ reset, strategy });
     if (!out.ok) return res.status(400).json(out);
     return res.json(out);
+  });
+
+  router.post("/anchor-strategy", (req, res) => {
+    try {
+      const enabled = Boolean((req.body as { enabled?: boolean })?.enabled);
+      const r = engine.setAnchorStrategyEnabled(enabled);
+      res.json({ ok: true as const, anchorStrategy: r.anchorStrategy });
+    } catch (e) {
+      res.status(400).json({ error: e instanceof Error ? e.message : String(e) });
+    }
   });
 
   router.post("/lag-snipe", (req, res) => {

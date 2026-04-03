@@ -1,7 +1,7 @@
 import type { ReactNode } from "react";
 import { useEffect, useState } from "react";
 import { BRAND_LOGO_SRC } from "./branding";
-import type { RiskSettingsSnapshot } from "./types";
+import type { AnchorStrategySnapshot, RiskSettingsSnapshot } from "./types";
 import type { SnipeRoute } from "./snipeUi";
 
 export type OverviewSubTab = "live" | "configuration" | "stats" | "faq";
@@ -248,36 +248,131 @@ export function CopyProMainNav(props: { route: SnipeRoute; onRoute: (r: SnipeRou
   );
 }
 
-export function StrategyModulesStrip(props: { onOpenStrategies?: () => void }) {
+export function StrategyModulesStrip(props: {
+  onOpenStrategies?: () => void;
+  anchor?: AnchorStrategySnapshot | null;
+  onAnchorToggle?: (enabled: boolean) => void;
+  anchorBusy?: boolean;
+}) {
+  const a = props.anchor;
+  const n = a?.stabilityTicks ?? 3;
+  const rec = a?.ticksRecorded ?? 0;
+  const shown = Math.min(rec, n);
+  const stableProg = n > 0 ? shown / n : 0;
+  const imb = a?.lastSignal?.imbalanceScore;
+  const imbPill =
+    imb == null || !Number.isFinite(imb) ? (
+      <span className="rounded px-1.5 py-0.5 font-mono text-slate-500">—</span>
+    ) : imb > 0.7 ? (
+      <span className="rounded bg-emerald-500/20 px-1.5 py-0.5 font-mono text-emerald-300">{imb.toFixed(2)}</span>
+    ) : imb < 0.3 ? (
+      <span className="rounded bg-rose-500/20 px-1.5 py-0.5 font-mono text-rose-300">{imb.toFixed(2)}</span>
+    ) : (
+      <span className="rounded bg-slate-600/40 px-1.5 py-0.5 font-mono text-slate-300">{imb.toFixed(2)}</span>
+    );
+  const mom = a?.lastSignal?.chainlinkMom;
+  const momPct = mom != null && Number.isFinite(mom) ? mom * 100 : null;
+
   return (
-    <div className="flex flex-wrap items-center justify-between gap-3 border-b border-copy-border/30 bg-[#080808] px-4 py-2.5 sm:px-6">
-      <div className="flex flex-wrap items-center gap-2">
-        <span className="text-[10px] font-bold uppercase tracking-wider text-slate-500">Strategy modules</span>
-        <button
-          type="button"
-          disabled
-          className="rounded-lg border border-slate-800 px-3 py-1 text-xs text-slate-600"
-          title="Not included in this build"
-        >
-          Copy trading
-        </button>
-        <button
-          type="button"
-          onClick={() => props.onOpenStrategies?.()}
-          className="rounded-lg border border-copy-green/50 bg-copy-green/10 px-3 py-1 text-xs font-bold text-copy-green transition hover:bg-copy-green/20"
-        >
-          Crypto markets snipe
-        </button>
-        <button
-          type="button"
-          disabled
-          className="cursor-not-allowed rounded-lg border border-slate-800 px-3 py-1 text-xs text-slate-600"
-        >
-          Crypto fun (beta)
-        </button>
+    <div className="flex flex-col gap-3 border-b border-copy-border/30 bg-[#080808] px-4 py-2.5 sm:px-6">
+      <div className="flex flex-wrap items-center justify-between gap-3">
+        <div className="flex flex-wrap items-center gap-2">
+          <span className="text-[10px] font-bold uppercase tracking-wider text-slate-500">Strategy modules</span>
+          <button
+            type="button"
+            disabled
+            className="rounded-lg border border-slate-800 px-3 py-1 text-xs text-slate-600"
+            title="Not included in this build"
+          >
+            Copy trading
+          </button>
+          <button
+            type="button"
+            onClick={() => props.onOpenStrategies?.()}
+            className="rounded-lg border border-copy-green/50 bg-copy-green/10 px-3 py-1 text-xs font-bold text-copy-green transition hover:bg-copy-green/20"
+          >
+            Crypto markets snipe
+          </button>
+          <button
+            type="button"
+            disabled
+            className="cursor-not-allowed rounded-lg border border-slate-800 px-3 py-1 text-xs text-slate-600"
+          >
+            Crypto fun (beta)
+          </button>
+        </div>
+        <div className="flex items-center gap-2 text-[10px] text-slate-500">
+          <span className="rounded border border-slate-800 px-2 py-1">Auto claim: server only</span>
+        </div>
       </div>
-      <div className="flex items-center gap-2 text-[10px] text-slate-500">
-        <span className="rounded border border-slate-800 px-2 py-1">Auto claim: server only</span>
+
+      <div className="flex flex-wrap items-stretch gap-3 rounded-xl border border-amber-700/35 bg-amber-950/25 px-3 py-2.5">
+        <div className="flex min-w-[120px] flex-col gap-0.5">
+          <span className="text-[10px] font-bold uppercase tracking-wide text-amber-200/90">Anchor</span>
+          <span className="inline-flex w-fit items-center rounded-md bg-amber-500/25 px-2 py-0.5 text-[11px] font-bold text-amber-100">
+            ANCHOR
+          </span>
+        </div>
+        <div className="flex min-w-0 flex-1 flex-wrap items-center gap-x-4 gap-y-2 text-[11px] text-slate-300">
+          <div className="flex items-center gap-1.5">
+            <span className="text-slate-500">imbalance</span>
+            {imbPill}
+          </div>
+          <div className="flex min-w-[100px] flex-col gap-0.5">
+            <span className="text-[10px] text-slate-500">
+              Stability {shown}/{n} ticks
+            </span>
+            <div className="h-1.5 w-full max-w-[120px] overflow-hidden rounded-full bg-slate-800">
+              <div
+                className="h-full rounded-full bg-amber-400/80 transition-[width]"
+                style={{ width: `${stableProg * 100}%` }}
+              />
+            </div>
+          </div>
+          <div className="flex items-center gap-1">
+            <span className="text-slate-500">CL mom</span>
+            {momPct == null ? (
+              <span className="font-mono text-slate-500">—</span>
+            ) : (
+              <span
+                className={
+                  "inline-flex items-center gap-0.5 font-mono " +
+                  (momPct >= 0 ? "text-emerald-400" : "text-rose-400")
+                }
+              >
+                <span aria-hidden>{momPct >= 0 ? "↑" : "↓"}</span>
+                {momPct >= 0 ? "+" : ""}
+                {momPct.toFixed(3)}%
+              </span>
+            )}
+          </div>
+          <div>
+            <span className="text-slate-500">Anchor px </span>
+            <span className="font-mono text-slate-200">
+              {a?.lastSignal?.anchorPrice != null ? a.lastSignal.anchorPrice.toFixed(3) : "—"}
+            </span>
+          </div>
+        </div>
+        <div className="flex flex-col items-end justify-center gap-1 border-t border-amber-800/30 pt-2 sm:border-t-0 sm:pt-0">
+          <span className="text-[10px] text-slate-500">
+            Env {a?.envEnabled ? "on" : "off"} · Runtime {a?.runtimeEnabled ? "on" : "off"}
+          </span>
+          <label className="flex cursor-pointer items-center gap-2 text-[11px] text-amber-100/95">
+            <input
+              type="checkbox"
+              className="rounded border-amber-600/60 bg-slate-900 text-amber-500 focus:ring-amber-500"
+              checked={Boolean(a?.runtimeEnabled)}
+              disabled={props.anchorBusy || a?.envEnabled === false}
+              title={
+                a?.envEnabled === false
+                  ? "Enable ANCHOR_STRATEGY_ENABLED in server/.env first"
+                  : "Toggle Anchor Strategy runtime without restart"
+              }
+              onChange={(e) => props.onAnchorToggle?.(e.target.checked)}
+            />
+            Live toggle
+          </label>
+        </div>
       </div>
     </div>
   );

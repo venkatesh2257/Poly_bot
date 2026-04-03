@@ -194,6 +194,25 @@ export interface TradingState {
   liveEngine?: LiveEngineSnapshot;
   /** Mirrors WS `prediction` for REST clients (newer servers). */
   predictionLive?: Pick<Prediction, "prediction" | "confidence" | "ts" | "recommendation" | "reason">;
+  anchorStrategy?: AnchorStrategySnapshot;
+}
+
+export interface AnchorStrategySnapshot {
+  envEnabled: boolean;
+  runtimeEnabled: boolean;
+  effectiveEnabled: boolean;
+  stabilityTicks: number;
+  ticksRecorded: number;
+  lastSignal: {
+    shouldTrade: boolean;
+    side: "UP" | "DOWN" | null;
+    imbalanceScore: number;
+    stabilityMet: boolean;
+    chainlinkMom: number;
+    anchorPrice: number;
+    reason: string;
+    skipCategory?: string;
+  } | null;
 }
 
 export interface LiveEngineSnapshot {

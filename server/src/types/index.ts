@@ -249,6 +249,27 @@ export interface TradingState {
   liveEngine: LiveEngineSnapshot;
   /** Same payload as WS `prediction` — REST parity when socket is slow or disconnected. */
   predictionLive: Pick<Prediction, "prediction" | "confidence" | "ts" | "recommendation" | "reason">;
+  /** Anchor Strategy: book + Chainlink snapshot for dashboard (optional on older servers). */
+  anchorStrategy?: AnchorStrategySnapshot;
+}
+
+/** Polymarket Anchor Strategy — bid dominance + Chainlink momentum (server-driven). */
+export interface AnchorStrategySnapshot {
+  envEnabled: boolean;
+  runtimeEnabled: boolean;
+  effectiveEnabled: boolean;
+  stabilityTicks: number;
+  ticksRecorded: number;
+  lastSignal: {
+    shouldTrade: boolean;
+    side: "UP" | "DOWN" | null;
+    imbalanceScore: number;
+    stabilityMet: boolean;
+    chainlinkMom: number;
+    anchorPrice: number;
+    reason: string;
+    skipCategory?: string;
+  } | null;
 }
 
 /** Feed-aligned status (books, discovery, RTDS) bundled for dashboard polling. */
