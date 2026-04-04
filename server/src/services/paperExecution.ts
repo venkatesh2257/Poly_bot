@@ -1,6 +1,9 @@
 /**
  * Paper execution: same live CLOB order books, virtual fills (book walk, latency, limit timeout, fees, no-fill).
  * Live mode must not import this for order routing — engine gates on SIMULATION only.
+ *
+ * Default fill behavior is optimistic for paper: unless `PAPER_AGGRESSIVE_CROSS=false`, BUY simulation lifts the
+ * walk limit to at least best ask + `PAPER_ENTRY_ASK_CROSS_BUFFER` (aggressive cross). See `paperExecutionMode()`.
  */
 
 function sleep(ms: number): Promise<void> {
@@ -22,6 +25,11 @@ function paperAggressiveCross(): boolean {
   if (v == null || v === "") return true;
   const s = String(v).toLowerCase();
   return s !== "false" && s !== "0" && s !== "no";
+}
+
+/** Dashboard/debug: current paper BUY crossing mode (default is aggressive-cross). */
+export function paperExecutionMode(): "aggressive-cross" | "strict-limit" {
+  return paperAggressiveCross() ? "aggressive-cross" : "strict-limit";
 }
 
 export interface NormalizedLevel {

@@ -224,6 +224,7 @@ function parseEnvEntryStrategy(): EntryStrategyKind {
   if (s === "whale_edge" || s === "whale" || s === "edge") return "whale_edge";
   if (s === "ensemble" || s === "all" || s === "combined") return "ensemble";
   if (s === "ola" || s === "latency" || s === "oracle_latency") return "ola";
+  if (s === "anchor" || s === "book_imbalance") return "anchor";
   return "momentum";
 }
 
@@ -238,6 +239,7 @@ function parseDashboardEntryStrategyId(raw: unknown): DashboardEntryStrategyId |
   if (s === "whale_edge" || s === "whale" || s === "edge") return "whale_edge";
   if (s === "ensemble" || s === "all" || s === "combined") return "ensemble";
   if (s === "ola" || s === "latency" || s === "oracle_latency") return "ola";
+  if (s === "anchor" || s === "book_imbalance") return "anchor";
   return null;
 }
 
@@ -987,6 +989,8 @@ export class TradingEngine {
         return "Ensemble (momentum+book+MR+chart+mid-flip+LSC+reversal)";
       case "ola":
         return "OLA — Binance vs price-to-beat + CLOB discount snipe";
+      case "anchor":
+        return "Anchor (book+Chainlink)";
       case "contrarian":
         return "Contrarian (.env)";
       default:
@@ -1024,7 +1028,8 @@ export class TradingEngine {
       if (!id) {
         return {
           ok: false,
-          reason: "strategy must be momentum, orderbook, mean_revert, chart, whale_edge, ensemble, or ola"
+          reason:
+            "strategy must be momentum, spot_poly_lag, orderbook, mean_revert, chart, whale_edge, ensemble, ola, or anchor"
         };
       }
       this.entryStrategyRuntime = id;
@@ -1037,6 +1042,22 @@ export class TradingEngine {
       return { ok: true, entryStrategy: this.getEntryStrategyState() };
     }
     return { ok: true, entryStrategy: this.getEntryStrategyState() };
+  }
+
+  private anchorFallbackEnabled(): boolean {
+    return String(process.env.ANCHOR_ALLOW_FALLBACK ?? "false").toLowerCase() === "true";
+  }
+
+  private anchorFastLaneEnabled(): boolean {
+    return String(process.env.ANCHOR_FAST_LANE ?? "false").toLowerCase() === "true";
+  }
+
+  /** Non–anchor strategy path only: optional rescue when `ANCHOR_ALLOW_FALLBACK=true`. */
+  private async runAnchorFallbackNonPrimary(): Promise<void> {
+    if (!this.anchorFallbackEnabled()) return;
+    const asset = this.wallet.getActiveDiscoveredAsset() ?? "?";
+    this.log("SIGNAL", `[ANCHOR][FALLBACK] asset=${asset} trigger=non_anchor_skip`);
+    await this.maybeRunAnchorStrategy();
   }
 
   /**
@@ -1240,7 +1261,7 @@ export class TradingEngine {
     return { prediction: direction, confidence, ts };
   }
 
-  private basePredict() {
+  private basePredict(): { prediction: Direction; confidence: number; ts: number } {
     if (this.lagSnipeEnabled) {
       const ev = this.evaluateLagSnipeDisplay();
       return { prediction: ev.prediction, confidence: ev.confidence, ts: Date.now() };
@@ -1249,6 +1270,21 @@ export class TradingEngine {
     if (strat === "ola") {
       const c = this.getOlaSignalCore();
       return { prediction: c.prediction, confidence: c.confidence, ts: Date.now() };
+    }
+    if (strat === "anchor") {
+      const side = this.lastAnchorSignal?.side;
+      if (side === "UP" || side === "DOWN") {
+        return { prediction: side, confidence: 94, ts: Date.now() };
+      }
+      if (this.directionalContext) {
+        const { up, down } = this.directionalContext;
+        const direction: Direction = up.mid >= down.mid ? "UP" : "DOWN";
+        const edge = Math.abs(up.mid - down.mid);
+        const confidenceBase = 90 + Math.min(6, edge * 40);
+        const confidence = Math.min(100, Number((confidenceBase + Math.random() * 2).toFixed(2)));
+        return { prediction: direction, confidence, ts: Date.now() };
+      }
+      return { prediction: "UP", confidence: 88, ts: Date.now() };
     }
     if (strat === "ensemble") {
       const r = this.buildEnsembleResult();
@@ -1495,7 +1531,7 @@ export class TradingEngine {
       };
     }
 
-    if (strat === "ola") {
+    if (strat === "ola" || strat === "anchor") {
       return { ok: true };
     }
 
@@ -1719,6 +1755,51 @@ export class TradingEngine {
         this.onPrediction?.(this.prediction);
       }
 
+      if (recommendation === "NO_TRADE" && fromTimer) this.noTradeSignals += 1;
+      if (fromTimer && !signalUnchanged) {
+        this.log(
+          "SIGNAL",
+          `${this.prediction.prediction} ${this.prediction.confidence}% (${this.prediction.recommendation})`
+        );
+      }
+      return;
+    }
+
+    if (es === "anchor") {
+      const base = this.basePredict();
+      let recommendation: "TRADE" | "NO_TRADE" = "TRADE";
+      let reason = `Anchor (book+Chainlink): tilt ${base.prediction} (${base.confidence.toFixed(0)}%)`;
+      if (this.wallet.hasLiveMarketData() && this.directionalContext) {
+        const upT = this.liveBookTradability(this.directionalContext.up);
+        const downT = this.liveBookTradability(this.directionalContext.down);
+        if (!upT.ok && !downT.ok) {
+          recommendation = "NO_TRADE";
+          reason = `Live books not tradable (both sides): UP — ${upT.detail}; DOWN — ${downT.detail}`;
+        }
+      }
+      const next: Prediction = { ...base, recommendation, reason };
+      let nextPhase: BotPhase;
+      let nextPhaseReason: string;
+      if (recommendation === "NO_TRADE" && reason.includes("Live books not tradable")) {
+        nextPhase = "MARKET_NOT_TRADABLE";
+        nextPhaseReason = reason;
+      } else if (recommendation === "TRADE") {
+        nextPhase = "SIGNAL_READY";
+        nextPhaseReason = `Signal: ${base.prediction} (${base.confidence.toFixed(0)}%)`;
+      } else {
+        nextPhase = "SIGNAL_READY";
+        nextPhaseReason = reason;
+      }
+      const predKey = `${next.prediction}|${next.recommendation}|${next.reason}|${Math.round(next.confidence)}`;
+      const phaseKey = `${nextPhase}|${nextPhaseReason}`;
+      const signalUnchanged = predKey === this.lastBroadcastPredKey && phaseKey === this.lastBroadcastPhaseKey;
+      this.prediction = next;
+      if (!signalUnchanged) {
+        this.lastBroadcastPredKey = predKey;
+        this.lastBroadcastPhaseKey = phaseKey;
+        this.setPhase(nextPhase, nextPhaseReason);
+        this.onPrediction?.(this.prediction);
+      }
       if (recommendation === "NO_TRADE" && fromTimer) this.noTradeSignals += 1;
       if (fromTimer && !signalUnchanged) {
         this.log(
@@ -2407,11 +2488,15 @@ export class TradingEngine {
   private async runAutoTradeOnce(olaFastLane: boolean) {
     if (!this.running || !this.autoTrading) return;
     if (this.olaKillTriggered) return;
-    const isOla = this.effectiveEntryStrategy() === "ola";
+    const strategy = this.effectiveEntryStrategy();
+    const isOla = strategy === "ola";
+    const isAnchor = strategy === "anchor";
+    const allowAnchorFastLane = isAnchor && this.anchorFastLaneEnabled();
     if (this.lagSnipeEnabled) {
       if (olaFastLane) return;
-    } else if (olaFastLane !== isOla) {
-      return;
+    } else {
+      if (olaFastLane && !isOla && !allowAnchorFastLane) return;
+      if (!olaFastLane && (isOla || allowAnchorFastLane)) return;
     }
     if (this.bookRefreshInFlight) return;
     this.maybeLogRuntimeHealth();
@@ -2442,6 +2527,22 @@ export class TradingEngine {
         return;
       }
 
+      if (isAnchor) {
+        this.maybeRotateAnchorWindow();
+        await this.recordAnchorBuffers();
+        if (!olaFastLane) {
+          await this.monitorAnchorExits();
+        }
+        const asset = this.wallet.getActiveDiscoveredAsset() ?? "?";
+        const wk = this.getAnchorWindowKey() ?? "?";
+        this.log(
+          "SIGNAL",
+          `[ANCHOR][PRIMARY] asset=${asset} window=${wk} runtimeEnabled=${this.anchorRuntimeEnabled} selected=true`
+        );
+        await this.maybeRunAnchorStrategy();
+        return;
+      }
+
       if (
         this.wallet.getMode() === "SIMULATION" &&
         paperBinarySettleEnabled() &&
@@ -2460,7 +2561,7 @@ export class TradingEngine {
                 "SIGNAL",
                 `[AUTO][SKIP] ORACLE_TOO_CLOSE asset=${asset} ms_to_window_end=${Math.round(msLeft)} min_required_ms=${minLeftMs}`
               );
-              await this.maybeRunAnchorStrategy();
+              await this.runAnchorFallbackNonPrimary();
               return;
             }
           }
@@ -2477,7 +2578,7 @@ export class TradingEngine {
             "SIGNAL",
             `[AUTO][SKIP] ORACLE_STALE asset=${assetGate} ageMs=${ageDisp} max_ms=${maxOracleAge}`
           );
-          await this.maybeRunAnchorStrategy();
+          await this.runAnchorFallbackNonPrimary();
           return;
         }
       }
@@ -2494,7 +2595,7 @@ export class TradingEngine {
                 "SIGNAL",
                 `[AUTO][SKIP] LATE_WINDOW asset=${assetGate} ms_to_window_end=${Math.round(msLeftLw)} min_remaining_ms=${minRemMs}`
               );
-              await this.maybeRunAnchorStrategy();
+              await this.runAnchorFallbackNonPrimary();
               return;
             }
           }
@@ -2528,7 +2629,7 @@ export class TradingEngine {
         !this.canIgnoreNoTradeForBookOnlyBlock("AUTO")
       ) {
         this.log("SIGNAL", `Auto-trade skipped (${this.prediction.reason ?? "direction mismatch"})`);
-        await this.maybeRunAnchorStrategy();
+        await this.runAnchorFallbackNonPrimary();
         return;
       }
       if (!isOla && !this.lagSnipeEnabled) {
@@ -2538,7 +2639,7 @@ export class TradingEngine {
             "SIGNAL",
             `[AUTO][SKIP] ORACLE_TREND_INSUFFICIENT asset=${assetGate} samples=${ot.samples} min_samples=${ot.min}`
           );
-          await this.maybeRunAnchorStrategy();
+          await this.runAnchorFallbackNonPrimary();
           return;
         }
         if (ot.kind === "stale") {
@@ -2547,7 +2648,7 @@ export class TradingEngine {
             "SIGNAL",
             `[AUTO][SKIP] ORACLE_TREND_STALE asset=${assetGate} ageMs=${ageDisp} max_ms=${ot.max}`
           );
-          await this.maybeRunAnchorStrategy();
+          await this.runAnchorFallbackNonPrimary();
           return;
         }
         const oracleTrend = ot.trend;
@@ -2557,7 +2658,7 @@ export class TradingEngine {
             "SIGNAL",
             `[AUTO][SKIP] ORACLE_TREND_MISMATCH asset=${assetGate} momentum=${momentumSide} oracle_trend=${oracleTrend}`
           );
-          await this.maybeRunAnchorStrategy();
+          await this.runAnchorFallbackNonPrimary();
           return;
         }
         if (direction !== oracleTrend) {
@@ -2565,14 +2666,14 @@ export class TradingEngine {
             "SIGNAL",
             `[AUTO][SKIP] DIRECTION_MISMATCH asset=${assetGate} dir=${direction} oracle_trend=${oracleTrend}`
           );
-          await this.maybeRunAnchorStrategy();
+          await this.runAnchorFallbackNonPrimary();
           return;
         }
       }
       const whaleGate = this.whaleEdgeGateOrOk(direction);
       if (!whaleGate.ok) {
         this.log("SIGNAL", whaleGate.reason);
-        await this.maybeRunAnchorStrategy();
+        await this.runAnchorFallbackNonPrimary();
         return;
       }
       const { amount: riskAmount, budget } = await this.computeAutoTradeAmount();
@@ -2593,7 +2694,7 @@ export class TradingEngine {
             )}; reserved ${reserved.toFixed(6)})`
           );
         }
-        await this.maybeRunAnchorStrategy();
+        await this.runAnchorFallbackNonPrimary();
         return;
       }
       if (this.wallet.getMode() === "LIVE" && riskAmount > 1 + 1e-9) {
@@ -2603,16 +2704,17 @@ export class TradingEngine {
             "SIGNAL",
             `[AUTO][SKIP] LIVE_MAX_ENTRY_USD_1 size_usd=${riskAmount.toFixed(2)} (set LIVE_TRADE_ABOVE_1_USD_OK=true to allow larger LIVE auto-entries)`
           );
-          await this.maybeRunAnchorStrategy();
+          await this.runAnchorFallbackNonPrimary();
           return;
         }
       }
       const result = await this.trade(direction, riskAmount, "AUTO", choice.reason);
       if (!result.accepted) {
         this.log("ERROR", `Auto-trade blocked: ${result.reason ?? "unknown"}`);
-        await this.maybeRunAnchorStrategy();
+        await this.runAnchorFallbackNonPrimary();
       } else {
         this.anchorTradedThisWindow = true;
+        return;
       }
     } catch (e) {
       this.log("ERROR", `Auto-trade tick: ${e instanceof Error ? e.message : String(e)}`);
@@ -2695,10 +2797,13 @@ export class TradingEngine {
   private buildAnchorStrategySnapshotPayload(): AnchorStrategySnapshot {
     const cfg = loadAnchorConfigFromEnv();
     const last = this.lastAnchorSignal;
+    const selectedAsEntry = this.effectiveEntryStrategy() === "anchor";
     return {
       envEnabled: cfg.enabled,
       runtimeEnabled: this.anchorRuntimeEnabled,
-      effectiveEnabled: cfg.enabled && this.anchorRuntimeEnabled,
+      effectiveEnabled: cfg.enabled && this.anchorRuntimeEnabled && selectedAsEntry,
+      selectedAsEntryStrategy: selectedAsEntry,
+      fallbackEnabled: this.anchorFallbackEnabled(),
       stabilityTicks: cfg.stabilityTicks,
       ticksRecorded: this.anchorImbalanceHistoryUp.length,
       lastSignal: last
@@ -3028,6 +3133,13 @@ export class TradingEngine {
         ts: Date.now(),
         recommendation: "TRADE",
         reason: "OLA: Binance + price-to-beat (no momentum blend)"
+      };
+    } else if (this.effectiveEntryStrategy() === "anchor") {
+      const b = this.basePredict();
+      this.prediction = {
+        ...b,
+        recommendation: "TRADE",
+        reason: "Anchor (book+Chainlink) warm start"
       };
     } else {
       this.prediction = { ...this.basePredict(), recommendation: "TRADE", reason: "Warm start" };
@@ -3602,7 +3714,9 @@ export class TradingEngine {
     book: MarketContext
   ): { ok: true } | { ok: false; code: string; detail: string } {
     if (this.lagSnipeEnabled) return { ok: true };
-    if (this.effectiveEntryStrategy() === "ola") return { ok: true };
+    if (this.effectiveEntryStrategy() === "ola" || this.effectiveEntryStrategy() === "anchor") {
+      return { ok: true };
+    }
     const c = this.prediction.confidence;
     const conf01 = c > 1 ? c / 100 : c;
 
@@ -3873,6 +3987,11 @@ export class TradingEngine {
   async trade(direction: Direction, amount: number, source: "MANUAL" | "AUTO" = "MANUAL", decisionReason?: string) {
     if (!this.running) return { accepted: false, reason: "Engine is stopped" };
     const strat = this.effectiveEntryStrategy();
+    const anchorAutoAnchorPath =
+      strat === "anchor" &&
+      source === "AUTO" &&
+      typeof decisionReason === "string" &&
+      decisionReason.startsWith("ANCHOR:");
     const botCfg = loadBotFiltersConfig();
     if (this.stopLossTriggered) {
       this.setPhase("ERROR", "Stop loss triggered");
@@ -3921,6 +4040,7 @@ export class TradingEngine {
 
     const minConfPct = Number(process.env.MIN_SIGNAL_CONF_PCT ?? 75);
     if (
+      !anchorAutoAnchorPath &&
       !this.lagSnipeEnabled &&
       source === "AUTO" &&
       Number.isFinite(minConfPct) &&
@@ -3940,6 +4060,7 @@ export class TradingEngine {
 
     if (
       strat !== "ola" &&
+      !anchorAutoAnchorPath &&
       !this.lagSnipeEnabled &&
       this.prediction.recommendation === "NO_TRADE" &&
       !this.canIgnoreNoTradeForBookOnlyBlock(source)
@@ -3955,7 +4076,7 @@ export class TradingEngine {
     }
 
     const book = this.liveBookForDirection(direction);
-    if (strat !== "ola" && !this.lagSnipeEnabled && signalModeHighConf()) {
+    if (strat !== "ola" && strat !== "anchor" && !this.lagSnipeEnabled && signalModeHighConf()) {
       const thr = highConfMidThreshold();
       const mid = book.mid;
       const c = this.prediction.confidence;

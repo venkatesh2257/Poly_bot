@@ -47,15 +47,19 @@ function localDateParts(ts: number) {
 }
 
 function strategyFromDecisionReason(reason?: string): string {
-  const s = String(reason ?? "").toUpperCase();
-  if (s.startsWith("LAG_SNIPE")) return "lag_snipe";
+  const s = String(reason ?? "").trim().toUpperCase();
+  if (!s) return "unknown";
+  if (s.startsWith("LAG_SNIPE") || s.startsWith("LAGSNIPE")) return "lag_snipe";
   if (s.startsWith("OLA")) return "ola";
+  if (s.startsWith("ANCHOR")) return "anchor";
+  if (s.startsWith("BOOKIMBALANCE")) return "anchor";
   if (s.startsWith("WHALE")) return "whale_edge";
   if (s.startsWith("ENSEMBLE")) return "ensemble";
   if (s.startsWith("ORDERBOOK")) return "orderbook";
-  if (s.startsWith("MEAN_REVERT")) return "mean_revert";
+  if (s.startsWith("MEAN_REVERT") || s.startsWith("MEANREVERT")) return "mean_revert";
   if (s.startsWith("CHART")) return "chart";
-  return "momentum";
+  if (s.startsWith("MOMENTUM")) return "momentum";
+  return "unknown";
 }
 
 function toProb(t: Trade): number | null {

@@ -156,7 +156,8 @@ export type EntryStrategyKind =
   | "chart"
   | "whale_edge"
   | "ensemble"
-  | "ola";
+  | "ola"
+  | "anchor";
 
 /** Dashboard-selectable strategies (API); contrarian also via ENTRY_STRATEGY in .env. */
 export type DashboardEntryStrategyId =
@@ -167,7 +168,8 @@ export type DashboardEntryStrategyId =
   | "chart"
   | "whale_edge"
   | "ensemble"
-  | "ola";
+  | "ola"
+  | "anchor";
 
 export interface EntryStrategyState {
   effective: EntryStrategyKind;
@@ -271,7 +273,12 @@ export interface TradingState {
 export interface AnchorStrategySnapshot {
   envEnabled: boolean;
   runtimeEnabled: boolean;
+  /** True only when Anchor is the selected entry strategy and env+runtime toggles allow it. */
   effectiveEnabled: boolean;
+  /** ENTRY_STRATEGY / dashboard override is `anchor`. */
+  selectedAsEntryStrategy: boolean;
+  /** `ANCHOR_ALLOW_FALLBACK=true`: Anchor may run after non-anchor auto path skips. */
+  fallbackEnabled: boolean;
   stabilityTicks: number;
   ticksRecorded: number;
   lastSignal: {

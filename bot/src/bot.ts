@@ -10,7 +10,7 @@ import { PriceEngine } from "./price-engine.js";
 import { findCurrentMarket, checkMarketOutcome, type MarketInfo } from "./market-engine.js";
 import { generateSignal, DEFAULT_CONFIG, type Signal, type SignalConfig } from "./signal-engine.js";
 import { ClobClient } from "@polymarket/clob-client";
-import { ethers } from "ethers";
+import { Contract, JsonRpcProvider, Wallet, ZeroHash, formatUnits } from "ethers";
 
 // ── Config ──────────────────────────────────────────────────
 const PROXY_URL = process.env.PROXY_URL || "https://polymarket-proxy-production.up.railway.app";
@@ -71,12 +71,12 @@ function categorizeLoss(trade: Trade): string {
 }
 
 // ── Wallet Helpers ──────────────────────────────────────────
-let provider: ethers.providers.Provider | null = null;
-let signer: ethers.Wallet | null = null;
+let provider: JsonRpcProvider | null = null;
+let signer: Wallet | null = null;
 
-function getProvider(): ethers.providers.Provider {
+function getProvider(): JsonRpcProvider {
   if (!provider) {
-    provider = new ethers.providers.StaticJsonRpcProvider(RPC_URL, { name: "polygon", chainId: 137 });
+    provider = new JsonRpcProvider(RPC_URL, 137);
   }
   return provider;
 }
@@ -84,32 +84,32 @@ function getProvider(): ethers.providers.Provider {
 async function getWalletBalance(): Promise<number> {
   try {
     const p = getProvider();
-    const usdc = new ethers.Contract(USDC_ADDRESS, ["function balanceOf(address) view returns (uint256)"], p);
+    const usdc = new Contract(USDC_ADDRESS, ["function balanceOf(address) view returns (uint256)"], p);
     const bal = await usdc.balanceOf(WALLET_ADDRESS);
-    return parseFloat(ethers.utils.formatUnits(bal, 6));
+    return parseFloat(formatUnits(bal, 6));
   } catch (e: any) {
     console.error("[wallet] Balance check failed:", e.message);
     return -1;
   }
 }
 
-async function getDynamicGas(): Promise<{ gasPrice: any }> {
-  const provider = signer!.provider! as any;
-  const gasPrice = await provider.getGasPrice();
-  const bumped = gasPrice.mul(130).div(100); // 30% above current
-  return { gasPrice: bumped };
+async function getDynamicGas(): Promise<{ gasPrice: bigint }> {
+  const prov = signer!.provider!;
+  const fee = await prov.getFeeData();
+  const gp = fee.gasPrice ?? 30n * 10n ** 9n;
+  return { gasPrice: (gp * 130n) / 100n };
 }
 
 async function redeemPosition(conditionId: string): Promise<boolean> {
   if (!signer) return false;
   try {
-    const ctf = new ethers.Contract(CTF_ADDRESS, [
+    const ctf = new Contract(CTF_ADDRESS, [
       "function redeemPositions(address collateralToken, bytes32 parentCollectionId, bytes32 conditionId, uint256[] indexSets) external"
     ], signer);
 
     const tx = await ctf.redeemPositions(
       USDC_ADDRESS,
-      ethers.constants.HashZero,
+      ZeroHash,
       conditionId,
       [1, 2],
       {
@@ -188,12 +188,12 @@ async function initClobClient() {
   }
   try {
     const p = getProvider();
-    signer = new ethers.Wallet(process.env.EVM_PRIVATE_KEY, p);
+    signer = new Wallet(process.env.EVM_PRIVATE_KEY, p);
     console.log(`[bot] Wallet: ${signer.address}`);
-    const client = new ClobClient(PROXY_URL, 137, signer);
+    const client = new ClobClient(PROXY_URL, 137, signer as any);
     const creds = await client.createOrDeriveApiKey();
     if ((creds as any).key && !(creds as any).apiKey) (creds as any).apiKey = (creds as any).key;
-    const authed = new ClobClient(PROXY_URL, 137, signer, creds, 0, signer.address);
+    const authed = new ClobClient(PROXY_URL, 137, signer as any, creds, 0, signer.address);
     console.log("[bot] CLOB client authenticated ✅");
     return authed;
   } catch (e: any) {

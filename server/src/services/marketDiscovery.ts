@@ -1,6 +1,6 @@
 /** Gamma API: active "{asset} Up or Down" 5m windows use slug `{asset}-updown-5m-{windowStartUnix}`. */
 
-export type UpDownAsset = "BTC" | "ETH" | "SOL" | "XRP" | "DOGE";
+export type UpDownAsset = "BTC" | "ETH" | "SOL" | "XRP";
 
 export interface ResolvedUpDownMarket {
   tokenIdUp: string;
@@ -37,7 +37,7 @@ function parseJsonStringArray(raw: unknown): string[] {
 
 function normalizeAsset(asset: string): UpDownAsset | null {
   const u = asset.trim().toUpperCase();
-  if (u === "BTC" || u === "ETH" || u === "SOL" || u === "XRP" || u === "DOGE") return u;
+  if (u === "BTC" || u === "ETH" || u === "SOL" || u === "XRP") return u;
   return null;
 }
 

@@ -118,7 +118,8 @@ export type DashboardEntryStrategyId =
   | "mean_revert"
   | "chart"
   | "whale_edge"
-  | "ola";
+  | "ola"
+  | "anchor";
 
 export type EntryStrategyKind =
   | "momentum"
@@ -128,7 +129,8 @@ export type EntryStrategyKind =
   | "chart"
   | "whale_edge"
   | "ensemble"
-  | "ola";
+  | "ola"
+  | "anchor";
 
 export interface EntryStrategyState {
   effective: EntryStrategyKind;
@@ -201,6 +203,8 @@ export interface AnchorStrategySnapshot {
   envEnabled: boolean;
   runtimeEnabled: boolean;
   effectiveEnabled: boolean;
+  selectedAsEntryStrategy?: boolean;
+  fallbackEnabled?: boolean;
   stabilityTicks: number;
   ticksRecorded: number;
   lastSignal: {

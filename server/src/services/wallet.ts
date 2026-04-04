@@ -80,7 +80,7 @@ export class WalletService {
   }
 
   /**
-   * Comma list from `UPDOWN_ASSETS`, else single `UPDOWN_ASSET`, else all five 5m majors.
+   * Comma list from `UPDOWN_ASSETS`, else single `UPDOWN_ASSET`, else default four 5m majors (BTC, ETH, SOL, XRP).
    * Precedence avoids legacy `.env` lines like `UPDOWN_ASSET=BTC` silently overriding a multi list.
    */
   private upDownAssetsFromEnv(): string[] {
@@ -216,8 +216,13 @@ export class WalletService {
     return this.autoDiscoverUpDownEnabled();
   }
 
-  isClobAuthenticated() {
+  /** True when L2 credentials are ready and orders/balance APIs may be used (authenticated trading). */
+  hasAuthenticatedLiveTrading(): boolean {
     return Boolean(this.client) && this.clobApiKeyReady;
+  }
+
+  isClobAuthenticated() {
+    return this.hasAuthenticatedLiveTrading();
   }
 
   getClobHostForPing(): string {
@@ -331,7 +336,8 @@ export class WalletService {
   }
 
   /**
-   * True when we can use real CLOB books: authenticated client, or Gamma-resolved markets (public /book fetch).
+   * Public or authenticated live market data available (CLOB books via auth client, public /book, or
+   * Gamma-resolved token ids). Not the same as authenticated trading — see `hasAuthenticatedLiveTrading()`.
    */
   hasLiveMarketData(): boolean {
     if (Boolean(this.client) && this.clobApiKeyReady) return true;
@@ -492,6 +498,8 @@ export class WalletService {
   }
 
   getSummary() {
+    const liveBooks = this.hasLiveMarketData();
+    const liveTradingAuth = this.hasAuthenticatedLiveTrading();
     return {
       mode: this.mode,
       /** Polymarket trading/funder (proxy/Safe or EOA). */
@@ -502,7 +510,12 @@ export class WalletService {
       network: this.mode === "LIVE" ? "polygon" : "simulation",
       connected: this.mode === "SIMULATION" || (Boolean(this.wallet) && this.clobApiKeyReady),
       demoLiveMarkets: this.demoLiveMarkets,
-      liveBooksConnected: this.hasLiveMarketData()
+      liveBooksConnected: liveBooks,
+      liveTradingAuthenticated: liveTradingAuth,
+      publicBooksOnlyMode: liveBooks && !liveTradingAuth,
+      discoveredSlotCount: this.getDiscoveredSlotCount(),
+      activeDiscoveredAsset: this.getActiveDiscoveredAsset(),
+      activeDiscoveredSlug: this.getActiveDiscoveredSlug()
     };
   }
 
