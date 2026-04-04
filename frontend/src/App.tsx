@@ -51,6 +51,7 @@ import {
   OverviewSubNav,
   RiskBetSettingsModal,
   SnipeAssetCardsRow,
+  AnchorStrategyEntryPanel,
   StrategyModulesStrip,
   type OverviewSubTab
 } from "./copyProUi";
@@ -2025,24 +2026,7 @@ export function App() {
       <main className="mx-auto w-full max-w-[1800px] flex-1 space-y-4 overflow-y-auto p-4 sm:p-5">
         {snipeRoute === "dashboard" && (
           <>
-            <StrategyModulesStrip
-              onOpenStrategies={() => setSnipeRoute("strategies")}
-              anchor={tradingState?.anchorStrategy}
-              anchorBusy={anchorBusy}
-              onAnchorToggle={(enabled) => {
-                if (!isLoggedIn) {
-                  openLoginModal("Sign in to toggle Anchor Strategy.");
-                  return;
-                }
-                setAnchorBusy(true);
-                void api
-                  .setAnchorStrategy(enabled)
-                  .then(() => api.tradingState())
-                  .then(setTradingState)
-                  .catch((e) => pushLog("ERROR", e instanceof Error ? e.message : String(e)))
-                  .finally(() => setAnchorBusy(false));
-              }}
-            />
+            <StrategyModulesStrip onOpenStrategies={() => setSnipeRoute("strategies")} />
             <OverviewSubNav value={overviewSub} onChange={setOverviewSub} />
             {overviewSub === "configuration" ? (
               <div className="card border-copy-border/40">
@@ -2500,6 +2484,23 @@ export function App() {
                 Contrarian is set in <code className="text-slate-300">ENTRY_STRATEGY</code>. Choose a mode below to override from the UI.
               </p>
             ) : null}
+            <AnchorStrategyEntryPanel
+              anchor={tradingState?.anchorStrategy}
+              anchorBusy={anchorBusy}
+              onAnchorToggle={(enabled) => {
+                if (!isLoggedIn) {
+                  openLoginModal("Sign in to toggle Anchor Strategy.");
+                  return;
+                }
+                setAnchorBusy(true);
+                void api
+                  .setAnchorStrategy(enabled)
+                  .then(() => api.tradingState())
+                  .then(setTradingState)
+                  .catch((e) => pushLog("ERROR", e instanceof Error ? e.message : String(e)))
+                  .finally(() => setAnchorBusy(false));
+              }}
+            />
             <div className="flex flex-wrap gap-1.5">
               {(
                 [
@@ -2704,24 +2705,7 @@ export function App() {
 
         {snipeRoute === "strategies" && (
           <>
-            <StrategyModulesStrip
-              onOpenStrategies={() => setSnipeRoute("strategies")}
-              anchor={tradingState?.anchorStrategy}
-              anchorBusy={anchorBusy}
-              onAnchorToggle={(enabled) => {
-                if (!isLoggedIn) {
-                  openLoginModal("Sign in to toggle Anchor Strategy.");
-                  return;
-                }
-                setAnchorBusy(true);
-                void api
-                  .setAnchorStrategy(enabled)
-                  .then(() => api.tradingState())
-                  .then(setTradingState)
-                  .catch((e) => pushLog("ERROR", e instanceof Error ? e.message : String(e)))
-                  .finally(() => setAnchorBusy(false));
-              }}
-            />
+            <StrategyModulesStrip onOpenStrategies={() => setSnipeRoute("strategies")} />
             <div className="card border-copy-border/40 p-6">
               <StrategyConfigScreen
                 botRunning={Boolean(status?.running)}
