@@ -1,5 +1,8 @@
 export type Mode = "SIMULATION" | "LIVE";
 export type Direction = "UP" | "DOWN";
+
+/** Shared nullable numeric fields (API / snapshots). */
+export type NullableNumber = number | null;
 export type TradeStatus = "PENDING" | "WIN" | "LOSS";
 export type LogLevel = "WIN" | "ERROR" | "SIGNAL" | "TRADE";
 
@@ -39,6 +42,15 @@ export interface MarketWsPayload {
 }
 
 export interface Prediction {
+  prediction: Direction;
+  confidence: number;
+  ts: number;
+  recommendation: "TRADE" | "NO_TRADE";
+  reason: string;
+}
+
+/** REST parity for `TradingState.predictionLive` (same shape as WS `prediction`). */
+export interface PredictionLiveSnapshot {
   prediction: Direction;
   confidence: number;
   ts: number;
@@ -250,7 +262,7 @@ export interface TradingState {
    */
   liveEngine: LiveEngineSnapshot;
   /** Same payload as WS `prediction` — REST parity when socket is slow or disconnected. */
-  predictionLive: Pick<Prediction, "prediction" | "confidence" | "ts" | "recommendation" | "reason">;
+  predictionLive: PredictionLiveSnapshot;
   /** Anchor Strategy: book + Chainlink snapshot for dashboard (optional on older servers). */
   anchorStrategy?: AnchorStrategySnapshot;
 }

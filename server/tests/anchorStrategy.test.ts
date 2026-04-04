@@ -216,6 +216,131 @@ describe("evaluateAnchorStrategy", () => {
   });
 });
 
+describe("evaluateAnchorStrategy edge cases", () => {
+  const freshOracle = 2000;
+
+  it("NaN anchor YES price returns INVALID_ANCHOR_PRICE", () => {
+    const ob = bookUp(0.75);
+    const hist = [100, 100, 100, 100.04];
+    const sig = evaluateAnchorStrategy(ob, hist, NaN, 0.48, [0.75, 0.75, 0.75], [0.5, 0.5, 0.5], baseCfg(), freshOracle);
+    expect(sig.shouldTrade).toBe(false);
+    expect(sig.skipCategory).toBe("INVALID_ANCHOR_PRICE");
+  });
+
+  it("negative anchor YES price returns INVALID_ANCHOR_PRICE", () => {
+    const ob = bookUp(0.75);
+    const hist = [100, 100, 100, 100.04];
+    const sig = evaluateAnchorStrategy(ob, hist, -0.1, 0.48, [0.75, 0.75, 0.75], [0.5, 0.5, 0.5], baseCfg(), freshOracle);
+    expect(sig.shouldTrade).toBe(false);
+    expect(sig.skipCategory).toBe("INVALID_ANCHOR_PRICE");
+  });
+
+  it("NaN in order book depths returns INVALID_ORDERBOOK", () => {
+    const ob: OrderBookSnapshot = { bidDepthUp: NaN, askDepthUp: 50, bidDepthDown: 50, askDepthDown: 50 };
+    const hist = [100, 100, 100, 100.04];
+    const sig = evaluateAnchorStrategy(ob, hist, 0.52, 0.48, [0.75, 0.75, 0.75], [0.5, 0.5, 0.5], baseCfg(), freshOracle);
+    expect(sig.shouldTrade).toBe(false);
+    expect(sig.skipCategory).toBe("INVALID_ORDERBOOK");
+  });
+
+  it("negative depths return INVALID_ORDERBOOK", () => {
+    const ob: OrderBookSnapshot = { bidDepthUp: -10, askDepthUp: 50, bidDepthDown: 50, askDepthDown: 50 };
+    const hist = [100, 100, 100, 100.04];
+    const sig = evaluateAnchorStrategy(ob, hist, 0.52, 0.48, [0.75, 0.75, 0.75], [0.5, 0.5, 0.5], baseCfg(), freshOracle);
+    expect(sig.shouldTrade).toBe(false);
+    expect(sig.skipCategory).toBe("INVALID_ORDERBOOK");
+  });
+
+  it("flat momentum history (zero mom) fails UP with MOMENTUM_MISMATCH", () => {
+    const ob = bookUp(0.75);
+    const hist = [100, 100, 100, 100];
+    const sig = evaluateAnchorStrategy(ob, hist, 0.52, 0.48, [0.75, 0.75, 0.75], [0.5, 0.5, 0.5], baseCfg(), freshOracle);
+    expect(sig.shouldTrade).toBe(false);
+    expect(sig.skipCategory).toBe("MOMENTUM_MISMATCH");
+  });
+
+  it("non-finite oracle age is ignored for ORACLE_STALE (null path)", () => {
+    const ob = bookUp(0.75);
+    const hist = [100, 100, 100, 100.04];
+    const sig = evaluateAnchorStrategy(ob, hist, 0.52, 0.48, [0.75, 0.75, 0.75], [0.5, 0.5, 0.5], baseCfg(), NaN);
+    expect(sig.shouldTrade).toBe(true);
+    expect(sig.side).toBe("UP");
+  });
+
+  it("maxYesMid boundary: exactly at max passes YES gate when anchor range allows", () => {
+    const cfg = { ...baseCfg(), maxYesMid: 0.65, anchorPriceMax: 0.65 };
+    const ob = bookUp(0.75);
+    const hist = [100, 100, 100, 100.04];
+    const sig = evaluateAnchorStrategy(ob, hist, cfg.maxYesMid, 1 - cfg.maxYesMid, [0.75, 0.75, 0.75], [0.5, 0.5, 0.5], cfg, freshOracle);
+    expect(sig.shouldTrade).toBe(true);
+    expect(sig.side).toBe("UP");
+  });
+
+  it("maxYesMid: epsilon above max rejects with YES_MID_TOO_HIGH", () => {
+    const cfg = baseCfg();
+    const ob = bookUp(0.75);
+    const hist = [100, 100, 100, 100.04];
+    const sig = evaluateAnchorStrategy(
+      ob,
+      hist,
+      cfg.maxYesMid + 1e-6,
+      0.2,
+      [0.75, 0.75, 0.75],
+      [0.5, 0.5, 0.5],
+      cfg,
+      freshOracle
+    );
+    expect(sig.shouldTrade).toBe(false);
+    expect(sig.skipCategory).toBe("YES_MID_TOO_HIGH");
+  });
+
+  it("upBidDepthShareMin boundary: exactly at threshold fails UP stability (needs strictly greater)", () => {
+    const cfg = { ...baseCfg(), upBidDepthShareMin: 0.7 };
+    const ob = bookUp(0.7);
+    const hist = [100, 100, 100, 100.04];
+    const sig = evaluateAnchorStrategy(ob, hist, 0.52, 0.48, [0.7, 0.7, 0.7], [0.5, 0.5, 0.5], cfg, freshOracle);
+    expect(sig.shouldTrade).toBe(false);
+    expect(sig.skipCategory).toBe("STABILITY_NOT_MET");
+  });
+
+  it("downBidDepthShareMax boundary: exactly at threshold fails DOWN stability (needs strictly less)", () => {
+    const cfg = { ...baseCfg(), downBidDepthShareMax: 0.3 };
+    const ob = bookDown(0.3);
+    const hist = [100, 100, 100, 99.96];
+    const sig = evaluateAnchorStrategy(ob, hist, 0.48, 0.52, [0.5, 0.5, 0.5], [0.3, 0.3, 0.3], cfg, freshOracle);
+    expect(sig.shouldTrade).toBe(false);
+    expect(sig.skipCategory).toBe("STABILITY_NOT_MET");
+  });
+
+  it("chainlinkMomThreshold: UP rejects when mom is at or below threshold (strict >)", () => {
+    const cfg = { ...baseCfg(), chainlinkMomThreshold: 0.000401 };
+    const ob = bookUp(0.75);
+    const hist = [100, 100, 100, 100.04];
+    const sig = evaluateAnchorStrategy(ob, hist, 0.52, 0.48, [0.75, 0.75, 0.75], [0.5, 0.5, 0.5], cfg, freshOracle);
+    expect(sig.shouldTrade).toBe(false);
+    expect(sig.skipCategory).toBe("MOMENTUM_MISMATCH");
+  });
+
+  it("mismatched history vs timestamps length still evaluates (uses last timestamp only)", () => {
+    const cfg = baseCfg();
+    const ob = bookUp(0.75);
+    const hist = [100, 100, 100, 100.04];
+    const tsShort = [Date.now() - 1000];
+    const sig = evaluateAnchorStrategy(
+      ob,
+      hist,
+      0.52,
+      0.48,
+      [0.75, 0.75, 0.75],
+      [0.5, 0.5, 0.5],
+      cfg,
+      freshOracle,
+      tsShort
+    );
+    expect(sig.shouldTrade).toBe(true);
+  });
+});
+
 describe("anchorEntryPreflight", () => {
   it("does not allow entry when another strategy already claimed the window", () => {
     const cfg = baseCfg();
@@ -247,6 +372,141 @@ describe("anchorEntryPreflight", () => {
       hasLiveMarketData: true,
       hasDirectionalContext: true,
       secondsToExpiry: 120,
+      hasPendingTrade: false,
+      anchorTradedThisWindow: false
+    });
+    expect(r.ok).toBe(true);
+  });
+
+  it("blocks when env disabled", () => {
+    const cfg = baseCfg();
+    const r = anchorEntryPreflight({
+      cfg,
+      envEnabled: false,
+      runtimeEnabled: true,
+      lagSnipeEnabled: false,
+      hasLiveMarketData: true,
+      hasDirectionalContext: true,
+      secondsToExpiry: 120,
+      hasPendingTrade: false,
+      anchorTradedThisWindow: false
+    });
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.category).toBe("DISABLED");
+  });
+
+  it("blocks when runtime disabled", () => {
+    const cfg = baseCfg();
+    const r = anchorEntryPreflight({
+      cfg,
+      envEnabled: true,
+      runtimeEnabled: false,
+      lagSnipeEnabled: false,
+      hasLiveMarketData: true,
+      hasDirectionalContext: true,
+      secondsToExpiry: 120,
+      hasPendingTrade: false,
+      anchorTradedThisWindow: false
+    });
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.category).toBe("DISABLED");
+  });
+
+  it("blocks when lag snipe enabled", () => {
+    const cfg = baseCfg();
+    const r = anchorEntryPreflight({
+      cfg,
+      envEnabled: true,
+      runtimeEnabled: true,
+      lagSnipeEnabled: true,
+      hasLiveMarketData: true,
+      hasDirectionalContext: true,
+      secondsToExpiry: 120,
+      hasPendingTrade: false,
+      anchorTradedThisWindow: false
+    });
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.category).toBe("LAG_SNIPE_BLOCK");
+  });
+
+  it("blocks when no live market data", () => {
+    const cfg = baseCfg();
+    const r = anchorEntryPreflight({
+      cfg,
+      envEnabled: true,
+      runtimeEnabled: true,
+      lagSnipeEnabled: false,
+      hasLiveMarketData: false,
+      hasDirectionalContext: true,
+      secondsToExpiry: 120,
+      hasPendingTrade: false,
+      anchorTradedThisWindow: false
+    });
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.category).toBe("NO_LIVE_BOOK");
+  });
+
+  it("blocks when no directional context", () => {
+    const cfg = baseCfg();
+    const r = anchorEntryPreflight({
+      cfg,
+      envEnabled: true,
+      runtimeEnabled: true,
+      lagSnipeEnabled: false,
+      hasLiveMarketData: true,
+      hasDirectionalContext: false,
+      secondsToExpiry: 120,
+      hasPendingTrade: false,
+      anchorTradedThisWindow: false
+    });
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.category).toBe("NO_LIVE_BOOK");
+  });
+
+  it("blocks when pending trade exists", () => {
+    const cfg = baseCfg();
+    const r = anchorEntryPreflight({
+      cfg,
+      envEnabled: true,
+      runtimeEnabled: true,
+      lagSnipeEnabled: false,
+      hasLiveMarketData: true,
+      hasDirectionalContext: true,
+      secondsToExpiry: 120,
+      hasPendingTrade: true,
+      anchorTradedThisWindow: false
+    });
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.category).toBe("PENDING_TRADE_BLOCK");
+  });
+
+  it("blocks when secondsToExpiry at minSecondsToExpiry boundary", () => {
+    const cfg = baseCfg();
+    const r = anchorEntryPreflight({
+      cfg,
+      envEnabled: true,
+      runtimeEnabled: true,
+      lagSnipeEnabled: false,
+      hasLiveMarketData: true,
+      hasDirectionalContext: true,
+      secondsToExpiry: cfg.minSecondsToExpiry,
+      hasPendingTrade: false,
+      anchorTradedThisWindow: false
+    });
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.category).toBe("LAST_60S_BLOCK");
+  });
+
+  it("allows when secondsToExpiry one second above minimum", () => {
+    const cfg = baseCfg();
+    const r = anchorEntryPreflight({
+      cfg,
+      envEnabled: true,
+      runtimeEnabled: true,
+      lagSnipeEnabled: false,
+      hasLiveMarketData: true,
+      hasDirectionalContext: true,
+      secondsToExpiry: cfg.minSecondsToExpiry + 1,
       hasPendingTrade: false,
       anchorTradedThisWindow: false
     });

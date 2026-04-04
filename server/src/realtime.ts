@@ -249,6 +249,7 @@ export class ChainlinkPriceHistoryBuffer {
   push(price: number, tsMs?: number): void {
     if (!Number.isFinite(price) || price <= 0) return;
     const t = tsMs ?? Date.now();
+    if (!Number.isFinite(t)) return;
     this.prices.push(price);
     this.timestampsMs.push(t);
     while (this.prices.length > this.maxLen) {
@@ -267,7 +268,8 @@ export class ChainlinkPriceHistoryBuffer {
     const n = this.timestampsMs.length;
     if (n === 0) return null;
     const t = this.timestampsMs[n - 1]!;
-    return Number.isFinite(t) ? t : null;
+    if (!Number.isFinite(t)) return null;
+    return t;
   }
   sampleCount(): number {
     return this.prices.length;
@@ -319,12 +321,20 @@ export type OracleTrendBufferGateResult =
  * Entry / trend staleness: use the fresher of raw Chainlink on-chain age and RTDS tick age.
  * Missing leg is ignored (treated as +∞) so a live RTDS stream can satisfy gates while Polygon CL heartbeats ~30s.
  */
+function toNonNegativeFiniteMs(v: number | null | undefined): number | null {
+  if (v == null) return null;
+  if (!Number.isFinite(v)) return null;
+  return Math.max(0, v);
+}
+
 export function getOracleAgeMsForTrend(
   chainlinkAgeMs: number | null | undefined,
   rtdsAgeMs: number | null | undefined
 ): number | null {
-  const cl = chainlinkAgeMs != null && Number.isFinite(chainlinkAgeMs) ? chainlinkAgeMs : Infinity;
-  const rt = rtdsAgeMs != null && Number.isFinite(rtdsAgeMs) ? rtdsAgeMs : Infinity;
+  const cl0 = toNonNegativeFiniteMs(chainlinkAgeMs);
+  const rt0 = toNonNegativeFiniteMs(rtdsAgeMs);
+  const cl = cl0 == null ? Infinity : cl0;
+  const rt = rt0 == null ? Infinity : rt0;
   const m = Math.min(cl, rt);
   return m === Infinity ? null : m;
 }
@@ -342,7 +352,7 @@ export function evaluateOracleTrendBufferGate(
   const samples = buf.sampleCount();
   if (samples < minSamples) return { kind: "insufficient", samples, min: minSamples };
   const lastTs = buf.lastTimestampMs();
-  const ageMs = lastTs != null ? nowMs - lastTs : null;
+  const ageMs = lastTs != null && Number.isFinite(nowMs) ? Math.max(0, nowMs - lastTs) : null;
   if (lastTs == null || ageMs == null || ageMs > maxSampleAgeMs) {
     return { kind: "stale", ageMs, max: maxSampleAgeMs };
   }
