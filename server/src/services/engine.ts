@@ -37,7 +37,12 @@ import {
   type AnchorSignal,
   type OrderBookSnapshot
 } from "../strategies/anchorStrategy.js";
-import { getChainlinkPriceHistoryBuffer } from "../realtime.js";
+import {
+  evaluateOracleTrendBufferGate,
+  getChainlinkPriceHistoryBuffer,
+  getChainlinkPriceHistoryBufferForAsset,
+  getOracleAgeMsForTrend
+} from "../realtime.js";
 import { computeEnsemble, type MidSample } from "./ensembleStrategy.js";
 import { evaluateWhaleEdgeGate, whalePaperTakeProfitMid } from "./whaleStrategy.js";
 import { runConnectivityPings } from "./apiPings.js";
@@ -144,6 +149,30 @@ function paperOracleMinHoldMs() {
 function paperEntryMinMsToWindowEnd() {
   const n = envNum("PAPER_ENTRY_MIN_MS_TO_WINDOW_END", 60_000);
   return Number.isFinite(n) && n >= 0 ? n : 60_000;
+}
+
+/** Auto-entry: max oracle tick age (ms) vs freshest of raw Chainlink `updatedAt` and RTDS (see `getOracleAgeMsForTrend`). Default 15s (~Polygon CL heartbeat). */
+function oracleMaxAgeMsForEntry() {
+  const n = envNum("ORACLE_MAX_AGE_MS_ENTRY", 15_000);
+  return Number.isFinite(n) && n >= 250 ? n : 15_000;
+}
+
+/** Skip auto-entries when less than this many ms remain in the Gamma window (last-2m style guard). Default 120s. */
+function lateEntryMinMsToWindowEnd() {
+  const n = envNum("LATE_ENTRY_MIN_MS_TO_WINDOW_END", 120_000);
+  return Number.isFinite(n) && n >= 0 ? n : 120_000;
+}
+
+/** Min samples in per-asset oracle buffer before trend is valid for auto-trade gates. Default 2. */
+function oracleTrendMinSamples() {
+  const n = envNum("ORACLE_TREND_MIN_SAMPLES", 2);
+  return Number.isFinite(n) && n >= 2 ? Math.floor(n) : 2;
+}
+
+/** Max age (ms) of newest buffer sample for oracle trend to be valid. Default 20s. */
+function oracleTrendMaxSampleAgeMs() {
+  const n = envNum("ORACLE_TREND_MAX_SAMPLE_AGE_MS", 20_000);
+  return Number.isFinite(n) && n >= 500 ? n : 20_000;
 }
 
 function simKellySizingEnabled() {
@@ -574,6 +603,50 @@ export class TradingEngine {
       return this.polymarketRtds.getAgeMsForAsset(asset);
     }
     return this.polymarketRtds.getAgeMsForAsset(asset);
+  }
+
+  /** Raw Chainlink tick age for entry gating (even when older than `chainlinkStaleMs()`, so RTDS fallback does not hide staleness). */
+  private oracleChainlinkRawAgeMsForAsset(asset: string): number | null {
+    const a = this.chainlinkAsset(asset);
+    if (!a) return null;
+    const tick = this.chainlinkUsdByAsset.get(a);
+    if (!tick || !Number.isFinite(tick.updatedAt)) return null;
+    return Math.max(0, Date.now() - tick.updatedAt);
+  }
+
+  /** Freshest of Chainlink on-chain age and RTDS age for auto-entry / anchor oracle gates. */
+  private oracleMergedAgeMsForEntryGate(asset: string): number | null {
+    return getOracleAgeMsForTrend(
+      this.oracleChainlinkRawAgeMsForAsset(asset),
+      this.polymarketRtds.getAgeMsForAsset(asset)
+    );
+  }
+
+  /** Per-asset oracle trend for auto-trade (min samples + fresh last tick). Anchor BTC buffer unchanged. */
+  private oracleTrendForAutoTradeGate(asset: string) {
+    return evaluateOracleTrendBufferGate(
+      getChainlinkPriceHistoryBufferForAsset(asset),
+      Date.now(),
+      oracleTrendMinSamples(),
+      oracleTrendMaxSampleAgeMs()
+    );
+  }
+
+  private formatOracleTrendHealthSegment(sym: string, now: number): string {
+    const buf = getChainlinkPriceHistoryBufferForAsset(sym);
+    const samples = buf.sampleCount();
+    const lastTs = buf.lastTimestampMs();
+    const ageMs = lastTs != null ? now - lastTs : null;
+    const r = evaluateOracleTrendBufferGate(buf, now, oracleTrendMinSamples(), oracleTrendMaxSampleAgeMs());
+    const trend = r.kind === "ok" ? r.trend : "NA";
+    const ageStr = ageMs != null ? String(Math.round(ageMs)) : "NA";
+    return `${sym}:${samples}/${ageStr}/${trend}`;
+  }
+
+  private formatOracleTrendHealthBracket(): string {
+    const now = Date.now();
+    const segs = (["BTC", "ETH", "SOL", "XRP"] as const).map((s) => this.formatOracleTrendHealthSegment(s, now));
+    return `oracleTrendHealth {${segs.join(" ")}}`;
   }
 
   /** Full oracle attribution for UI + throttled `[ORACLE][SOURCE]` logs. */
@@ -2316,7 +2389,7 @@ export class TradingEngine {
 
     this.log(
       "SIGNAL",
-      `[HEALTH] rtds=${rtdsConnected ? "OK" : "OFF"} bookAgeSec=${bookAgeSec ?? "—"} pos pending=${pending} wins=${wins} losses=${losses} cache/oracleAgeMs {${oracleAges}} rtdsAgeMs {${rtdsAges}} oracleSource {${oracleSources}}`
+      `[HEALTH] rtds=${rtdsConnected ? "OK" : "OFF"} bookAgeSec=${bookAgeSec ?? "—"} pos pending=${pending} wins=${wins} losses=${losses} rtdsAgeMs {${rtdsAges}} cache/oracleAgeMs {${oracleAges}} oracleSource {${oracleSources}} ${this.formatOracleTrendHealthBracket()}`
     );
   }
 
@@ -2394,6 +2467,40 @@ export class TradingEngine {
         }
       }
 
+      const assetGate = this.wallet.getActiveDiscoveredAsset() ?? "BTC";
+      if (!this.lagSnipeEnabled && !isOla) {
+        const maxOracleAge = oracleMaxAgeMsForEntry();
+        const gateAgeMs = this.oracleMergedAgeMsForEntryGate(assetGate);
+        if (gateAgeMs == null || gateAgeMs > maxOracleAge) {
+          const ageDisp = gateAgeMs == null ? "null" : String(Math.round(gateAgeMs));
+          this.log(
+            "SIGNAL",
+            `[AUTO][SKIP] ORACLE_STALE asset=${assetGate} ageMs=${ageDisp} max_ms=${maxOracleAge}`
+          );
+          await this.maybeRunAnchorStrategy();
+          return;
+        }
+      }
+
+      if (!this.lagSnipeEnabled && !isOla) {
+        const metaLw = this.wallet.getDiscoveredMeta();
+        if (metaLw?.endDateIso) {
+          const endLw = new Date(metaLw.endDateIso).getTime();
+          if (!Number.isNaN(endLw)) {
+            const msLeftLw = endLw - Date.now();
+            const minRemMs = lateEntryMinMsToWindowEnd();
+            if (msLeftLw < minRemMs && msLeftLw > -60_000) {
+              this.log(
+                "SIGNAL",
+                `[AUTO][SKIP] LATE_WINDOW asset=${assetGate} ms_to_window_end=${Math.round(msLeftLw)} min_remaining_ms=${minRemMs}`
+              );
+              await this.maybeRunAnchorStrategy();
+              return;
+            }
+          }
+        }
+      }
+
       this.maybeRotateAnchorWindow();
       await this.recordAnchorBuffers();
       if (!olaFastLane) {
@@ -2424,6 +2531,44 @@ export class TradingEngine {
         await this.maybeRunAnchorStrategy();
         return;
       }
+      if (!isOla && !this.lagSnipeEnabled) {
+        const ot = this.oracleTrendForAutoTradeGate(assetGate);
+        if (ot.kind === "insufficient") {
+          this.log(
+            "SIGNAL",
+            `[AUTO][SKIP] ORACLE_TREND_INSUFFICIENT asset=${assetGate} samples=${ot.samples} min_samples=${ot.min}`
+          );
+          await this.maybeRunAnchorStrategy();
+          return;
+        }
+        if (ot.kind === "stale") {
+          const ageDisp = ot.ageMs == null ? "null" : String(Math.round(ot.ageMs));
+          this.log(
+            "SIGNAL",
+            `[AUTO][SKIP] ORACLE_TREND_STALE asset=${assetGate} ageMs=${ageDisp} max_ms=${ot.max}`
+          );
+          await this.maybeRunAnchorStrategy();
+          return;
+        }
+        const oracleTrend = ot.trend;
+        const momentumSide = this.rawMomentumSide();
+        if (momentumSide !== oracleTrend) {
+          this.log(
+            "SIGNAL",
+            `[AUTO][SKIP] ORACLE_TREND_MISMATCH asset=${assetGate} momentum=${momentumSide} oracle_trend=${oracleTrend}`
+          );
+          await this.maybeRunAnchorStrategy();
+          return;
+        }
+        if (direction !== oracleTrend) {
+          this.log(
+            "SIGNAL",
+            `[AUTO][SKIP] DIRECTION_MISMATCH asset=${assetGate} dir=${direction} oracle_trend=${oracleTrend}`
+          );
+          await this.maybeRunAnchorStrategy();
+          return;
+        }
+      }
       const whaleGate = this.whaleEdgeGateOrOk(direction);
       if (!whaleGate.ok) {
         this.log("SIGNAL", whaleGate.reason);
@@ -2451,6 +2596,17 @@ export class TradingEngine {
         await this.maybeRunAnchorStrategy();
         return;
       }
+      if (this.wallet.getMode() === "LIVE" && riskAmount > 1 + 1e-9) {
+        const allowLargeLive = String(process.env.LIVE_TRADE_ABOVE_1_USD_OK ?? "").toLowerCase() === "true";
+        if (!allowLargeLive) {
+          this.log(
+            "SIGNAL",
+            `[AUTO][SKIP] LIVE_MAX_ENTRY_USD_1 size_usd=${riskAmount.toFixed(2)} (set LIVE_TRADE_ABOVE_1_USD_OK=true to allow larger LIVE auto-entries)`
+          );
+          await this.maybeRunAnchorStrategy();
+          return;
+        }
+      }
       const result = await this.trade(direction, riskAmount, "AUTO", choice.reason);
       if (!result.accepted) {
         this.log("ERROR", `Auto-trade blocked: ${result.reason ?? "unknown"}`);
@@ -2474,6 +2630,19 @@ export class TradingEngine {
     if (key !== this.lastAnchorWindowKey) {
       this.lastAnchorWindowKey = key;
       this.anchorTradedThisWindow = false;
+      void this.primeOracleTrendBuffersForCoreAssets();
+    }
+  }
+
+  /** Seed per-asset trend buffers on 5m window roll so non-active assets (ETH/SOL/XRP) are not stuck at 0 samples. */
+  private async primeOracleTrendBuffersForCoreAssets(): Promise<void> {
+    const assets = ["BTC", "ETH", "SOL", "XRP"] as const;
+    const now = Date.now();
+    for (const asset of assets) {
+      const spot = this.oracleSpotUsdForAsset(asset);
+      if (spot != null && Number.isFinite(spot) && spot > 0) {
+        getChainlinkPriceHistoryBufferForAsset(asset).push(spot, now);
+      }
     }
   }
 
@@ -2503,9 +2672,13 @@ export class TradingEngine {
   }
 
   private async recordAnchorBuffers(): Promise<void> {
-    const spot = this.oracleSpotUsdForAsset("BTC");
-    if (spot != null && Number.isFinite(spot) && spot > 0) {
-      getChainlinkPriceHistoryBuffer().push(spot, Date.now());
+    const now = Date.now();
+    const core = ["BTC", "ETH", "SOL", "XRP"] as const;
+    for (const asset of core) {
+      const spot = this.oracleSpotUsdForAsset(asset);
+      if (spot != null && Number.isFinite(spot) && spot > 0) {
+        getChainlinkPriceHistoryBufferForAsset(asset).push(spot, now);
+      }
     }
     const snap = await this.buildAnchorOrderBookSnapshot();
     if (!snap) return;
@@ -2625,7 +2798,8 @@ export class TradingEngine {
     const buf = getChainlinkPriceHistoryBuffer();
     const hist = buf.snapshot();
     const tsMs = buf.snapshotTimestampsMs();
-    const oracleAgeMs = this.oracleAgeMsForAsset("BTC");
+    const oracleAgeMs =
+      this.oracleMergedAgeMsForEntryGate("BTC") ?? this.oracleAgeMsForAsset("BTC");
 
     const sig = evaluateAnchorStrategy(
       snap,

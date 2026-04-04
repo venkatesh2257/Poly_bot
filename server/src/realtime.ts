@@ -3,6 +3,7 @@
  * @see https://docs.polymarket.com/developers/RTDS/RTDS-crypto-prices
  */
 import WebSocket from "ws";
+import type { Direction } from "./types/index.js";
 
 const RTDS_URL = "wss://ws-live-data.polymarket.com";
 
@@ -261,15 +262,97 @@ export class ChainlinkPriceHistoryBuffer {
   snapshotTimestampsMs(): number[] {
     return [...this.timestampsMs];
   }
+  /** Newest sample time (ms), or null if empty. */
+  lastTimestampMs(): number | null {
+    const n = this.timestampsMs.length;
+    if (n === 0) return null;
+    const t = this.timestampsMs[n - 1]!;
+    return Number.isFinite(t) ? t : null;
+  }
+  sampleCount(): number {
+    return this.prices.length;
+  }
   clear(): void {
     this.prices.length = 0;
     this.timestampsMs.length = 0;
   }
 }
 
-let chainlinkHistSingleton: ChainlinkPriceHistoryBuffer | null = null;
+const chainlinkBuffersByAsset = new Map<string, ChainlinkPriceHistoryBuffer>();
 
+/** Rolling oracle USD samples per underlying (e.g. BTC, ETH) for trend gates + Anchor BTC momentum. */
+export function getChainlinkPriceHistoryBufferForAsset(asset: string): ChainlinkPriceHistoryBuffer {
+  const k = asset.trim().toUpperCase() || "BTC";
+  let b = chainlinkBuffersByAsset.get(k);
+  if (!b) {
+    b = new ChainlinkPriceHistoryBuffer(10);
+    chainlinkBuffersByAsset.set(k, b);
+  }
+  return b;
+}
+
+/** BTC series — Anchor strategy momentum / exits use this buffer. */
 export function getChainlinkPriceHistoryBuffer(): ChainlinkPriceHistoryBuffer {
-  if (!chainlinkHistSingleton) chainlinkHistSingleton = new ChainlinkPriceHistoryBuffer(10);
-  return chainlinkHistSingleton;
+  return getChainlinkPriceHistoryBufferForAsset("BTC");
+}
+
+/** Last ≤3 prices: UP if rising steps dominate (ties → DOWN). */
+export function computeOracleMicroTrendFromPrices(prices: number[]): Direction | null {
+  if (prices.length < 2) return null;
+  const slice = prices.slice(-3);
+  let score = 0;
+  for (let i = 1; i < slice.length; i++) {
+    const prev = slice[i - 1]!;
+    const cur = slice[i]!;
+    if (cur > prev) score += 1;
+    else if (cur < prev) score -= 1;
+  }
+  return score > 0 ? "UP" : "DOWN";
+}
+
+export type OracleTrendBufferGateResult =
+  | { kind: "ok"; trend: Direction }
+  | { kind: "insufficient"; samples: number; min: number }
+  | { kind: "stale"; ageMs: number | null; max: number };
+
+/**
+ * Entry / trend staleness: use the fresher of raw Chainlink on-chain age and RTDS tick age.
+ * Missing leg is ignored (treated as +∞) so a live RTDS stream can satisfy gates while Polygon CL heartbeats ~30s.
+ */
+export function getOracleAgeMsForTrend(
+  chainlinkAgeMs: number | null | undefined,
+  rtdsAgeMs: number | null | undefined
+): number | null {
+  const cl = chainlinkAgeMs != null && Number.isFinite(chainlinkAgeMs) ? chainlinkAgeMs : Infinity;
+  const rt = rtdsAgeMs != null && Number.isFinite(rtdsAgeMs) ? rtdsAgeMs : Infinity;
+  const m = Math.min(cl, rt);
+  return m === Infinity ? null : m;
+}
+
+/**
+ * Auto-trade oracle trend: require enough samples and a fresh last tick.
+ * Pure function for tests and engine gate.
+ */
+export function evaluateOracleTrendBufferGate(
+  buf: ChainlinkPriceHistoryBuffer,
+  nowMs: number,
+  minSamples: number,
+  maxSampleAgeMs: number
+): OracleTrendBufferGateResult {
+  const samples = buf.sampleCount();
+  if (samples < minSamples) return { kind: "insufficient", samples, min: minSamples };
+  const lastTs = buf.lastTimestampMs();
+  const ageMs = lastTs != null ? nowMs - lastTs : null;
+  if (lastTs == null || ageMs == null || ageMs > maxSampleAgeMs) {
+    return { kind: "stale", ageMs, max: maxSampleAgeMs };
+  }
+  const trend = computeOracleMicroTrendFromPrices(buf.snapshot());
+  if (trend == null) return { kind: "insufficient", samples, min: minSamples };
+  return { kind: "ok", trend };
+}
+
+/** Vitest / dev only — clears per-asset buffers. */
+export function resetChainlinkPriceBuffersForTests(): void {
+  for (const b of chainlinkBuffersByAsset.values()) b.clear();
+  chainlinkBuffersByAsset.clear();
 }

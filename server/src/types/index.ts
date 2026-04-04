@@ -364,3 +364,37 @@ export interface Insights {
   highConfMidBlocked: number;
   boneEntryFilters: BoneFilterBlocks;
 }
+
+/** Persisted adaptive learning snapshot (`config/adaptiveConfig.json`). */
+export interface AdaptiveConfigFile {
+  lastRunMs: number;
+  hint?: string;
+  demoSample?: number;
+  liveSample?: number;
+  demoPnlSum?: number;
+  livePnlSum?: number;
+  observedMaxSpread?: number;
+}
+
+export type AlertSeverity = "info" | "warn" | "error";
+
+export interface AlertEvent {
+  id: string;
+  severity: AlertSeverity;
+  source: string;
+  message: string;
+  ts: number;
+}
+
+export interface ApiHealthResultRow {
+  name: string;
+  ok: boolean;
+  ms?: number;
+  detail?: string;
+}
+
+export interface ApiHealthSnapshot {
+  ts: number;
+  ok: boolean;
+  results: ApiHealthResultRow[];
+}
