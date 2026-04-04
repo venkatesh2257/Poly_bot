@@ -353,10 +353,22 @@ export function StrategyModulesStrip(props: {
             </span>
           </div>
         </div>
-        <div className="flex flex-col items-end justify-center gap-1 border-t border-amber-800/30 pt-2 sm:border-t-0 sm:pt-0">
-          <span className="text-[10px] text-slate-500">
-            Env {a?.envEnabled ? "on" : "off"} · Runtime {a?.runtimeEnabled ? "on" : "off"}
+        <div className="flex max-w-[min(100%,320px)] flex-col items-end justify-center gap-1 border-t border-amber-800/30 pt-2 sm:border-t-0 sm:pt-0">
+          <span className="text-right text-[10px] text-slate-500">
+            Env {a?.envEnabled ? "on" : "off"} · Runtime {a?.runtimeEnabled ? "on" : "off"} ·{" "}
+            <span className={a?.effectiveEnabled ? "font-semibold text-emerald-400" : "font-semibold text-amber-300/95"}>
+              Effective {a?.effectiveEnabled ? "on" : "off"}
+            </span>
           </span>
+          {a?.envEnabled === false ? (
+            <p className="text-right text-[10px] leading-snug text-amber-200/90">
+              Anchor stays idle until{" "}
+              <code className="rounded bg-black/40 px-1 font-mono text-[10px]">ANCHOR_STRATEGY_ENABLED=true</code> in{" "}
+              <code className="rounded bg-black/40 px-1 font-mono text-[10px]">server/.env</code>, then restart the server.
+            </p>
+          ) : a?.envEnabled === true && !a?.effectiveEnabled ? (
+            <p className="text-right text-[10px] text-slate-500">Turn on the Live toggle so Anchor can evaluate.</p>
+          ) : null}
           <label className="flex cursor-pointer items-center gap-2 text-[11px] text-amber-100/95">
             <input
               type="checkbox"
