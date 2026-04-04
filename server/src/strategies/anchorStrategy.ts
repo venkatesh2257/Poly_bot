@@ -36,6 +36,10 @@ export interface AnchorStrategyConfig {
   chainlinkMomReverseThreshold: number;
   anchorPriceMin: number;
   anchorPriceMax: number;
+  /**
+   * USD notional per Anchor entry.
+   * Env `ANCHOR_TRADE_SIZE` (e.g. 1.00); if unset or empty, uses engine risk `ENTRY_USD` / overrides passed into `loadAnchorConfigFromEnv(fallbackUsd)`.
+   */
   tradeSize: number;
   exitBufferSeconds: number;
   maxYesMid: number;
@@ -457,7 +461,34 @@ export function anchorShouldExitDownOnMomentum(chainlinkMom: number, posThreshol
   return chainlinkMom > posThreshold;
 }
 
-export function loadAnchorConfigFromEnv(): AnchorStrategyConfig {
+/**
+ * USD size for Anchor entries. Uses `ANCHOR_TRADE_SIZE` when set to a positive number; otherwise `fallbackEntryUsd`
+ * (typically engine `effEntryUsd()` from `ENTRY_USD` / risk API).
+ * For LIVE smoke tests, ANCHOR_TRADE_SIZE overrides generic entry sizing.
+ */
+export function resolveAnchorTradeSizeUsd(fallbackEntryUsd: number): number {
+  const raw = process.env.ANCHOR_TRADE_SIZE;
+  if (raw != null && String(raw).trim() !== "") {
+    const n = Number(String(raw).trim());
+    if (Number.isFinite(n) && n > 0) return n;
+  }
+  const fb = Number(fallbackEntryUsd);
+  return Number.isFinite(fb) && fb > 0 ? fb : 1;
+}
+
+/**
+ * Live-test oriented env (documented in `.env.example`):
+ * ```env
+ * MODE=LIVE
+ * ENTRY_STRATEGY=anchor
+ * ANCHOR_STRATEGY_ENABLED=true
+ * ANCHOR_ALLOW_FALLBACK=false
+ * ANCHOR_TRADE_SIZE=1.00
+ * ANCHOR_FAST_LANE=false
+ * ANCHOR_DEBUG_LOGS=true
+ * ```
+ */
+export function loadAnchorConfigFromEnv(fallbackEntryUsd = 1): AnchorStrategyConfig {
   return {
     enabled: String(process.env.ANCHOR_STRATEGY_ENABLED ?? "").toLowerCase() === "true",
     stabilityTicks: Number(process.env.ANCHOR_STABILITY_TICKS) || 3,
@@ -467,7 +498,7 @@ export function loadAnchorConfigFromEnv(): AnchorStrategyConfig {
     chainlinkMomReverseThreshold: Number(process.env.ANCHOR_MOM_REVERSE_THRESHOLD) || -0.0005,
     anchorPriceMin: Number(process.env.ANCHOR_PRICE_MIN) || 0.4,
     anchorPriceMax: Number(process.env.ANCHOR_PRICE_MAX) || 0.65,
-    tradeSize: Number(process.env.ANCHOR_TRADE_SIZE) || 1,
+    tradeSize: resolveAnchorTradeSizeUsd(fallbackEntryUsd),
     exitBufferSeconds: Number(process.env.ANCHOR_EXIT_BUFFER_SECONDS) || 30,
     maxYesMid: Number(process.env.ANCHOR_MAX_YES_MID) || 0.7,
     minSecondsToExpiry: Number(process.env.ANCHOR_MIN_SECONDS_TO_EXPIRY) || 60,

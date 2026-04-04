@@ -411,7 +411,6 @@ export class TradingEngine {
   private anchorTradedThisWindow = false;
   /** UI/API toggle; Anchor still requires ANCHOR_STRATEGY_ENABLED in .env. */
   private anchorRuntimeEnabled = true;
-
   /** Skip redundant WS `status` when phase copy is unchanged. */
   private lastBroadcastPredKey = "";
   private lastBroadcastPhaseKey = "";
@@ -1050,6 +1049,40 @@ export class TradingEngine {
 
   private anchorFastLaneEnabled(): boolean {
     return String(process.env.ANCHOR_FAST_LANE ?? "false").toLowerCase() === "true";
+  }
+
+  private validateAnchorLiveTestConfig(): void {
+    const mode = String(process.env.MODE ?? "").trim().toUpperCase();
+    const rawEntry = String(process.env.ENTRY_STRATEGY ?? "").trim().toLowerCase();
+    const anchorEntry = rawEntry === "anchor" || rawEntry === "book_imbalance";
+    if (mode !== "LIVE" || !anchorEntry) return;
+    if (String(process.env.ANCHOR_STRATEGY_ENABLED ?? "").toLowerCase() !== "true") {
+      this.log("SIGNAL", "[ANCHOR][WARN] LIVE anchor selected but ANCHOR_STRATEGY_ENABLED is not true");
+    }
+    if (this.anchorFallbackEnabled()) {
+      this.log("SIGNAL", "[ANCHOR][WARN] LIVE anchor selected but ANCHOR_ALLOW_FALLBACK is not false");
+    }
+    const szRaw = process.env.ANCHOR_TRADE_SIZE;
+    const szTrim = szRaw != null ? String(szRaw).trim() : "";
+    if (szTrim === "") {
+      this.log("SIGNAL", "[ANCHOR][WARN] LIVE anchor selected but ANCHOR_TRADE_SIZE is missing/invalid");
+    } else {
+      const n = Number(szTrim);
+      if (!Number.isFinite(n) || n <= 0) {
+        this.log("SIGNAL", "[ANCHOR][WARN] LIVE anchor selected but ANCHOR_TRADE_SIZE is missing/invalid");
+      }
+    }
+  }
+
+  /** Once per `init()`: resolved Anchor knobs (actual mode/size/toggles). */
+  private logAnchorStartupResolvedConfig(): void {
+    const cfg = loadAnchorConfigFromEnv(this.effEntryUsd());
+    const mode = this.wallet.getMode();
+    const selected = this.effectiveEntryStrategy() === "anchor";
+    this.log(
+      "SIGNAL",
+      `[ANCHOR][CONFIG] selected=${selected} mode=${mode} tradeSizeUsd=${cfg.tradeSize.toFixed(2)} allowFallback=${this.anchorFallbackEnabled()} fastLane=${this.anchorFastLaneEnabled()} enabled=${cfg.enabled && this.anchorRuntimeEnabled}`
+    );
   }
 
   /** Non–anchor strategy path only: optional rescue when `ANCHOR_ALLOW_FALLBACK=true`. */
@@ -2795,7 +2828,7 @@ export class TradingEngine {
   }
 
   private buildAnchorStrategySnapshotPayload(): AnchorStrategySnapshot {
-    const cfg = loadAnchorConfigFromEnv();
+    const cfg = loadAnchorConfigFromEnv(this.effEntryUsd());
     const last = this.lastAnchorSignal;
     const selectedAsEntry = this.effectiveEntryStrategy() === "anchor";
     return {
@@ -2831,14 +2864,14 @@ export class TradingEngine {
     event: "ANCHOR_SKIP" | "ANCHOR_SIGNAL" | "ANCHOR_ENTRY" | "ANCHOR_EXIT",
     payload: Record<string, unknown>
   ) {
-    const cfg = loadAnchorConfigFromEnv();
+    const cfg = loadAnchorConfigFromEnv(this.effEntryUsd());
     const line = JSON.stringify({ event, ts: Date.now(), ...payload });
     if (event === "ANCHOR_SIGNAL" && !cfg.anchorDebugLogs) return;
     this.log(event === "ANCHOR_ENTRY" || event === "ANCHOR_EXIT" ? "TRADE" : "SIGNAL", line);
   }
 
   private async maybeRunAnchorStrategy(): Promise<void> {
-    const cfg = loadAnchorConfigFromEnv();
+    const cfg = loadAnchorConfigFromEnv(this.effEntryUsd());
     if (!cfg.enabled) return;
     if (!this.anchorRuntimeEnabled) return;
 
@@ -2968,14 +3001,21 @@ export class TradingEngine {
       marketSlug: metaNow?.slug ?? null
     });
 
-    const result = await this.trade(sig.side!, cfg.tradeSize, "AUTO", `ANCHOR: ${sig.reason}`);
+    const amountUsd = cfg.tradeSize;
+    if (this.wallet.getMode() === "LIVE") {
+      this.log(
+        "TRADE",
+        `[ANCHOR][LIVE_TEST] amountUsd=${amountUsd.toFixed(2)} strategy=anchor fallback=${this.anchorFallbackEnabled()} mode=${this.wallet.getMode()}`
+      );
+    }
+    const result = await this.trade(sig.side!, amountUsd, "AUTO", `ANCHOR: ${sig.reason}`);
     if (result.accepted) {
       this.anchorTradedThisWindow = true;
     }
   }
 
   private async monitorAnchorExits(): Promise<void> {
-    const cfg = loadAnchorConfigFromEnv();
+    const cfg = loadAnchorConfigFromEnv(this.effEntryUsd());
     if (!cfg.enabled || !this.anchorRuntimeEnabled) return;
     const pending = this.trades.filter(
       (t) => t.status === "PENDING" && String(t.decisionReason ?? "").includes("ANCHOR:")
@@ -3071,6 +3111,8 @@ export class TradingEngine {
   async init() {
     const autoStart = String(process.env.AUTO_START_BOT ?? "true").toLowerCase() === "true";
     await this.wallet.init();
+    this.validateAnchorLiveTestConfig();
+    this.logAnchorStartupResolvedConfig();
     try {
       this.markets = await this.wallet.getMarkets(25);
       const autoSel = this.wallet.getDiscoveredSelection();
