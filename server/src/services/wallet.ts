@@ -5,6 +5,7 @@ import type { DirectionalContext, MarketContext, MarketOption } from "../types/i
 import { signatureTypeModeName } from "../constants/signatureType.js";
 import { resolveActiveUpDown5m } from "./marketDiscovery.js";
 import { batchBook } from "./clobService.js";
+import { normalizeRawOrderBook } from "./paperExecution.js";
 
 export class WalletService {
   private mode = (process.env.MODE as "SIMULATION" | "LIVE") || "SIMULATION";
@@ -789,6 +790,7 @@ export class WalletService {
 
   async placeOrder(input: { direction: "UP" | "DOWN"; amount: number; price: number }) {
     if (this.mode !== "LIVE") {
+      // Paper fills use engine → paperExecution.simulatePaperLimitBuy (best ask + PAPER_ENTRY_ASK_CROSS_BUFFER).
       return { orderID: "simulated", sizeFilled: input.amount, price: input.price, tokenID: "simulation" };
     }
     if (!this.client || !this.clobApiKeyReady) throw new Error("Polymarket client not initialized");
@@ -798,13 +800,26 @@ export class WalletService {
       throw new Error("Set CLOB_TOKEN_ID_UP/DOWN or enable AUTO_DISCOVER_UPDOWN for LIVE trading");
     }
 
+    let price = input.price;
+    const liveAskBuf = Number(process.env.LIVE_ENTRY_ASK_CROSS_BUFFER ?? "");
+    if (Number.isFinite(liveAskBuf) && liveAskBuf > 0) {
+      try {
+        const raw = await this.getRawOrderBook(tokenID);
+        const nb = normalizeRawOrderBook(raw);
+        if (nb?.bestAsk != null && Number.isFinite(nb.bestAsk)) {
+          price = Math.min(0.999, Math.max(price, nb.bestAsk + liveAskBuf));
+        }
+      } catch {
+        /* keep input.price */
+      }
+    }
+
     const tickSize = await this.client.getTickSize(tokenID);
     const negRisk = await this.client.getNegRisk(tokenID);
     const side = Side.BUY;
     // `amount` is treated by the engine/UI as collateral USD to risk.
     // In Polymarket CLOB limit orders, `size` is token conditional shares.
     // For BUY orders: collateral cost ~= price * size => size ~= collateral / price.
-    const price = input.price;
     const collateral = input.amount;
     const rawShares = price > 0 ? collateral / price : collateral;
     const tick = Number(tickSize);

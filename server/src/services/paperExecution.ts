@@ -164,8 +164,10 @@ export async function simulatePaperLimitBuy(params: PaperLimitBuyParams): Promis
     const nb = normalizeRawOrderBook(raw);
     if (!nb || nb.bestAsk == null) return null;
     let walkLimit = params.limitPrice;
-    if (paperAggressiveCross() && nb.bestAsk > params.limitPrice + 1e-12) {
-      walkLimit = Math.min(0.999, Math.max(params.limitPrice, nb.bestAsk));
+    const askCrossBuf = envNum("PAPER_ENTRY_ASK_CROSS_BUFFER", 0.002);
+    if (paperAggressiveCross() && nb.bestAsk != null && Number.isFinite(nb.bestAsk)) {
+      // Market-style BUY: cross at least best ask + small buffer (default 0.002) for fast paper fills.
+      walkLimit = Math.min(0.999, Math.max(params.limitPrice, nb.bestAsk + askCrossBuf));
     }
     if (walkLimit + 1e-12 < nb.bestAsk) return null;
     const ref = nb.bestAsk;

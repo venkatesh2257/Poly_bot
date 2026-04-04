@@ -50,6 +50,8 @@ export interface Prediction {
 export interface TradePaperLeg {
   missed?: boolean;
   tokenId?: string;
+  /** Wall-clock ms when paper entry fill completed (oracle settle min-hold guard). */
+  entryFilledAtMs?: number;
   entryVwap?: number;
   entryShares?: number;
   entryCostUsd?: number;

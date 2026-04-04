@@ -134,6 +134,18 @@ function paperBinarySettleEnabled() {
   return String(process.env.PAPER_BINARY_SETTLE ?? "true").toLowerCase() !== "false";
 }
 
+/** Min ms after paper entry fill before oracle-binary settlement (stops same-second settle vs stale PTB). Default 5m. */
+function paperOracleMinHoldMs() {
+  const n = envNum("PAPER_ORACLE_MIN_HOLD_MS", 300_000);
+  return Number.isFinite(n) && n >= 0 ? n : 300_000;
+}
+
+/** Skip new paper entries when Gamma window ends sooner than this (oracle settle race). Default 60s. */
+function paperEntryMinMsToWindowEnd() {
+  const n = envNum("PAPER_ENTRY_MIN_MS_TO_WINDOW_END", 60_000);
+  return Number.isFinite(n) && n >= 0 ? n : 60_000;
+}
+
 function simKellySizingEnabled() {
   return String(process.env.KELLY_SIZING ?? "true").toLowerCase() !== "false";
 }
@@ -2357,6 +2369,31 @@ export class TradingEngine {
         return;
       }
 
+      if (
+        this.wallet.getMode() === "SIMULATION" &&
+        paperBinarySettleEnabled() &&
+        !this.lagSnipeEnabled &&
+        !isOla
+      ) {
+        const meta = this.wallet.getDiscoveredMeta();
+        if (meta?.endDateIso) {
+          const endMs = new Date(meta.endDateIso).getTime();
+          if (!Number.isNaN(endMs)) {
+            const msLeft = endMs - Date.now();
+            const minLeftMs = paperEntryMinMsToWindowEnd();
+            if (msLeft < minLeftMs && msLeft > -60_000) {
+              const asset = this.wallet.getActiveDiscoveredAsset() ?? "?";
+              this.log(
+                "SIGNAL",
+                `[AUTO][SKIP] ORACLE_TOO_CLOSE asset=${asset} ms_to_window_end=${Math.round(msLeft)} min_required_ms=${minLeftMs}`
+              );
+              await this.maybeRunAnchorStrategy();
+              return;
+            }
+          }
+        }
+      }
+
       this.maybeRotateAnchorWindow();
       await this.recordAnchorBuffers();
       if (!olaFastLane) {
@@ -4045,6 +4082,7 @@ export class TradingEngine {
       paper: {
         missed: false,
         tokenId,
+        entryFilledAtMs: Date.now(),
         entryVwap: fill.vwap,
         entryShares: fill.filledShares,
         entryCostUsd: fill.notionalUsd,
@@ -4121,6 +4159,26 @@ export class TradingEngine {
   }
 
   /**
+   * Oracle-binary paper settle must not run in the same moment as entry fill (stale PTB/oracle race).
+   * Re-queues `resolveTrade` until `PAPER_ORACLE_MIN_HOLD_MS` have passed since `entryFilledAtMs`.
+   */
+  private deferPaperOracleSettlementIfNeeded(t: Trade, tradeId: string): boolean {
+    const minHoldMs = paperOracleMinHoldMs();
+    if (minHoldMs <= 0) return false;
+    const entryTs = t.paper?.entryFilledAtMs;
+    if (entryTs == null || entryTs <= 0) return false;
+    const elapsed = Date.now() - entryTs;
+    if (elapsed >= minHoldMs) return false;
+    const wait = Math.max(250, minHoldMs - elapsed);
+    this.log(
+      "SIGNAL",
+      `PAPER_ORACLE_SETTLE_DEFER trade=${tradeId.slice(0, 8)}… wait_ms=${Math.round(wait)} min_hold_ms=${minHoldMs} elapsed_ms=${Math.round(elapsed)}`
+    );
+    setTimeout(() => this.resolveTrade(tradeId), wait);
+    return true;
+  }
+
+  /**
    * Session-close outcome source of truth:
    * - UP wins only when close spot > target.
    * - DOWN wins only when close spot < target.
@@ -4130,10 +4188,15 @@ export class TradingEngine {
   private evaluateSessionCloseOutcome(
     direction: Direction,
     asset: string,
-    targetFallbackUsd?: number
+    targetFallbackUsd?: number,
+    opts?: { preferEntryTarget?: boolean }
   ): { ready: true; isWin: boolean } | { ready: false; reason: string } {
     const a = asset.trim().toUpperCase();
-    const ptb = this.priceToBeatByAsset.get(a) ?? targetFallbackUsd ?? null;
+    const fromMap = this.priceToBeatByAsset.get(a);
+    const entryOk =
+      targetFallbackUsd != null && Number.isFinite(targetFallbackUsd) && targetFallbackUsd > 0;
+    const ptb =
+      opts?.preferEntryTarget && entryOk ? targetFallbackUsd : (fromMap ?? targetFallbackUsd ?? null);
     if (ptb == null || !Number.isFinite(ptb) || ptb <= 0) {
       return { ready: false, reason: `target missing for ${a}` };
     }
@@ -4170,7 +4233,9 @@ export class TradingEngine {
     const t = this.trades[idx];
     if (!t || t.status !== "PENDING") return;
     const asset = (t.asset ?? "BTC").toUpperCase();
-    const settle = this.evaluateSessionCloseOutcome(t.direction, asset, t.targetPriceUsdAtEntry);
+    const settle = this.evaluateSessionCloseOutcome(t.direction, asset, t.targetPriceUsdAtEntry, {
+      preferEntryTarget: true
+    });
     if (!settle.ready) {
       this.scheduleSettleRetry(t.id, settle.reason, 1200, "Lag Snipe settle waiting feed");
       return;
@@ -4238,7 +4303,7 @@ export class TradingEngine {
     this.pushStatus();
     this.log(
       isWin ? "WIN" : "ERROR",
-      `PAPER oracle-binary settle ${settled.direction} P&L $${settled.pnl.toFixed(2)} (oracle vs PTB)`
+      `PAPER oracle-binary settle ${settled.direction} P&L $${settled.pnl.toFixed(2)} (oracle vs entry-PTB; min-hold ok)`
     );
     if (this.stopLossTriggered) {
       this.setPhase("ERROR", "Stop loss reached; engine stopped");
@@ -4388,7 +4453,9 @@ export class TradingEngine {
     const t = this.trades[idx];
     if (!t || t.status !== "PENDING") return;
     const asset = (t.asset ?? this.wallet.getActiveDiscoveredAsset() ?? "BTC").toUpperCase();
-    const settle = this.evaluateSessionCloseOutcome(t.direction, asset, t.targetPriceUsdAtEntry);
+    const settle = this.evaluateSessionCloseOutcome(t.direction, asset, t.targetPriceUsdAtEntry, {
+      preferEntryTarget: true
+    });
     if (!settle.ready) {
       this.scheduleSettleRetry(t.id, settle.reason, 1200, "Settle waiting feed");
       return;
@@ -4598,6 +4665,7 @@ export class TradingEngine {
     ) {
       const useOracleBinary = Boolean(t.lagSnipeHold) || paperBinarySettleEnabled();
       if (useOracleBinary) {
+        if (this.deferPaperOracleSettlementIfNeeded(t, tradeId)) return;
         void this.finalizePaperOracleBinarySettlement(idx);
       } else {
         void this.finalizePaperTradeExit(idx);

@@ -51,7 +51,6 @@ import {
   OverviewSubNav,
   RiskBetSettingsModal,
   SnipeAssetCardsRow,
-  AnchorStrategyEntryPanel,
   StrategyModulesStrip,
   type OverviewSubTab
 } from "./copyProUi";
@@ -1881,6 +1880,40 @@ export function App() {
     pushInspectionUi(`UI: ${hint}`);
   };
 
+  const anchorRuntimeOn = Boolean(tradingState?.anchorStrategy?.runtimeEnabled);
+  const anchorEnvOff = tradingState?.anchorStrategy?.envEnabled === false;
+  const anchorControlTitle = useMemo(() => {
+    const a = tradingState?.anchorStrategy;
+    const tail =
+      "Choose Anchor ON or OFF below (same idea as picking an entry mode). Polymarket evaluation only runs when Effective is on (needs ANCHOR_STRATEGY_ENABLED=true in server/.env + restart).";
+    if (!a) {
+      return `Bid-depth + Chainlink momentum after main entry skips. ${tail}`;
+    }
+    const n = a.stabilityTicks ?? 3;
+    const rec = Math.min(a.ticksRecorded ?? 0, n);
+    const imb = a.lastSignal?.imbalanceScore;
+    const imbS = imb != null && Number.isFinite(imb) ? imb.toFixed(2) : "—";
+    const mom = a.lastSignal?.chainlinkMom;
+    const momS = mom != null && Number.isFinite(mom) ? `${(mom * 100).toFixed(3)}%` : "—";
+    const px = a.lastSignal?.anchorPrice != null ? a.lastSignal.anchorPrice.toFixed(3) : "—";
+    return `Env ${a.envEnabled ? "on" : "off"} · Effective ${a.effectiveEnabled ? "on" : "off"} · Stability ${rec}/${n} · imbalance ${imbS} · CL mom ${momS} · Anchor px ${px}. ${tail}`;
+  }, [tradingState?.anchorStrategy]);
+
+  const handleAnchorRuntimeSet = (enabled: boolean) => {
+    if (!isLoggedIn) {
+      openLoginModal("Sign in to control Anchor strategy.");
+      return;
+    }
+    if (Boolean(tradingState?.anchorStrategy?.runtimeEnabled) === enabled) return;
+    setAnchorBusy(true);
+    void api
+      .setAnchorStrategy(enabled)
+      .then(() => api.tradingState())
+      .then(setTradingState)
+      .catch((e) => pushLog("ERROR", e instanceof Error ? e.message : String(e)))
+      .finally(() => setAnchorBusy(false));
+  };
+
   const handleStartBotClick = () => {
     if (!isLoggedIn) {
       openLoginModal("Sign in with User ID / Password (server APP_USER_ID / APP_PASSWORD), then start the bot.");
@@ -2484,23 +2517,6 @@ export function App() {
                 Contrarian is set in <code className="text-slate-300">ENTRY_STRATEGY</code>. Choose a mode below to override from the UI.
               </p>
             ) : null}
-            <AnchorStrategyEntryPanel
-              anchor={tradingState?.anchorStrategy}
-              anchorBusy={anchorBusy}
-              onAnchorToggle={(enabled) => {
-                if (!isLoggedIn) {
-                  openLoginModal("Sign in to toggle Anchor Strategy.");
-                  return;
-                }
-                setAnchorBusy(true);
-                void api
-                  .setAnchorStrategy(enabled)
-                  .then(() => api.tradingState())
-                  .then(setTradingState)
-                  .catch((e) => pushLog("ERROR", e instanceof Error ? e.message : String(e)))
-                  .finally(() => setAnchorBusy(false));
-              }}
-            />
             <div className="flex flex-wrap gap-1.5">
               {(
                 [
@@ -2531,6 +2547,32 @@ export function App() {
                   </button>
                 );
               })}
+              <button
+                type="button"
+                disabled={!isLoggedIn || anchorBusy}
+                onClick={() => handleAnchorRuntimeSet(true)}
+                title={`${anchorControlTitle} — set runtime ON.`}
+                className={`rounded-md px-2.5 py-1 text-[10px] font-semibold transition ${
+                  anchorRuntimeOn
+                    ? "bg-orange-500/20 text-orange-200 ring-1 ring-orange-400/45"
+                    : "bg-slate-800 text-slate-300 hover:bg-slate-700"
+                } disabled:cursor-not-allowed disabled:opacity-50`}
+              >
+                Anchor ON
+              </button>
+              <button
+                type="button"
+                disabled={!isLoggedIn || anchorBusy}
+                onClick={() => handleAnchorRuntimeSet(false)}
+                title={`${anchorControlTitle} — set runtime OFF.`}
+                className={`rounded-md px-2.5 py-1 text-[10px] font-semibold transition ${
+                  !anchorRuntimeOn
+                    ? "bg-slate-600/35 text-slate-100 ring-1 ring-slate-500/55"
+                    : "bg-slate-800 text-slate-300 hover:bg-slate-700"
+                } disabled:cursor-not-allowed disabled:opacity-50`}
+              >
+                Anchor OFF
+              </button>
               <button
                 type="button"
                 disabled={!isLoggedIn || entryStrategyBusy || entryStrategyUi.runtimeOverride == null}
@@ -2565,6 +2607,13 @@ export function App() {
                 Start Spot-Poly Lag 🎯
               </button>
             </div>
+            {anchorEnvOff ? (
+              <p className="text-[10px] leading-snug text-slate-500">
+                Env flag off: you can still set Anchor ON/OFF above. Live evaluation needs{" "}
+                <code className="text-slate-400">ANCHOR_STRATEGY_ENABLED=true</code> in{" "}
+                <code className="text-slate-400">server/.env</code> and a server restart (until then, Effective stays off).
+              </p>
+            ) : null}
             {lagSnipeOn ? (
               <p className="text-[10px] font-medium text-amber-200/95">
                 {tradingState?.lagSnipeBanner ?? "Lag Snipe: HOLD Manual Exit"} — other strategies paused for entries.
