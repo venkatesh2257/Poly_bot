@@ -43,6 +43,14 @@ import {
   getChainlinkPriceHistoryBufferForAsset,
   getOracleAgeMsForTrend
 } from "../realtime.js";
+import {
+  classifyOracleStale,
+  evaluateOracleDirectionFlipGate,
+  freshOracleWindowState,
+  loadOracleGateEnv,
+  updateOracleWindowStateFromChainlink,
+  type OracleWindowState
+} from "./oracleWindowGate.js";
 import { computeEnsemble, type MidSample } from "./ensembleStrategy.js";
 import { evaluateWhaleEdgeGate, whalePaperTakeProfitMid } from "./whaleStrategy.js";
 import { runConnectivityPings } from "./apiPings.js";
@@ -149,12 +157,6 @@ function paperOracleMinHoldMs() {
 function paperEntryMinMsToWindowEnd() {
   const n = envNum("PAPER_ENTRY_MIN_MS_TO_WINDOW_END", 60_000);
   return Number.isFinite(n) && n >= 0 ? n : 60_000;
-}
-
-/** Auto-entry: max oracle tick age (ms) vs freshest of raw Chainlink `updatedAt` and RTDS (see `getOracleAgeMsForTrend`). Default 15s (~Polygon CL heartbeat). */
-function oracleMaxAgeMsForEntry() {
-  const n = envNum("ORACLE_MAX_AGE_MS_ENTRY", 15_000);
-  return Number.isFinite(n) && n >= 250 ? n : 15_000;
 }
 
 /** Skip auto-entries when less than this many ms remain in the Gamma window (last-2m style guard). Default 120s. */
@@ -341,6 +343,13 @@ export class TradingEngine {
   private chainlinkFeed = new ChainlinkFeedService();
   /** Cached latest Chainlink tick; used as “oracle spot” for multi-asset strike/oracle. */
   private chainlinkUsdByAsset = new Map<string, ChainlinkUsdPriceTick>();
+  /** Wall-clock time of last successful Chainlink RPC tick per asset (canonical freshness with on-chain `updatedAt`). */
+  private chainlinkLastSuccessfulFetchMs = new Map<string, number>();
+  /** Per-asset 5m window oracle strike / flip / strike-based trend (BTC/ETH/SOL/XRP). */
+  private oracleWindowStateByAsset = new Map<string, OracleWindowState>();
+  private lastOracleWindowLogKeyByAsset = new Map<string, string>();
+  private lastChainlinkLiveLogKeyByAsset = new Map<string, string>();
+  private chainlinkInvalidAnswerTsWarned = new Set<string>();
   private gammaDisplayByAsset = new Map<
     string,
     { up: number; down: number; priceToBeat?: number; updatedMs: number }
@@ -447,6 +456,74 @@ export class TradingEngine {
       return Math.max(500, parsed);
     }
     return 120_000;
+  }
+
+  private oracleSourcePrefersChainlink(): boolean {
+    const s = String(process.env.ORACLE_SOURCE ?? "chainlink").trim().toLowerCase();
+    return s === "" || s === "chainlink";
+  }
+
+  private isValidChainlinkAnswerTimestamp(updatedAtMs: number, nowMs: number): boolean {
+    if (!Number.isFinite(updatedAtMs) || updatedAtMs <= 0) return false;
+    if (updatedAtMs > nowMs + 120_000) return false;
+    const age = nowMs - updatedAtMs;
+    if (!Number.isFinite(age) || age < 0) return false;
+    if (age > 86400 * 365 * 1000) return false;
+    return true;
+  }
+
+  /**
+   * Chainlink entry-gating freshness: authoritative = on-chain answer `updatedAt` age when valid;
+   * else receipt age (last successful transport). `fetchAgeMs` mirrors transport latency diagnostic only.
+   */
+  private chainlinkFreshnessDiagnostics(asset: string): {
+    gateAgeMs: number | null;
+    answerAgeMs: number | null;
+    fetchAgeMs: number | null;
+    receiptAgeMs: number | null;
+  } {
+    const a = this.chainlinkAsset(asset);
+    if (!a) {
+      return { gateAgeMs: null, answerAgeMs: null, fetchAgeMs: null, receiptAgeMs: null };
+    }
+    const now = Date.now();
+    const tick = this.chainlinkUsdByAsset.get(a);
+    const fetchMs = this.chainlinkLastSuccessfulFetchMs.get(a);
+    const fetchAgeMs =
+      fetchMs != null && Number.isFinite(fetchMs) ? Math.max(0, now - fetchMs) : null;
+    const receiptAgeMs = fetchAgeMs;
+
+    let answerAgeMs: number | null = null;
+    if (tick != null && this.isValidChainlinkAnswerTimestamp(tick.updatedAt, now)) {
+      answerAgeMs = Math.max(0, now - tick.updatedAt);
+    } else if (tick != null && Number.isFinite(tick.updatedAt)) {
+      if (!this.chainlinkInvalidAnswerTsWarned.has(a)) {
+        this.chainlinkInvalidAnswerTsWarned.add(a);
+        this.log(
+          "SIGNAL",
+          `[CHAINLINK][WARN] asset=${a} invalid_or_ignored_answer_timestamp updatedAt=${tick.updatedAt} — using receipt age for gate if available`
+        );
+      }
+    }
+
+    const gateAgeMs = answerAgeMs != null ? answerAgeMs : receiptAgeMs;
+    return { gateAgeMs, answerAgeMs, fetchAgeMs, receiptAgeMs };
+  }
+
+  private oracleChainlinkGateAgeMs(asset: string): number | null {
+    return this.chainlinkFreshnessDiagnostics(asset).gateAgeMs;
+  }
+
+  /** Canonical age for auto-trade oracle gates (Chainlink-first when ORACLE_SOURCE=chainlink). */
+  private oracleEntryAgeMsForGate(asset: string): number | null {
+    const rawCl = this.oracleChainlinkRawAgeMsForAsset(asset);
+    const rtds = this.polymarketRtds.getAgeMsForAsset(asset);
+    if (this.oracleSourcePrefersChainlink() && this.chainlinkAsset(asset)) {
+      const g = this.oracleChainlinkGateAgeMs(asset);
+      if (g != null) return g;
+      return getOracleAgeMsForTrend(rawCl, rtds);
+    }
+    return getOracleAgeMsForTrend(rawCl, rtds);
   }
 
   /** Wall-clock bucket length for which asset is “in focus” (default 300s = 5m). */
@@ -613,14 +690,6 @@ export class TradingEngine {
     const tick = this.chainlinkUsdByAsset.get(a);
     if (!tick || !Number.isFinite(tick.updatedAt)) return null;
     return Math.max(0, Date.now() - tick.updatedAt);
-  }
-
-  /** Freshest of Chainlink on-chain age and RTDS age for auto-entry / anchor oracle gates. */
-  private oracleMergedAgeMsForEntryGate(asset: string): number | null {
-    return getOracleAgeMsForTrend(
-      this.oracleChainlinkRawAgeMsForAsset(asset),
-      this.polymarketRtds.getAgeMsForAsset(asset)
-    );
   }
 
   /** Per-asset oracle trend for auto-trade (min samples + fresh last tick). Anchor BTC buffer unchanged. */
@@ -2603,14 +2672,27 @@ export class TradingEngine {
 
       const assetGate = this.wallet.getActiveDiscoveredAsset() ?? "BTC";
       if (!this.lagSnipeEnabled && !isOla) {
-        const maxOracleAge = oracleMaxAgeMsForEntry();
-        const gateAgeMs = this.oracleMergedAgeMsForEntryGate(assetGate);
-        if (gateAgeMs == null || gateAgeMs > maxOracleAge) {
-          const ageDisp = gateAgeMs == null ? "null" : String(Math.round(gateAgeMs));
-          this.log(
-            "SIGNAL",
-            `[AUTO][SKIP] ORACLE_STALE asset=${assetGate} ageMs=${ageDisp} max_ms=${maxOracleAge}`
-          );
+        const oEnv = loadOracleGateEnv();
+        const gateAgeMs = this.oracleEntryAgeMsForGate(assetGate);
+        const staleCls = classifyOracleStale(gateAgeMs, oEnv);
+        const clStaleLog = () => {
+          if (!this.chainlinkAsset(assetGate)) {
+            const g = gateAgeMs == null ? "null" : String(Math.round(gateAgeMs));
+            return `gateAgeMs=${g}`;
+          }
+          const d = this.chainlinkFreshnessDiagnostics(assetGate);
+          const g = gateAgeMs == null ? "null" : String(Math.round(gateAgeMs));
+          const a = d.answerAgeMs == null ? "null" : String(Math.round(d.answerAgeMs));
+          const f = d.fetchAgeMs == null ? "null" : String(Math.round(d.fetchAgeMs));
+          return `gateAgeMs=${g} answerAgeMs=${a} fetchAgeMs=${f}`;
+        };
+        if (staleCls === "hard") {
+          this.log("SIGNAL", `[AUTO][SKIP] ORACLE_STALE_HARD asset=${assetGate} ${clStaleLog()}`);
+          await this.runAnchorFallbackNonPrimary();
+          return;
+        }
+        if (staleCls === "soft") {
+          this.log("SIGNAL", `[AUTO][SKIP] ORACLE_STALE_SOFT asset=${assetGate} ${clStaleLog()}`);
           await this.runAnchorFallbackNonPrimary();
           return;
         }
@@ -2666,42 +2748,52 @@ export class TradingEngine {
         return;
       }
       if (!isOla && !this.lagSnipeEnabled) {
-        const ot = this.oracleTrendForAutoTradeGate(assetGate);
-        if (ot.kind === "insufficient") {
+        const oEnv = loadOracleGateEnv();
+        const metaOg = this.wallet.getDiscoveredMeta();
+        const wsSec = metaOg?.windowStartSec;
+        const windowStartMs = wsSec != null ? wsSec * 1000 : null;
+        let owState =
+          this.oracleWindowStateByAsset.get(assetGate) ??
+          freshOracleWindowState(wsSec ?? 0, this.priceToBeatByAsset.get(assetGate) ?? null, Date.now());
+        if (this.chainlinkAsset(assetGate) && (owState.strikePrice == null || owState.strikePrice <= 0)) {
+          const sk = this.priceToBeatByAsset.get(assetGate);
+          if (sk != null && Number.isFinite(sk) && sk > 0 && wsSec != null) {
+            owState = freshOracleWindowState(wsSec, sk, Date.now());
+          }
+        }
+        const dirGate = evaluateOracleDirectionFlipGate({
+          intendedDir: direction,
+          state: owState,
+          nowMs: Date.now(),
+          windowStartMs,
+          env: oEnv
+        });
+        if (!dirGate.ok) {
+          if (dirGate.code === "STRIKE_PENDING") {
+            this.log(
+              "SIGNAL",
+              `[AUTO][SKIP] ORACLE_TREND_INSUFFICIENT asset=${assetGate} samples=0 min_samples=1 (strike/window pending)`
+            );
+            await this.runAnchorFallbackNonPrimary();
+            return;
+          }
           this.log(
             "SIGNAL",
-            `[AUTO][SKIP] ORACLE_TREND_INSUFFICIENT asset=${assetGate} samples=${ot.samples} min_samples=${ot.min}`
+            `[AUTO][SKIP] ORACLE_TREND_MISMATCH_CONFIRMED asset=${assetGate} momentum=${this.rawMomentumSide()} oracle_trend=${owState.trend} deltaBps=${owState.trendDeltaBps.toFixed(0)} flips=${owState.flipCountInWindow} oppTicks=${owState.consecutiveOppositeTicks}`
           );
           await this.runAnchorFallbackNonPrimary();
           return;
         }
-        if (ot.kind === "stale") {
-          const ageDisp = ot.ageMs == null ? "null" : String(Math.round(ot.ageMs));
-          this.log(
-            "SIGNAL",
-            `[AUTO][SKIP] ORACLE_TREND_STALE asset=${assetGate} ageMs=${ageDisp} max_ms=${ot.max}`
-          );
-          await this.runAnchorFallbackNonPrimary();
-          return;
-        }
-        const oracleTrend = ot.trend;
-        const momentumSide = this.rawMomentumSide();
-        if (momentumSide !== oracleTrend) {
-          this.log(
-            "SIGNAL",
-            `[AUTO][SKIP] ORACLE_TREND_MISMATCH asset=${assetGate} momentum=${momentumSide} oracle_trend=${oracleTrend}`
-          );
-          await this.runAnchorFallbackNonPrimary();
-          return;
-        }
-        if (direction !== oracleTrend) {
-          this.log(
-            "SIGNAL",
-            `[AUTO][SKIP] DIRECTION_MISMATCH asset=${assetGate} dir=${direction} oracle_trend=${oracleTrend}`
-          );
-          await this.runAnchorFallbackNonPrimary();
-          return;
-        }
+        const ageOk = this.oracleEntryAgeMsForGate(assetGate);
+        const okDiag = this.chainlinkAsset(assetGate) ? this.chainlinkFreshnessDiagnostics(assetGate) : null;
+        const okExtra =
+          okDiag != null
+            ? ` gateAgeMs=${ageOk == null ? "null" : Math.round(ageOk)} answerAgeMs=${okDiag.answerAgeMs == null ? "null" : Math.round(okDiag.answerAgeMs)} fetchAgeMs=${okDiag.fetchAgeMs == null ? "null" : Math.round(okDiag.fetchAgeMs)}`
+            : ` ageMs=${ageOk == null ? "null" : Math.round(ageOk)}`;
+        this.log(
+          "SIGNAL",
+          `[AUTO][ORACLE_OK] asset=${assetGate} trend=${dirGate.trend} deltaBps=${dirGate.deltaBps.toFixed(0)} flips=${dirGate.flips} oppTicks=${dirGate.oppTicks}${okExtra}`
+        );
       }
       const whaleGate = this.whaleEdgeGateOrOk(direction);
       if (!whaleGate.ok) {
@@ -2936,8 +3028,9 @@ export class TradingEngine {
     const buf = getChainlinkPriceHistoryBuffer();
     const hist = buf.snapshot();
     const tsMs = buf.snapshotTimestampsMs();
+    const anchorAsset = this.wallet.getActiveDiscoveredAsset() ?? "BTC";
     const oracleAgeMs =
-      this.oracleMergedAgeMsForEntryGate("BTC") ?? this.oracleAgeMsForAsset("BTC");
+      this.oracleEntryAgeMsForGate(anchorAsset) ?? this.oracleAgeMsForAsset(anchorAsset);
 
     const sig = evaluateAnchorStrategy(
       snap,
@@ -3325,7 +3418,11 @@ export class TradingEngine {
               );
               for (let i = 0; i < chainlinkAssetsToPoll.length; i++) {
                 const tick = ticks[i];
-                if (tick) chainlinkTicksByAsset.set(chainlinkAssetsToPoll[i], tick);
+                const sym = chainlinkAssetsToPoll[i];
+                if (tick) {
+                  chainlinkTicksByAsset.set(sym, tick);
+                  this.chainlinkLastSuccessfulFetchMs.set(sym, Date.now());
+                }
               }
               // Always keep oracle spot + age from Chainlink only when it's fresh.
               for (const [asset, tick] of chainlinkTicksByAsset.entries()) {
@@ -3360,6 +3457,56 @@ export class TradingEngine {
               }
 
               this.logOracleSourceIfChanged(chainlinkAssetsToPoll);
+
+              const gateEnv = loadOracleGateEnv();
+              const nowOr = Date.now();
+              for (const a of chainlinkAssetsToPoll) {
+                const tick = chainlinkTicksByAsset.get(a);
+                if (!tick) continue;
+                const ws = windowStartByChainlinkAsset.get(a);
+                const strike = this.priceToBeatByAsset.get(a);
+                if (ws == null || strike == null || !Number.isFinite(strike) || strike <= 0) continue;
+                let st = this.oracleWindowStateByAsset.get(a);
+                if (!st || st.windowSec !== ws) {
+                  st = freshOracleWindowState(ws, strike, nowOr);
+                } else if (st.strikePrice != null && Math.abs(st.strikePrice - strike) > 1e-6) {
+                  st = freshOracleWindowState(ws, strike, nowOr);
+                }
+                const prevFlips = st.flipCountInWindow;
+                const fetchT = this.chainlinkLastSuccessfulFetchMs.get(a);
+                const fetchAgeMs = fetchT != null ? Math.max(0, nowOr - fetchT) : null;
+                const answerTsOk = this.isValidChainlinkAnswerTimestamp(tick.updatedAt, nowOr);
+                const answerAgeMs = answerTsOk ? Math.max(0, nowOr - tick.updatedAt) : null;
+                const gateAgeMsLive =
+                  answerAgeMs != null ? answerAgeMs : fetchAgeMs != null ? fetchAgeMs : null;
+                const liveKey = `${tick.price.toFixed(1)}|${gateAgeMsLive == null ? "na" : Math.floor(gateAgeMsLive / 2000)}`;
+                if (this.lastChainlinkLiveLogKeyByAsset.get(a) !== liveKey) {
+                  this.lastChainlinkLiveLogKeyByAsset.set(a, liveKey);
+                  const aa = answerAgeMs == null ? "null" : String(Math.round(answerAgeMs));
+                  const fa = fetchAgeMs == null ? "null" : String(Math.round(fetchAgeMs));
+                  const ga = gateAgeMsLive == null ? "null" : String(Math.round(gateAgeMsLive));
+                  this.log(
+                    "SIGNAL",
+                    `[CHAINLINK][LIVE] asset=${a} price=${tick.price.toFixed(2)} answerAgeMs=${aa} fetchAgeMs=${fa} gateAgeMs=${ga} source=chainlink`
+                  );
+                }
+                const next = updateOracleWindowStateFromChainlink(st, tick.price, nowOr, gateEnv);
+                this.oracleWindowStateByAsset.set(a, next);
+                const winKey = `${next.windowSec}|${next.trend}|${next.trendDeltaBps.toFixed(1)}|${strike.toFixed(1)}`;
+                if (this.lastOracleWindowLogKeyByAsset.get(a) !== winKey) {
+                  this.lastOracleWindowLogKeyByAsset.set(a, winKey);
+                  this.log(
+                    "SIGNAL",
+                    `[CHAINLINK][WINDOW] asset=${a} windowSec=${next.windowSec} strike=${strike.toFixed(2)} trend=${next.trend} deltaBps=${next.trendDeltaBps.toFixed(1)}`
+                  );
+                }
+                if (next.flipCountInWindow > prevFlips) {
+                  this.log(
+                    "SIGNAL",
+                    `[CHAINLINK][FLIP] asset=${a} windowSec=${ws} flipCount=${next.flipCountInWindow} side=${next.lastSideAboveStrike ?? "?"} deltaBps=${next.trendDeltaBps.toFixed(0)}`
+                  );
+                }
+              }
             }
 
             this.multiSlotBooks = Object.fromEntries(entries);
@@ -3398,7 +3545,7 @@ export class TradingEngine {
                         "SIGNAL",
                         `[CHAINLINK] strike captured asset=${assetUpper} windowSec=${ws} price=$${tick.price.toFixed(
                           2
-                        )} source=chainlink`
+                        )} source=chainlink deltaBps=0 flipsReset=1`
                       );
                       // Ensure oracle spot uses Chainlink for this asset during the window.
                       this.chainlinkUsdByAsset.set(assetUpper, tick);
@@ -3461,6 +3608,11 @@ export class TradingEngine {
             this.priceToBeatByAsset.clear();
             this.oracleWindowTrackedByAsset.clear();
             this.chainlinkUsdByAsset.clear();
+            this.oracleWindowStateByAsset.clear();
+            this.lastOracleWindowLogKeyByAsset.clear();
+            this.chainlinkLastSuccessfulFetchMs.clear();
+            this.lastChainlinkLiveLogKeyByAsset.clear();
+            this.chainlinkInvalidAnswerTsWarned.clear();
             this.recordEnsembleMidSample();
           }
           this.lastBookRefreshMs = Date.now();
