@@ -11,6 +11,7 @@ import type {
   Insights,
   MarketOption,
   Mode,
+  SetModeResponse,
   PingResponse,
   PolymarketAccountSummary,
   PasswordLoginResponse,
@@ -99,17 +100,17 @@ export const api = {
       method: "POST",
       body: JSON.stringify({ asset, enabled })
     }),
-  setMode: (mode: Mode) =>
-    request<{ ok: boolean; mode: Mode; reason?: string }>("/mode", {
+  setMode: (body: { mode: Mode }) =>
+    request<SetModeResponse>("/mode", {
       method: "POST",
-      body: JSON.stringify({ mode })
+      body: JSON.stringify(body)
     }),
   /**
    * Alias for execution-mode toggle.
    * Body: { simulation: boolean } where true = SIMULATION (paper), false = LIVE (real CLOB).
    */
   setConfig: (body: { simulation: boolean }) =>
-    request<{ ok: boolean; mode: Mode; reason?: string }>("/config", {
+    request<SetModeResponse>("/config", {
       method: "POST",
       body: JSON.stringify(body)
     }),

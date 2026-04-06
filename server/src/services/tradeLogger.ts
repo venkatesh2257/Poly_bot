@@ -70,6 +70,8 @@ function toProb(t: Trade): number | null {
 function toExitPrice(t: Trade): number | null {
   if (t.status === "WIN") return 1;
   if (t.status === "LOSS") return 0;
+  if (t.status === "CLOSED" && t.paper?.exitVwap != null && Number.isFinite(t.paper.exitVwap)) return t.paper.exitVwap;
+  if (t.status === "CLOSED") return Number(t.pnl ?? 0) >= 0 ? 1 : 0;
   return null;
 }
 
@@ -109,8 +111,10 @@ export class TradeLogger {
   }
 
   async recordSettledTrade(t: Trade, ts = Date.now()) {
-    if (t.status !== "WIN" && t.status !== "LOSS") return;
+    if (t.status !== "WIN" && t.status !== "LOSS" && t.status !== "CLOSED") return;
     const db = this.ensureDb();
+    const persistedStatus: "WIN" | "LOSS" =
+      t.status === "CLOSED" ? (Number(t.pnl ?? 0) >= 0 ? "WIN" : "LOSS") : t.status;
     const row: TradeLogRow = {
       id: t.id,
       timeIso: new Date(ts).toISOString(),
@@ -121,7 +125,7 @@ export class TradeLogger {
       entry: Number(t.price ?? 0),
       exit: toExitPrice(t),
       pnl: Number(t.pnl ?? 0),
-      status: t.status
+      status: persistedStatus
     };
     await db.run(
       `INSERT INTO trades (id, time_iso, closed_at_ms, asset, strategy, side, prob, entry, exit, pnl, status)

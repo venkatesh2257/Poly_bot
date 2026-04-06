@@ -8,11 +8,22 @@ import { createApiRouter } from "./routes/api.js";
 import { TradingEngine } from "./services/engine.js";
 import { AuthService } from "./services/auth.js";
 import { TradeLogger } from "./services/tradeLogger.js";
+import { applyDefaultPaperTestEnv } from "./services/executionFlags.js";
 import spotPolyLag from "../../src/strategies/spotPolyLag.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 config({ path: path.resolve(__dirname, "../.env") });
+applyDefaultPaperTestEnv();
+{
+  const modeRaw = String(process.env.MODE ?? "").trim().toUpperCase();
+  const ex = String(process.env.EXECUTE_TRADES ?? "").trim().toLowerCase();
+  if (modeRaw === "LIVE" && ex !== "true") {
+    console.warn(
+      "[STARTUP][WARN] MODE=LIVE but EXECUTE_TRADES is not true; live orders will not be sent"
+    );
+  }
+}
 
 const PORT = Number(process.env.PORT ?? 4000);
 const WS_PORT = Number(process.env.WS_PORT ?? 4001);
@@ -66,7 +77,7 @@ wsServer.on("connection", (socket) => {
 
 engine.onMarket = (data) => send({ type: "market", payload: data });
 engine.onPrediction = (data) => send({ type: "prediction", payload: data });
-engine.onTrades = (data) => send({ type: "trade", payload: data });
+engine.onTrades = () => send({ type: "trade", payload: engine.getTrades() });
 engine.onStatus = (data) => send({ type: "status", payload: data });
 engine.onLog = (data) => send({ type: "log", payload: data });
 engine.onBetLog = (data) => send({ type: "betLog", payload: data });
@@ -86,7 +97,7 @@ void (async () => {
   setInterval(() => {
     const trades = engine.getTrades();
     for (const t of trades) {
-      if (t.status !== "WIN" && t.status !== "LOSS") continue;
+      if (t.status !== "WIN" && t.status !== "LOSS" && t.status !== "CLOSED") continue;
       const key = `${t.id}:${t.status}:${Number(t.pnl ?? 0).toFixed(4)}`;
       if (seenSettled.has(key)) continue;
       seenSettled.add(key);

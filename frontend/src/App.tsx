@@ -113,6 +113,14 @@ function tradePnlUsd(t: Trade): number {
   return Number.isFinite(x) ? x : 0;
 }
 
+function tradeRowOpenForUi(t: Trade): boolean {
+  return t.status === "PENDING" || t.status === "OPEN";
+}
+
+function tradeRowClosedForUi(t: Trade): boolean {
+  return t.status === "WIN" || t.status === "LOSS" || t.status === "CLOSED";
+}
+
 /** CLOB mid (0–1) → display % (e.g. 0.52 → 52.00). */
 function fmtEntryMidPct(v: number | undefined): string {
   if (v == null || !Number.isFinite(v)) return "—";
@@ -123,10 +131,77 @@ function isPaperNoFill(t: Trade): boolean {
   return Boolean(t.paper?.missed);
 }
 
+function tradeEntryFillPct(t: Trade): string {
+  const v = t.paper?.entryVwap ?? t.price;
+  const n = Number(v);
+  return Number.isFinite(n) ? (n * 100).toFixed(2) : "—";
+}
+
+/** Exit / mark (¢): uses simulated exit VWAP, live mark while PENDING, or binary 100/0 fallback. */
+function tradeExitDisplayPct(t: Trade): string {
+  if (isPaperNoFill(t)) return "—";
+  const ex = t.paper?.exitVwap;
+  if (ex != null && Number.isFinite(ex)) return (ex * 100).toFixed(2);
+  if ((t.status === "PENDING" || t.status === "OPEN") && t.paper && !t.paper.missed) {
+    const m = t.paper.markPrice;
+    if (m != null && Number.isFinite(m)) return `${(m * 100).toFixed(2)} mkt`;
+  }
+  if (t.status === "WIN") return "100.00";
+  if (t.status === "LOSS") return "0.00";
+  if (t.status === "CLOSED") {
+    const ev = t.paper?.exitVwap;
+    if (ev != null && Number.isFinite(ev)) return (ev * 100).toFixed(2);
+    return tradePnlUsd(t) >= 0 ? "100.00" : "0.00";
+  }
+  return "—";
+}
+
+function formatTradePnlDisplay(t: Trade, digits: number): { text: string; className: string } {
+  if (isPaperNoFill(t)) return { text: "NO FILL", className: "text-slate-500" };
+  if (
+    (t.status === "PENDING" || t.status === "OPEN") &&
+    t.paper?.unrealizedPnlUsd != null &&
+    Number.isFinite(t.paper.unrealizedPnlUsd)
+  ) {
+    const u = t.paper.unrealizedPnlUsd;
+    return {
+      text: `${u >= 0 ? "+" : ""}$${u.toFixed(digits)} u`,
+      className: u >= 0 ? "text-emerald-400" : "text-rose-400"
+    };
+  }
+  const p = Number(t.pnl ?? 0);
+  return {
+    text: `${p >= 0 ? "+" : ""}$${p.toFixed(digits)}`,
+    className: p >= 0 ? "text-emerald-400" : "text-rose-400"
+  };
+}
+
+/** Badge: server `executionMode` when present; else infer (legacy rows). */
+function tradeExecutionModeLabel(t: Trade, walletMode?: Mode | null): "PAPER" | "LIVE" {
+  if (t.executionMode === "PAPER" || t.executionMode === "LIVE") return t.executionMode;
+  if (walletMode === "SIMULATION") return "PAPER";
+  if (t.paper != null) return "PAPER";
+  const oid = String(t.clobOrderId ?? "");
+  if (oid.startsWith("paper-")) return "PAPER";
+  return "LIVE";
+}
+
+function tradeReasonSummary(t: Trade): string {
+  if (t.decisionReason) return t.decisionReason;
+  return t.status === "PENDING" || t.status === "OPEN" ? "OPEN" : t.status;
+}
+
 function calcStats(trades: Trade[]) {
-  const settled = trades.filter((t) => !t.paper?.missed);
-  const wins = settled.filter((t) => t.status === "WIN");
-  const losses = settled.filter((t) => t.status === "LOSS");
+  const settled = trades.filter(
+    (t) =>
+      !t.paper?.missed && (t.status === "WIN" || t.status === "LOSS" || t.status === "CLOSED")
+  );
+  const wins = settled.filter(
+    (t) => t.status === "WIN" || (t.status === "CLOSED" && tradePnlUsd(t) > 0)
+  );
+  const losses = settled.filter(
+    (t) => t.status === "LOSS" || (t.status === "CLOSED" && tradePnlUsd(t) <= 0)
+  );
   const grossWin = wins.reduce((a, b) => a + Math.max(0, tradePnlUsd(b)), 0);
   const grossLoss = losses.reduce((a, b) => a + Math.abs(Math.min(0, tradePnlUsd(b))), 0);
   const winRate = settled.length ? (wins.length / settled.length) * 100 : 0;
@@ -344,7 +419,6 @@ export function App() {
   const [status, setStatus] = useState<BotStatus | null>(null);
   const [wallet, setWallet] = useState<WalletSummary | null>(null);
   const [amount, setAmount] = useState(1);
-  const [historyFilter, setHistoryFilter] = useState<"ALL" | "WIN" | "LOSS">("ALL");
   const [loadingTrade, setLoadingTrade] = useState(false);
   const [wsConnected, setWsConnected] = useState(false);
   const [walletAddress, setWalletAddress] = useState<string | null>(null);
@@ -607,6 +681,16 @@ export function App() {
     if (srv != null && Number.isFinite(srv)) return { value: srv, hint: undefined };
     return null;
   }, [status?.mode, wallet?.polymarketUsdc, metaMaskPolymarketUsdc]);
+
+  const executionEnvBadge = useMemo(() => {
+    const pt = status?.paperTrading;
+    const ex = status?.executeTrades;
+    if (pt === undefined && ex === undefined) return null;
+    if (pt === true) return { label: "PAPER", tone: "paper" as const };
+    if (ex === true) return { label: "LIVE", tone: "live" as const };
+    return { label: "LIVE (TESTING)", tone: "liveTesting" as const };
+  }, [status?.paperTrading, status?.executeTrades]);
+
   const lastMetaMaskBalanceGateLogRef = useRef(0);
   const pushLog = (level: LogLevel, message: string) => {
     setLogs((prev) => [{ ts: Date.now(), level, message }, ...prev].slice(0, 120));
@@ -695,18 +779,7 @@ export function App() {
     return base;
   };
 
-  const expected = useMemo(() => {
-    const conf = prediction?.confidence ?? 0;
-    const profit = amount * (conf / 100);
-    const loss = amount * ((100 - conf) / 100);
-    return { profit, loss };
-  }, [amount, prediction]);
-
   const stats = useMemo(() => calcStats(trades), [trades]);
-  const filteredTrades = useMemo(
-    () => (historyFilter === "ALL" ? trades : trades.filter((t) => t.status === historyFilter)),
-    [historyFilter, trades]
-  );
 
   useEffect(() => {
     const today = dayStartLocal();
@@ -815,11 +888,11 @@ export function App() {
   const portfolioData = useMemo(() => {
     if (!status) return [];
     const ordered = [...trades].reverse();
-    const realizedPnl = ordered.reduce((sum, t) => sum + (t.status === "PENDING" ? 0 : t.pnl), 0);
+    const realizedPnl = ordered.reduce((sum, t) => sum + (tradeRowOpenForUi(t) ? 0 : t.pnl), 0);
     let balance = Number(status.balance ?? 0) - realizedPnl;
     const now = Date.now();
     return ordered.map((t, idx) => {
-      if (t.status !== "PENDING") balance += t.pnl;
+      if (!tradeRowOpenForUi(t)) balance += t.pnl;
       return {
         idx,
         time: t.time,
@@ -1519,7 +1592,7 @@ export function App() {
       }
       return;
     }
-    const pending = trades.find((t) => t.status === "PENDING");
+    const pending = trades.find((t) => tradeRowOpenForUi(t));
     if (!pending) return;
     if (pending.id && pending.id === lastMetaMaskTradeIdRef.current) return;
     lastMetaMaskTradeIdRef.current = pending.id ?? null;
@@ -1762,30 +1835,38 @@ export function App() {
   const sessionStats = useMemo(() => {
     const baseline = sessionIdsBeforeStartRef.current;
     const sessionTrades = trades.filter(
-      (t) => !baseline.has(t.id) && (t.status === "WIN" || t.status === "LOSS")
+      (t) => !baseline.has(t.id) && tradeRowClosedForUi(t)
     );
     const pnl = sessionTrades.reduce((a, t) => a + tradePnlUsd(t), 0);
-    const wins = sessionTrades.filter((t) => t.status === "WIN").length;
-    const losses = sessionTrades.filter((t) => t.status === "LOSS").length;
+    const wins = sessionTrades.filter(
+      (t) => t.status === "WIN" || (t.status === "CLOSED" && tradePnlUsd(t) > 0)
+    ).length;
+    const losses = sessionTrades.filter(
+      (t) => t.status === "LOSS" || (t.status === "CLOSED" && tradePnlUsd(t) <= 0)
+    ).length;
     const n = sessionTrades.length;
     return { pnl, wins, losses, n, winRate: n ? (wins / n) * 100 : 0 };
   }, [trades, runningSince, status?.running]);
 
   const allTimePnl = useMemo(() => {
-    const settled = trades.filter((t) => t.status === "WIN" || t.status === "LOSS");
+    const settled = trades.filter((t) => tradeRowClosedForUi(t));
     return settled.reduce((a, t) => a + tradePnlUsd(t), 0);
   }, [trades]);
 
   const wlCounts = useMemo(() => {
-    const settled = trades.filter((t) => t.status === "WIN" || t.status === "LOSS");
+    const settled = trades.filter((t) => tradeRowClosedForUi(t));
     return {
-      w: settled.filter((t) => t.status === "WIN").length,
-      l: settled.filter((t) => t.status === "LOSS").length
+      w: settled.filter(
+        (t) => t.status === "WIN" || (t.status === "CLOSED" && tradePnlUsd(t) > 0)
+      ).length,
+      l: settled.filter(
+        (t) => t.status === "LOSS" || (t.status === "CLOSED" && tradePnlUsd(t) <= 0)
+      ).length
     };
   }, [trades]);
 
   const pnlCurveData = useMemo(() => {
-    const closed = trades.filter((t) => t.status === "WIN" || t.status === "LOSS");
+    const closed = trades.filter((t) => tradeRowClosedForUi(t));
     const chrono = [...closed].reverse();
     let cum = 0;
     let hi = 0;
@@ -1795,7 +1876,12 @@ export function App() {
       cum += tradePnlUsd(t);
       hi = Math.max(hi, cum);
       lo = Math.min(lo, cum);
-      pts.push({ idx: pts.length, cum, t: t.time, win: t.status === "WIN" });
+      pts.push({
+        idx: pts.length,
+        cum,
+        t: t.time,
+        win: t.status === "WIN" || (t.status === "CLOSED" && tradePnlUsd(t) > 0)
+      });
     });
     return { pts, net: cum, hi, lo };
   }, [trades]);
@@ -1820,16 +1906,24 @@ export function App() {
     }
     if (status?.mode === target) return;
     setModeToggleLoading(true);
-    pushInspectionUi(`Mode → POST /api/config (${target === "SIMULATION" ? "SIMULATION=true" : "SIMULATION=false"})`);
+    pushInspectionUi(
+      `Mode → POST /api/mode (${target === "LIVE" ? "LIVE + EXECUTE_TRADES=true" : "SIMULATION + paper rail"})`
+    );
     try {
-      const r = await api.setConfig({ simulation: target === "SIMULATION" });
+      const r = await api.setMode({ mode: target });
       const [s, m, w, ts] = await Promise.all([
         api.status(),
         api.markets(),
         api.wallet(),
         api.tradingState()
       ]);
-      setStatus(s);
+      setStatus({
+        ...s,
+        mode: r.mode ?? s.mode,
+        paperTrading: typeof r.paperTrading === "boolean" ? r.paperTrading : s.paperTrading,
+        paperOnly: typeof r.paperOnly === "boolean" ? r.paperOnly : s.paperOnly,
+        executeTrades: typeof r.executeTrades === "boolean" ? r.executeTrades : s.executeTrades
+      });
       setMarkets(m);
       setWallet(w);
       setTradingState(ts);
@@ -1990,6 +2084,7 @@ export function App() {
         modeLive={status?.mode === "LIVE"}
         modeToggleLoading={modeToggleLoading}
         metaMaskAutoEnabled={metaMaskAutoEnabled}
+        executionEnvBadge={executionEnvBadge}
         onStop={handleStopBotClick}
         onStart={handleStartBotClick}
         onPaper={() => void setTradingMode("SIMULATION")}
@@ -2039,23 +2134,6 @@ export function App() {
       <CopyProMainNav route={snipeRoute} onRoute={setSnipeRoute} />
 
       <div className="flex min-h-0 min-w-0 flex-1 flex-col">
-      {tradingState ? (
-        <div className="border-b border-snipe-border bg-snipe-panel/80 px-4 py-2.5 text-center text-sm">
-          <span
-            className={
-              tradingState.executionLabel === "LIVE_ONLY"
-                ? "font-semibold text-amber-300"
-                : "font-semibold text-sky-300"
-            }
-          >
-            Current execution:{" "}
-            {tradingState.executionLabel === "LIVE_ONLY"
-              ? "LIVE ONLY — orders can go to Polymarket CLOB"
-              : "PAPER ONLY — simulated balance, no live orders"}
-          </span>
-        </div>
-      ) : null}
-
       <main className="mx-auto w-full max-w-[1800px] flex-1 space-y-4 overflow-y-auto p-4 sm:p-5">
         {snipeRoute === "dashboard" && (
           <>
@@ -2223,6 +2301,7 @@ export function App() {
                     <thead className="sticky top-0 z-10 bg-[#0c0f14] text-[10px] uppercase tracking-wide text-slate-500">
                       <tr>
                         <th className="px-3 py-2">Time</th>
+                        <th className="px-2 py-2">Exec</th>
                         <th className="px-2 py-2">Asset</th>
                         <th className="px-2 py-2">Strategy</th>
                         <th className="px-2 py-2">Side</th>
@@ -2237,9 +2316,25 @@ export function App() {
                       </tr>
                     </thead>
                     <tbody className="font-mono text-[11px] text-slate-300">
-                      {filteredTrades.map((t) => (
+                      {trades.map((t) => (
                         <tr key={t.id} className="border-b border-white/[0.04] hover:bg-white/[0.02]">
                           <td className="whitespace-nowrap px-3 py-2 text-slate-400">{t.time}</td>
+                          <td className="px-2 py-2">
+                            {(() => {
+                              const em = tradeExecutionModeLabel(t, status?.mode);
+                              return (
+                                <span
+                                  className={
+                                    em === "PAPER"
+                                      ? "rounded bg-amber-500/20 px-1.5 py-0.5 text-[9px] font-bold uppercase tracking-wide text-amber-200"
+                                      : "rounded bg-sky-500/15 px-1.5 py-0.5 text-[9px] font-bold uppercase tracking-wide text-sky-200"
+                                  }
+                                >
+                                  {em}
+                                </span>
+                              );
+                            })()}
+                          </td>
                           <td className="px-2 py-2 font-semibold text-slate-300">{t.asset ?? "—"}</td>
                           <td className="px-2 py-2 text-slate-400">
                             {entryStrategyUi.effective.replace(/_/g, " ")}
@@ -2257,26 +2352,20 @@ export function App() {
                           </td>
                           <td className="px-2 py-2 text-emerald-300/90">{fmtEntryMidPct(t.upPriceAtEntry)}</td>
                           <td className="px-2 py-2 text-rose-300/90">{fmtEntryMidPct(t.downPriceAtEntry)}</td>
-                          <td className="px-2 py-2">{(Number(t.price ?? 0) * 100).toFixed(2)}</td>
-                          <td className="px-2 py-2 text-slate-400">
-                            {isPaperNoFill(t)
-                              ? "—"
-                              : t.status === "WIN"
-                                ? "100.00"
-                                : t.status === "LOSS"
-                                  ? "0.00"
-                                  : "—"}
-                          </td>
+                          <td className="px-2 py-2">{tradeEntryFillPct(t)}</td>
+                          <td className="px-2 py-2 text-slate-400">{tradeExitDisplayPct(t)}</td>
                           <td className="px-2 py-2">${Number(t.amount ?? 0).toFixed(2)}</td>
-                          <td className={`px-2 py-2 ${isPaperNoFill(t) ? "text-slate-500" : Number(t.pnl ?? 0) >= 0 ? "text-emerald-400" : "text-rose-400"}`}>
-                            {isPaperNoFill(t) ? "NO FILL" : `${Number(t.pnl ?? 0) >= 0 ? "+" : ""}$${Number(t.pnl ?? 0).toFixed(3)}`}
+                          <td className={`px-2 py-2 ${formatTradePnlDisplay(t, 3).className}`}>
+                            {formatTradePnlDisplay(t, 3).text}
                           </td>
-                          <td className="px-2 py-2 text-slate-600">—</td>
+                          <td className="px-2 py-2 text-slate-500">
+                            {tradeRowOpenForUi(t) ? "OPEN" : "—"}
+                          </td>
                           <td
                             className="max-w-[200px] truncate px-2 py-2 text-[10px] text-slate-500"
-                            title={t.decisionReason ?? t.status}
+                            title={tradeReasonSummary(t)}
                           >
-                            {t.decisionReason ?? t.status}
+                            {tradeReasonSummary(t)}
                           </td>
                         </tr>
                       ))}
@@ -2452,8 +2541,8 @@ export function App() {
               <>
                 {" "}
                 | Exec:{" "}
-                <span className={tradingState.executionMode === "LIVE" ? "text-emerald-300" : "text-slate-300"}>
-                  {tradingState.executionMode === "LIVE" ? "LIVE" : "SIM"}
+                <span className={tradingState.executionMode === "LIVE" ? "text-emerald-300" : "text-sky-300"}>
+                  {tradingState.executionMode === "LIVE" ? "LIVE" : "PAPER"}
                 </span>
               </>
             ) : null}
@@ -2461,6 +2550,13 @@ export function App() {
               <span className="text-slate-400"> — {status.phaseReason}</span>
             ) : null}
           </div>
+          {tradingState ? (
+            <p className="text-[11px] leading-snug text-slate-500">
+              {tradingState.executionLabel === "LIVE_ONLY"
+                ? "LIVE — orders can route to Polymarket CLOB."
+                : "PAPER — simulated."}
+            </p>
+          ) : null}
           {tradingState?.liveEngine ? (
             <div className="flex flex-wrap items-center gap-x-2.5 gap-y-1 rounded-md border border-slate-800/90 bg-[#0a0c10]/90 px-2.5 py-1.5 font-mono text-[10px] leading-tight text-slate-500">
               <span>
@@ -2681,7 +2777,8 @@ export function App() {
               </select>
             </div>
             <p className="text-[11px] text-slate-500">
-              Capital available: ${capitalUsd.toFixed(2)} → recommended bet: $
+              {status?.mode === "LIVE" ? "Balance (reference):" : "Simulated balance:"}{" "}
+              ${capitalUsd.toFixed(2)} → recommended bet: $
               {Number(((capitalUsd * capitalPctPerEntry) / 100).toFixed(2)).toFixed(2)}
             </p>
             <input
@@ -2701,8 +2798,10 @@ export function App() {
             </p>
           </div>
           <div className="rounded-lg bg-slate-800 p-3 text-sm">
-            <p>You can earn ${fmtNum(expected.profit, 2)} in 5 seconds</p>
-            <p className="text-loss">You can lose ${fmtNum(expected.loss, 2)}</p>
+            <p>Target stake per trade: ${fmtNum(amount, 2)}</p>
+            <p className="mt-1 text-[11px] leading-snug text-slate-500">
+              Actual risk depends on market and slippage.
+            </p>
           </div>
           <button
             type="button"
@@ -2719,7 +2818,7 @@ export function App() {
             Strategy: {prediction?.recommendation ?? "TRADE"} {prediction?.reason ? `- ${prediction.reason}` : ""}
           </p>
           <div className="text-xs text-slate-400">
-            Mode: {status?.mode ?? "SIMULATION"} | CLOB: {wallet?.connected ? "Connected" : "Not connected"}
+            {status?.mode === "LIVE" ? "LIVE" : "PAPER"} | CLOB: {wallet?.connected ? "Connected" : "Not connected"}
             {wallet?.polymarketUsdc != null ? ` | Server CLOB $${wallet.polymarketUsdc.toFixed(2)}` : ""}
             {metaMaskPolymarketUsdc != null ? ` | MetaMask $${metaMaskPolymarketUsdc.toFixed(2)}` : ""}
           </div>
@@ -2794,7 +2893,7 @@ export function App() {
             <div className="space-y-2 text-xs text-slate-400">
               <h3 className="font-semibold text-slate-200">Session</h3>
               <p>
-                Mode: <span className="text-slate-200">{status?.mode ?? "—"}</span> · CLOB:{" "}
+                <span className="text-slate-200">{status?.mode === "LIVE" ? "LIVE" : "PAPER"}</span> · CLOB:{" "}
                 {wallet?.connected ? "connected" : "not connected"}
               </p>
               <p className="text-[11px] text-slate-500">
@@ -3100,26 +3199,13 @@ export function App() {
         <section className="card col-span-12 lg:col-span-8">
           <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
             <h3 className="font-display text-xs font-bold uppercase tracking-[0.2em] text-slate-400">Recent sample trades</h3>
-            <div className="flex gap-2">
-              {(["ALL", "WIN", "LOSS"] as const).map((f) => (
-                <button
-                  key={f}
-                  type="button"
-                  onClick={() => setHistoryFilter(f)}
-                  className={`rounded-lg px-2 py-1 text-[10px] font-bold uppercase ${
-                    historyFilter === f ? "bg-snipe-accent text-[#061016]" : "bg-snipe-panel text-slate-400"
-                  }`}
-                >
-                  {f}
-                </button>
-              ))}
-            </div>
           </div>
           <div className="max-h-[320px] overflow-auto">
             <table className="w-full text-left text-xs">
               <thead className="sticky top-0 bg-[#0c0f14] text-[10px] uppercase tracking-wide text-slate-500">
                 <tr>
                   <th className="px-2 py-2">Time</th>
+                  <th className="px-2 py-2">Exec</th>
                   <th className="px-2 py-2">Asset</th>
                   <th className="px-2 py-2">Side</th>
                   <th className="px-2 py-2">UP@entry</th>
@@ -3132,24 +3218,38 @@ export function App() {
                 </tr>
               </thead>
               <tbody className="font-mono text-[11px]">
-                {filteredTrades.map((t) => (
+                {trades.map((t) => (
                   <tr key={t.id} className="border-b border-white/[0.04]">
                     <td className="px-2 py-2 text-slate-400">{t.time}</td>
+                    <td className="px-2 py-2">
+                      {(() => {
+                        const em = tradeExecutionModeLabel(t, status?.mode);
+                        return (
+                          <span
+                            className={
+                              em === "PAPER"
+                                ? "rounded bg-amber-500/20 px-1.5 py-0.5 text-[9px] font-bold uppercase text-amber-200"
+                                : "rounded bg-sky-500/15 px-1.5 py-0.5 text-[9px] font-bold uppercase text-sky-200"
+                            }
+                          >
+                            {em}
+                          </span>
+                        );
+                      })()}
+                    </td>
                     <td className="px-2 py-2 font-semibold text-slate-300">{t.asset ?? "—"}</td>
                     <td className={`px-2 py-2 font-bold ${t.direction === "UP" ? "text-emerald-400" : "text-rose-400"}`}>
                       {t.direction === "UP" ? "YES" : "NO"}
                     </td>
                     <td className="px-2 py-2 text-emerald-300/90">{fmtEntryMidPct(t.upPriceAtEntry)}</td>
                     <td className="px-2 py-2 text-rose-300/90">{fmtEntryMidPct(t.downPriceAtEntry)}</td>
-                    <td className="px-2 py-2">{(Number(t.price ?? 0) * 100).toFixed(2)}</td>
-                    <td className="px-2 py-2 text-slate-400">
-                      {isPaperNoFill(t) ? "—" : t.status === "WIN" ? "100.00" : t.status === "LOSS" ? "0.00" : "—"}
+                    <td className="px-2 py-2">{tradeEntryFillPct(t)}</td>
+                    <td className="px-2 py-2 text-slate-400">{tradeExitDisplayPct(t)}</td>
+                    <td className={`px-2 py-2 ${formatTradePnlDisplay(t, 2).className}`}>
+                      {formatTradePnlDisplay(t, 2).text}
                     </td>
-                    <td className={`px-2 py-2 ${isPaperNoFill(t) ? "text-slate-500" : Number(t.pnl ?? 0) >= 0 ? "text-emerald-400" : "text-rose-400"}`}>
-                      {isPaperNoFill(t) ? "NO FILL" : `${Number(t.pnl ?? 0) >= 0 ? "+" : ""}$${Number(t.pnl ?? 0).toFixed(2)}`}
-                    </td>
-                    <td className="max-w-[180px] truncate px-2 py-2 text-[10px] text-slate-500" title={t.decisionReason}>
-                      {t.decisionReason ?? t.status}
+                    <td className="max-w-[180px] truncate px-2 py-2 text-[10px] text-slate-500" title={tradeReasonSummary(t)}>
+                      {tradeReasonSummary(t)}
                     </td>
                     <td className="px-2 py-2 text-slate-500">{t.market}</td>
                   </tr>

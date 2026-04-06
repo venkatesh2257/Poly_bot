@@ -22,6 +22,8 @@ export function CopyProTopBar(props: {
   modeLive: boolean;
   modeToggleLoading: boolean;
   metaMaskAutoEnabled: boolean;
+  /** PAPER / LIVE / LIVE (TESTING) from server session env. */
+  executionEnvBadge?: { label: string; tone: "paper" | "live" | "liveTesting" } | null;
   onStop: () => void;
   onStart: () => void;
   onPaper: () => void;
@@ -38,6 +40,7 @@ export function CopyProTopBar(props: {
     modeLive,
     modeToggleLoading,
     metaMaskAutoEnabled,
+    executionEnvBadge,
     onStop,
     onStart,
     onPaper,
@@ -46,6 +49,15 @@ export function CopyProTopBar(props: {
     onLogout,
     onOpenRiskSettings
   } = props;
+
+  const execBadgeClass =
+    executionEnvBadge?.tone === "live"
+      ? "border-amber-500/50 bg-amber-500/15 text-amber-200"
+      : executionEnvBadge?.tone === "liveTesting"
+        ? "border-orange-600/60 bg-orange-950/60 text-orange-200"
+        : executionEnvBadge?.tone === "paper"
+          ? "border-sky-600/50 bg-sky-950/50 text-sky-200"
+          : "";
 
   return (
     <header className="border-b border-copy-border/60 bg-copy-surface/95 px-4 py-3 shadow-copy-glow backdrop-blur sm:px-6">
@@ -87,6 +99,16 @@ export function CopyProTopBar(props: {
           >
             {wsConnected ? "API" : "Offline"}
           </span>
+          {executionEnvBadge ? (
+            <span
+              className={
+                "rounded border px-2 py-1 text-[10px] font-bold uppercase tracking-wide " + execBadgeClass
+              }
+              title="Server session: PAPER_TRADING / EXECUTE_TRADES (set by Go LIVE or .env)"
+            >
+              {executionEnvBadge.label}
+            </span>
+          ) : null}
           <button
             type="button"
             onClick={() => onOpenRiskSettings?.()}
@@ -199,7 +221,10 @@ export function CopyProMetricsRow(props: {
   return (
     <div className="border-b border-copy-border/40 bg-black/40 px-4 py-3 sm:px-6">
       <div className="mx-auto grid max-w-[1800px] gap-3 sm:grid-cols-2 lg:grid-cols-6">
-        <Metric label="Mode" value={props.mode} />
+        <div className="rounded-xl border border-copy-border/70 bg-[#0d0f0d] px-4 py-3 shadow-inner">
+          <p className="sr-only">Trading mode</p>
+          <p className="font-mono text-lg font-bold text-copy-green">{props.mode}</p>
+        </div>
         <Metric label="Balance" value={props.balance} />
         <Metric label="Session P&amp;L" value={props.todayOrSessionPnl} />
         <Metric label="All P&amp;L" value={props.allPnl} />

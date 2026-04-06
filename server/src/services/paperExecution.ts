@@ -16,6 +16,25 @@ function envNum(key: string, fallback: number): number {
 }
 
 /**
+ * Taker fee rate for paper BUY/SELL simulation. `PAPER_FEE_BPS` overrides `PAPER_TAKER_FEE_RATE` when set (incl. 0).
+ */
+export function paperTakerFeeRate(): number {
+  const raw = process.env.PAPER_FEE_BPS;
+  if (raw !== undefined && String(raw).trim() !== "") {
+    const bps = Number(raw);
+    if (Number.isFinite(bps) && bps >= 0) return Math.min(500, bps) / 10_000;
+  }
+  return envNum("PAPER_TAKER_FEE_RATE", 0.003);
+}
+
+/** Extra BUY limit cushion vs mid: `PAPER_SLIPPAGE_BPS` / 10_000 (default 10 bps). */
+export function paperEntrySlippageFraction(): number {
+  const bps = Number(process.env.PAPER_SLIPPAGE_BPS ?? 10);
+  const n = Number.isFinite(bps) ? bps : 10;
+  return Math.min(0.5, Math.max(0, n / 10_000));
+}
+
+/**
  * When true (default), paper BUY lifts to best ask if limit (mid) sits inside the spread — otherwise
  * mid < bestAsk never crosses and you only get no_fill_limit_uncrossed_or_no_liquidity.
  * Set PAPER_AGGRESSIVE_CROSS=false to require limit >= best ask (strict mid-only).
@@ -162,7 +181,7 @@ export interface PaperLimitBuyParams {
  * Crossing BUY: limitPrice >= best ask. Fill by walking the ask ladder up to limitPrice.
  */
 export async function simulatePaperLimitBuy(params: PaperLimitBuyParams): Promise<PaperFillResult> {
-  const feeRate = params.feeRate ?? envNum("PAPER_TAKER_FEE_RATE", 0.003);
+  const feeRate = params.feeRate ?? paperTakerFeeRate();
   const limitTimeoutSec = params.limitTimeoutSec ?? envNum("PAPER_LIMIT_TIMEOUT_SEC", 1.5);
   const t0 = Date.now();
   await sleep(randomLatencyMs());
@@ -217,7 +236,7 @@ export interface PaperMarketSellParams {
 
 /** Aggressive exit: walk bid side (market-style). */
 export async function simulatePaperMarketSell(params: PaperMarketSellParams): Promise<PaperFillResult> {
-  const feeRate = params.feeRate ?? envNum("PAPER_TAKER_FEE_RATE", 0.003);
+  const feeRate = params.feeRate ?? paperTakerFeeRate();
   const minBid = params.minBid ?? envNum("PAPER_EXIT_MIN_BID", 0.01);
   const t0 = Date.now();
   await sleep(randomLatencyMs());

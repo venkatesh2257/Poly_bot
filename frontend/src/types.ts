@@ -20,7 +20,21 @@ export interface BetLogEntry {
   minLiquidity?: number;
 }
 export type Mode = "SIMULATION" | "LIVE";
-export type TradeStatus = "PENDING" | "WIN" | "LOSS";
+
+/** POST /api/mode and POST /api/config — execution flags after sync (server-owned). */
+export interface SetModeResponse {
+  ok: boolean;
+  mode: Mode;
+  reason?: string;
+  paperTrading?: boolean;
+  executeTrades?: boolean;
+  paperOnly?: boolean;
+  /** Same booleans as paperTrading / executeTrades (API echo). */
+  PAPER_TRADING?: boolean;
+  EXECUTE_TRADES?: boolean;
+  envMode?: string;
+}
+export type TradeStatus = "PENDING" | "WIN" | "LOSS" | "OPEN" | "CLOSED";
 
 export type BotPhase =
   | "STOPPED"
@@ -80,7 +94,16 @@ export interface Trade {
   gtcExitOrderId?: string;
   gtcExitTargetShares?: number;
   gtcProfitLocked?: boolean;
-  paper?: { missed?: boolean };
+  paper?: {
+    missed?: boolean;
+    entryVwap?: number;
+    markPrice?: number;
+    unrealizedPnlUsd?: number;
+    exitVwap?: number;
+    closeMethod?: string;
+  };
+  /** From server `getTrades()`: simulated vs CLOB-backed row. */
+  executionMode?: "PAPER" | "LIVE";
 }
 
 export interface BotStatus {
@@ -93,6 +116,10 @@ export interface BotStatus {
   olaKillTriggered?: boolean;
   phase: BotPhase;
   phaseReason?: string;
+  /** Session env from server (Go LIVE / Switch to PAPER). */
+  paperTrading?: boolean;
+  paperOnly?: boolean;
+  executeTrades?: boolean;
 }
 
 export interface RiskSettingsSnapshot {

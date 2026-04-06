@@ -3,6 +3,7 @@ import { TradingEngine } from "../services/engine.js";
 import { AuthService } from "../services/auth.js";
 import { PolymarketPublicService } from "../services/polymarket.js";
 import { TradeLogger } from "../services/tradeLogger.js";
+import { executionEnvSnapshotStrings, syncExecutionEnvForUiMode } from "../services/executionFlags.js";
 
 export type InspectionPayload = {
   ts: number;
@@ -32,7 +33,8 @@ function shouldInspectApiPath(path: string, method: string): boolean {
         "/spot-poly-lag",
         "/asset-auto-trade",
         "/auth/password-login",
-        "/auth/verify"
+        "/auth/verify",
+        "/debug/live-env"
       ].includes(p))
   ) {
     return true;
@@ -90,7 +92,7 @@ export function createApiRouter(
 
   router.get("/auth/nonce", (req, res) => {
     const address = String(req.query.address ?? "");
-    if (!/^0x[a-fA-F0-9]{40}$/.test(address)) {
+    if (!/^0x[a-fA-F0-9]{40}$/i.test(address.trim())) {
       return res.status(400).json({ error: "Invalid address" });
     }
     const nonce = auth.createNonce(address);
@@ -161,8 +163,21 @@ export function createApiRouter(
     if (mode !== "SIMULATION" && mode !== "LIVE") {
       return res.status(400).json({ ok: false, reason: "mode must be SIMULATION or LIVE" });
     }
+    syncExecutionEnvForUiMode(mode, req.body as Record<string, unknown>);
     const result = await engine.setMode(mode);
-    return res.json({ ok: result.ok, mode: engine.status().mode, reason: result.reason });
+    const st = engine.status();
+    const env = executionEnvSnapshotStrings();
+    return res.json({
+      ok: result.ok,
+      mode: st.mode,
+      reason: result.reason,
+      paperTrading: env.paperTrading,
+      executeTrades: env.executeTrades,
+      paperOnly: env.paperOnly,
+      PAPER_TRADING: env.paperTrading,
+      EXECUTE_TRADES: env.executeTrades,
+      envMode: env.mode
+    });
   });
 
   /**
@@ -181,8 +196,31 @@ export function createApiRouter(
       return res.status(400).json({ ok: false, reason: "config.simulation must be boolean" });
     }
     const mode = simulation ? "SIMULATION" : "LIVE";
+    syncExecutionEnvForUiMode(mode, req.body as Record<string, unknown>);
     const result = await engine.setMode(mode);
-    return res.json({ ok: result.ok, mode: engine.status().mode, reason: result.reason });
+    const st = engine.status();
+    const env = executionEnvSnapshotStrings();
+    return res.json({
+      ok: result.ok,
+      mode: st.mode,
+      reason: result.reason,
+      paperTrading: env.paperTrading,
+      executeTrades: env.executeTrades,
+      paperOnly: env.paperOnly,
+      PAPER_TRADING: env.paperTrading,
+      EXECUTE_TRADES: env.executeTrades,
+      envMode: env.mode
+    });
+  });
+
+  router.post("/debug/live-env", (req, res) => {
+    const token = getBearerToken(req.headers.authorization);
+    const session = auth.getSession(token);
+    if (!session) return res.status(401).json({ ok: false, reason: "Login required" });
+    if (session.authType === "wallet" && !isWalletAuthorized(session.address)) {
+      return res.status(403).json({ ok: false, reason: "Logged in wallet not allowed" });
+    }
+    return res.json({ ok: true, ...engine.getLiveExecutionDebugSnapshot() });
   });
 
   // When enabled, the engine will generate pending trades + execution phases,
@@ -269,6 +307,8 @@ export function createApiRouter(
       cooldownMs
     });
     if (!out.ok) return res.status(400).json(out);
+    const wm = engine.status().mode;
+    syncExecutionEnvForUiMode(wm === "LIVE" ? "LIVE" : "SIMULATION", {});
     return res.json(out);
   });
 
@@ -345,7 +385,11 @@ export function createApiRouter(
   });
 
   router.get("/bet-logs", (_req, res) => res.json(engine.getBetLogs()));
-  router.get("/paper-trade-history", (_req, res) => res.json(engine.getBotTradeHistory()));
+  /** @deprecated Prefer GET /trades; same queue as dashboard, filtered to PAPER rows. */
+  router.get("/paper-trade-history", (_req, res) =>
+    res.json(engine.getTrades().filter((t) => t.executionMode === "PAPER"))
+  );
+  /** Full engine trade queue (PAPER + LIVE); no server-side filtering. */
   router.get("/trades", (_req, res) => res.json(engine.getTrades()));
   router.get("/trade-log/query", async (req, res) => {
     const q = req.query as Record<string, string | undefined>;

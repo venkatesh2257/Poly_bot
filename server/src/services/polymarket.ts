@@ -2,7 +2,7 @@ const GAMMA_BASE = "https://gamma-api.polymarket.com";
 const DATA_BASE = "https://data-api.polymarket.com";
 
 function isProxyWalletAddress(a: string): boolean {
-  return /^0x[a-fA-F0-9]{40}$/.test(a.trim());
+  return /^0x[a-fA-F0-9]{40}$/i.test(a.trim());
 }
 
 function buildUrl(base: string, path: string, query?: Record<string, string | number | undefined>) {

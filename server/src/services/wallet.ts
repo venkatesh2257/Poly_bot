@@ -1,14 +1,20 @@
 import { ethers } from "ethers";
 import { Wallet as EthersV5Wallet } from "@ethersproject/wallet";
 import { AssetType, ClobClient, OrderType, Side } from "@polymarket/clob-client";
-import type { DirectionalContext, MarketContext, MarketOption } from "../types/index.js";
+import type { ClobPlaceOrderResult, DirectionalContext, MarketContext, MarketOption } from "../types/index.js";
 import { signatureTypeModeName } from "../constants/signatureType.js";
 import { resolveActiveUpDown5m } from "./marketDiscovery.js";
 import { batchBook } from "./clobService.js";
 import { normalizeRawOrderBook } from "./paperExecution.js";
+import { executeTradesEnv, paperOnlyEnv } from "./executionFlags.js";
 
 export class WalletService {
-  private mode = (process.env.MODE as "SIMULATION" | "LIVE") || "SIMULATION";
+  private static initialModeFromEnv(): "SIMULATION" | "LIVE" {
+    const m = String(process.env.MODE ?? "").trim().toUpperCase();
+    return m === "LIVE" ? "LIVE" : "SIMULATION";
+  }
+
+  private mode: "SIMULATION" | "LIVE" = WalletService.initialModeFromEnv();
   /**
    * When MODE=SIMULATION, still connect CLOB (read-only) so paper trades use real UP/DOWN books
    * and auto-discovery. No orders are posted unless MODE=LIVE.
@@ -20,7 +26,7 @@ export class WalletService {
   private clobChainId = Number(process.env.CLOB_CHAIN_ID ?? 137);
   /** Decimal only (0/1/2). `SIGNATURE_TYPE` wins over legacy `CLOB_SIGNATURE_TYPE`. */
   private clobSignatureType = WalletService.readSignatureTypeFromEnv();
-  private clobFunder = process.env.CLOB_FUNDER_ADDRESS;
+  private clobFunder = String(process.env.CLOB_FUNDER_ADDRESS ?? "").trim();
   private clobTokenId = process.env.CLOB_TOKEN_ID;
   private clobTokenIdUp = process.env.CLOB_TOKEN_ID_UP;
   private clobTokenIdDown = process.env.CLOB_TOKEN_ID_DOWN;
@@ -306,6 +312,35 @@ export class WalletService {
     return changed;
   }
 
+  /** Gamma can fail transiently; LIVE orders need token ids from discovery or manual env. */
+  private async discoverWithRetries(context: string): Promise<void> {
+    if (!this.autoDiscoverUpDownEnabled()) return;
+    const attempts = 4;
+    for (let i = 0; i < attempts; i++) {
+      try {
+        await this.refreshActiveUpDownMarket();
+        if (this.discoveredSlots.length > 0) {
+          if (i > 0) {
+            console.log(`[WalletService] Gamma discovery ok after ${i + 1} attempts (${context})`);
+          }
+          return;
+        }
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e);
+        console.warn(`[WalletService] Gamma discovery attempt ${i + 1}/${attempts} (${context}): ${msg}`);
+      }
+      if (i < attempts - 1) {
+        await new Promise((r) => setTimeout(r, 400 * (i + 1)));
+      }
+    }
+    if (this.discoveredSlots.length === 0) {
+      console.warn(
+        `[WalletService] No Up/Down token ids from Gamma (${context}). ` +
+          `Set CLOB_TOKEN_ID_UP / CLOB_TOKEN_ID_DOWN or check AUTO_DISCOVER_UPDOWN / network.`
+      );
+    }
+  }
+
   private newClient(wallet: ethers.Wallet, creds?: { apiKey?: string; key?: string; secret: string; passphrase: string }, signatureType?: number) {
     const normalizedCreds = creds
       ? {
@@ -365,7 +400,7 @@ export class WalletService {
         tokenIdDown: string;
       }
     | null {
-    if (!this.clobFunder || !/^0x[a-fA-F0-9]{40}$/.test(this.clobFunder)) return null;
+    if (!this.clobFunder || !/^0x[a-fA-F0-9]{40}$/i.test(this.clobFunder)) return null;
     const up = this.activeTokenUp();
     const down = this.activeTokenDown();
     if (!up || !down) return null;
@@ -390,8 +425,9 @@ export class WalletService {
 
   /** Connect CLOB + L2; on failure sets mode to SIMULATION (same as startup). */
   private async connectLive() {
-    const pkRaw = process.env.EVM_PRIVATE_KEY;
-    const pk = pkRaw?.startsWith("0x") ? pkRaw : pkRaw ? `0x${pkRaw}` : pkRaw;
+    this.clobFunder = String(process.env.CLOB_FUNDER_ADDRESS ?? "").trim();
+    const pkRaw = String(process.env.EVM_PRIVATE_KEY ?? "").trim();
+    const pk = pkRaw.startsWith("0x") ? pkRaw : pkRaw ? `0x${pkRaw}` : "";
     if (!pk) {
       console.warn("[WalletService] Missing EVM_PRIVATE_KEY — staying in simulation");
       this.mode = "SIMULATION";
@@ -404,7 +440,7 @@ export class WalletService {
       this.teardownLive();
       return;
     }
-    if (!this.clobFunder || !/^0x[a-fA-F0-9]{40}$/.test(this.clobFunder)) {
+    if (!this.clobFunder || !/^0x[a-fA-F0-9]{40}$/i.test(this.clobFunder)) {
       console.warn("[WalletService] CLOB_FUNDER_ADDRESS invalid — staying in simulation");
       this.mode = "SIMULATION";
       this.teardownLive();
@@ -446,7 +482,7 @@ export class WalletService {
           `[WalletService] signerAddress=${signerAddr} funderAddress=${funderAddr} signatureType=${signatureType} mode=${modeName} signerEqualsFunder=${signerEqualsFunder}`
         );
         if (this.autoDiscoverUpDownEnabled()) {
-          await this.refreshActiveUpDownMarket().catch(() => undefined);
+          await this.discoverWithRetries("post-CLOB-auth");
         }
         return;
       } catch (error) {
@@ -464,9 +500,13 @@ export class WalletService {
       await this.connectLive();
     }
     if (this.autoDiscoverUpDownEnabled()) {
-      await this.refreshActiveUpDownMarket().catch((e) =>
-        console.warn(`[WalletService] Gamma discovery on init: ${e instanceof Error ? e.message : String(e)}`)
-      );
+      if (this.mode === "LIVE" && this.clobApiKeyReady && this.discoveredSlots.length === 0) {
+        await this.discoverWithRetries("engine-init");
+      } else {
+        await this.refreshActiveUpDownMarket().catch((e) =>
+          console.warn(`[WalletService] Gamma discovery on init: ${e instanceof Error ? e.message : String(e)}`)
+        );
+      }
     }
   }
 
@@ -475,7 +515,12 @@ export class WalletService {
    * LIVE may fall back to SIMULATION if keys/auth fail (same as cold start).
    */
   async setMode(next: "SIMULATION" | "LIVE"): Promise<{ ok: boolean; reason?: string }> {
-    if (next === this.mode) return { ok: true };
+    if (next === this.mode) {
+      if (next === "LIVE" && this.clobApiKeyReady && this.client && this.autoDiscoverUpDownEnabled()) {
+        await this.discoverWithRetries("setMode-idempotent-LIVE");
+      }
+      return { ok: true };
+    }
     if (next === "SIMULATION") {
       this.mode = next;
       if (!this.demoLiveMarkets) {
@@ -801,16 +846,61 @@ export class WalletService {
     return this.client.getTrades();
   }
 
-  async placeOrder(input: { direction: "UP" | "DOWN"; amount: number; price: number }) {
+  async placeOrder(input: { direction: "UP" | "DOWN"; amount: number; price: number }): Promise<ClobPlaceOrderResult> {
     if (this.mode !== "LIVE") {
-      // Paper fills use engine → paperExecution.simulatePaperLimitBuy (best ask + PAPER_ENTRY_ASK_CROSS_BUFFER).
-      return { orderID: "simulated", sizeFilled: input.amount, price: input.price, tokenID: "simulation" };
+      return {
+        ok: true,
+        success: true,
+        orderID: "simulated",
+        orderId: "simulated",
+        sizeFilled: input.amount,
+        price: input.price,
+        tokenID: "simulation",
+        simulated: true
+      };
     }
-    if (!this.client || !this.clobApiKeyReady) throw new Error("Polymarket client not initialized");
+    if (!executeTradesEnv()) {
+      console.warn("[CLOB][SKIP] EXECUTE_TRADES is false");
+      return {
+        ok: false,
+        success: false,
+        orderID: "",
+        orderId: null,
+        sizeFilled: 0,
+        price: input.price,
+        tokenID: "",
+        errorMsg: "EXECUTE_TRADES disabled (env)"
+      };
+    }
+    if (!this.client || !this.clobApiKeyReady) {
+      const msg = "Polymarket client not initialized";
+      console.error(`[CLOB] ${msg}`);
+      return {
+        ok: false,
+        success: false,
+        orderID: "",
+        orderId: null,
+        sizeFilled: 0,
+        price: input.price,
+        tokenID: "",
+        errorMsg: msg
+      };
+    }
     const tokenID =
       input.direction === "UP" ? this.activeTokenUp() || this.clobTokenId : this.activeTokenDown() || this.clobTokenId;
     if (!tokenID || tokenID === "btc-5s-token") {
-      throw new Error("Set CLOB_TOKEN_ID_UP/DOWN or enable AUTO_DISCOVER_UPDOWN for LIVE trading");
+      const msg = "Set CLOB_TOKEN_ID_UP/DOWN or enable AUTO_DISCOVER_UPDOWN for LIVE trading";
+      console.error(`[CLOB] ${msg}`);
+      return {
+        ok: false,
+        success: false,
+        orderID: "",
+        orderId: null,
+        sizeFilled: 0,
+        price: input.price,
+        tokenID: "",
+        errorMsg: msg
+      };
     }
 
     let price = input.price;
@@ -827,37 +917,177 @@ export class WalletService {
       }
     }
 
-    const tickSize = await this.client.getTickSize(tokenID);
-    const negRisk = await this.client.getNegRisk(tokenID);
+    const orderType = OrderType.GTC;
     const side = Side.BUY;
-    // `amount` is treated by the engine/UI as collateral USD to risk.
-    // In Polymarket CLOB limit orders, `size` is token conditional shares.
-    // For BUY orders: collateral cost ~= price * size => size ~= collateral / price.
     const collateral = input.amount;
     const rawShares = price > 0 ? collateral / price : collateral;
-    const tick = Number(tickSize);
-    const decimals = tickSize.includes(".") ? tickSize.split(".")[1].length : 0;
-    const sizeShares = Number(rawShares.toFixed(decimals));
-    const result: any = await this.client.createAndPostOrder(
-      {
-        tokenID,
+
+    let tickSize: string;
+    let negRisk: boolean;
+    let sizeShares: number;
+    try {
+      tickSize = await this.client.getTickSize(tokenID);
+      negRisk = await this.client.getNegRisk(tokenID);
+      const decimals = tickSize.includes(".") ? tickSize.split(".")[1].length : 0;
+      sizeShares = Number(rawShares.toFixed(decimals));
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      console.error(`[CLOB] pre-order tick/negRisk failed tokenId=${tokenID} msg=${msg}`);
+      return {
+        ok: false,
+        success: false,
+        orderID: "",
+        orderId: null,
+        sizeFilled: 0,
         price,
-        side,
-        size: sizeShares
-      },
-      {
-        tickSize: String(tickSize) as any,
-        negRisk
-      },
-      OrderType.GTC
+        tokenID,
+        errorMsg: msg
+      };
+    }
+
+    console.log(
+      `[CLOB] submit tokenId=${tokenID} side=BUY collateralUsd=${collateral} sizeShares=${sizeShares} price=${price} orderType=${orderType}`
     );
 
-    return {
-      orderID: String(result?.orderID ?? result?.orderId ?? "unknown"),
-      sizeFilled: Number(result?.sizeFilled ?? result?.takingAmount ?? result?.sizeMatched ?? 0),
-      price: Number(result?.price ?? input.price),
-      tokenID
-    };
+    try {
+      const result: any = await this.client.createAndPostOrder(
+        {
+          tokenID,
+          price,
+          side,
+          size: sizeShares
+        },
+        {
+          tickSize: String(tickSize) as any,
+          negRisk
+        },
+        orderType
+      );
+
+      const firstOrderId =
+        Array.isArray(result?.orders) && result.orders[0]
+          ? result.orders[0].orderID ?? result.orders[0].orderId ?? result.orders[0].id
+          : undefined;
+      const pickId = (v: unknown) => (v != null && String(v).trim() !== "" ? String(v) : "");
+      const orderId =
+        pickId(result?.orderID) ||
+        pickId(result?.orderId) ||
+        pickId(result?.order_id) ||
+        pickId(result?.id) ||
+        pickId(result?.data?.orderID) ||
+        pickId(result?.data?.orderId) ||
+        pickId(result?.data?.order_id) ||
+        pickId(firstOrderId);
+      const errRaw =
+        result?.errorMsg ??
+        result?.error ??
+        result?.message ??
+        result?.err ??
+        (typeof result?.data === "string" ? result.data : "");
+      const errorMsg = errRaw != null && String(errRaw).trim() !== "" ? String(errRaw) : "";
+      const statusStr = String(result?.status ?? result?.order_status ?? result?.orderStatus ?? "");
+      const successFlag = result?.success;
+      const errUpper = errorMsg.toUpperCase();
+      const bodyStr = (() => {
+        try {
+          return JSON.stringify(result).slice(0, 2000);
+        } catch {
+          return String(result);
+        }
+      })();
+
+      const fatalTokens = [
+        "EXECUTION_ERROR",
+        "INVALID_ORDER_ERROR",
+        "INSERT_ERROR",
+        "FOK_ORDER_NOT_FILLED_ERROR",
+        "MARKET_NOT_READY"
+      ];
+      const knownReject =
+        successFlag === false ||
+        fatalTokens.some((k) => errUpper.includes(k) || statusStr.toUpperCase().includes(k));
+
+      if (knownReject || (errorMsg && !orderId)) {
+        console.error(
+          `[CLOB][ORDER] success=false orderId=${orderId} status=${statusStr} errorMsg=${errorMsg || "(empty)"} body=${bodyStr}`
+        );
+        console.error(
+          `[CLOB][ORDER_FAILED] orderId=${orderId || ""} status=${statusStr} errorMsg=${errorMsg || "(empty)"}`
+        );
+        return {
+          ok: false,
+          success: false,
+          orderID: orderId || "",
+          orderId: orderId || null,
+          sizeFilled: 0,
+          price: Number(result?.price ?? price),
+          tokenID,
+          errorMsg: errorMsg || "CLOB rejected order",
+          clobStatus: statusStr
+        };
+      }
+
+      const sizeFilled = Number(result?.sizeFilled ?? result?.takingAmount ?? result?.sizeMatched ?? 0);
+      const outPrice = Number(result?.price ?? price);
+      const stUp = statusStr.toUpperCase();
+      const zeroFillFatal =
+        sizeFilled <= 0 &&
+        fatalTokens.some((k) => errUpper.includes(k) || stUp.includes(k));
+
+      if (zeroFillFatal) {
+        const em = errorMsg || statusStr || "zero_fill_with_error";
+        console.error(
+          `[CLOB][ORDER] success=false orderId=${orderId} status=${statusStr} errorMsg=${em} body=${bodyStr}`
+        );
+        console.error(`[CLOB][ORDER_FAILED] orderId=${orderId} status=${statusStr} errorMsg=${em}`);
+        return {
+          ok: false,
+          success: false,
+          orderID: orderId || "",
+          orderId: orderId || null,
+          sizeFilled: 0,
+          price: outPrice,
+          tokenID,
+          errorMsg: em,
+          clobStatus: statusStr
+        };
+      }
+
+      console.log(
+        `[CLOB][ORDER] success=true orderId=${orderId} status=${statusStr} errorMsg=${errorMsg || ""} sizeFilled=${sizeFilled}`
+      );
+
+      if (sizeFilled <= 0) {
+        console.warn(`[CLOB][NO_FILL] order accepted but no fill orderId=${orderId}`);
+      }
+
+      return {
+        ok: true,
+        success: true,
+        orderID: orderId || "unknown",
+        orderId: orderId || null,
+        sizeFilled,
+        price: outPrice,
+        tokenID,
+        clobStatus: statusStr
+      };
+    } catch (error) {
+      const msg = error instanceof Error ? error.message : String(error);
+      const stack = error instanceof Error ? error.stack : "";
+      console.error(
+        `[CLOB] createAndPostOrder exception tokenId=${tokenID} side=BUY sizeShares=${sizeShares} price=${price} orderType=${orderType} msg=${msg}${stack ? ` stack=${stack.slice(0, 500)}` : ""}`
+      );
+      return {
+        ok: false,
+        success: false,
+        orderID: "",
+        orderId: null,
+        sizeFilled: 0,
+        price,
+        tokenID,
+        errorMsg: msg
+      };
+    }
   }
 
   /**
@@ -871,7 +1101,7 @@ export class WalletService {
     gtcPrice: number;
     maxShares: number;
   }): Promise<{ orderID: string; tokenID: string; side: string; size: number; latencyMs: number } | null> {
-    if (this.mode !== "LIVE" || !this.client || !this.clobApiKeyReady) return null;
+    if (this.mode !== "LIVE" || !this.client || !this.clobApiKeyReady || paperOnlyEnv()) return null;
     const up = this.activeTokenUp();
     const down = this.activeTokenDown();
     if (!up || !down) return null;
@@ -913,7 +1143,7 @@ export class WalletService {
   }
 
   async cancelClobOrder(orderID: string) {
-    if (this.mode !== "LIVE" || !this.client || !this.clobApiKeyReady) return;
+    if (this.mode !== "LIVE" || !this.client || !this.clobApiKeyReady || paperOnlyEnv()) return;
     try {
       await this.client.cancelOrder({ orderID });
     } catch {
@@ -923,7 +1153,7 @@ export class WalletService {
 
   /** Cancels all open orders for a conditional token (CLOB `asset_id`). */
   async cancelMarketOrdersForAsset(assetId: string) {
-    if (this.mode !== "LIVE" || !this.client || !this.clobApiKeyReady) return;
+    if (this.mode !== "LIVE" || !this.client || !this.clobApiKeyReady || paperOnlyEnv()) return;
     try {
       await this.client.cancelMarketOrders({ asset_id: assetId });
     } catch {
@@ -935,7 +1165,7 @@ export class WalletService {
    * Market SELL conditional shares (FAK) — flattens a long outcome position on Polymarket.
    */
   async postMarketSellShares(tokenID: string, shares: number): Promise<{ orderID: string } | null> {
-    if (this.mode !== "LIVE" || !this.client || !this.clobApiKeyReady) return null;
+    if (this.mode !== "LIVE" || !this.client || !this.clobApiKeyReady || paperOnlyEnv()) return null;
     const tickSize = await this.client.getTickSize(tokenID);
     const negRisk = await this.client.getNegRisk(tokenID);
     const decimals = String(tickSize).includes(".") ? String(tickSize).split(".")[1].length : 0;

@@ -1,9 +1,25 @@
 export type Mode = "SIMULATION" | "LIVE";
 export type Direction = "UP" | "DOWN";
 
+/** Result of `WalletService.placeOrder` (CLOB or simulation). */
+export interface ClobPlaceOrderResult {
+  ok: boolean;
+  success?: boolean;
+  orderID: string;
+  /** Alias for dashboards / strict null checks */
+  orderId?: string | null;
+  sizeFilled: number;
+  price: number;
+  tokenID: string;
+  errorMsg?: string;
+  clobStatus?: string;
+  simulated?: boolean;
+}
+
 /** Shared nullable numeric fields (API / snapshots). */
 export type NullableNumber = number | null;
-export type TradeStatus = "PENDING" | "WIN" | "LOSS";
+/** PAPER rail: PENDING→WIN|LOSS. LIVE rail: OPEN→CLOSED (pnl &lt; 0 = loss). */
+export type TradeStatus = "PENDING" | "WIN" | "LOSS" | "OPEN" | "CLOSED";
 export type LogLevel = "WIN" | "ERROR" | "SIGNAL" | "TRADE";
 
 export type BotPhase =
@@ -70,6 +86,13 @@ export interface TradePaperLeg {
   entryFeesUsd?: number;
   entrySlippageBps?: number;
   entryLatencyMs?: number;
+  entryBestBid?: number;
+  entryBestAsk?: number;
+  /** Last mark for open paper rows (bid or mid per `PAPER_MARK_TO_BID`). */
+  markPrice?: number;
+  /** Estimated P&amp;L if closed at `markPrice` after exit-fee estimate. */
+  unrealizedPnlUsd?: number;
+  closeMethod?: "EARLY_EXIT" | "SETTLEMENT_YES" | "SETTLEMENT_NO";
   exitVwap?: number;
   exitProceedsUsd?: number;
   exitFeesUsd?: number;
@@ -108,28 +131,8 @@ export interface Trade {
   lagSnipeHold?: boolean;
   /** Paper path: live book simulation metadata (entry/exit). */
   paper?: TradePaperLeg;
-}
-
-/** Structured log for paper vs live comparison (`GET /paper-trade-history`). */
-export interface BotTradeHistoryRecord {
-  ts: number;
-  mode: "paper";
-  trade_id: string;
-  token_id: string;
-  side: "buy" | "sell";
-  phase: "entry" | "exit" | "missed" | "error";
-  entry_price?: number;
-  exit_price?: number;
-  fill_price_actual?: number;
-  slippage_bps?: number;
-  partial_fill?: boolean;
-  missed?: boolean;
-  latency_ms?: number;
-  fees?: number;
-  pnl_usd?: number;
-  size_shares?: number;
-  notional_usd?: number;
-  reason?: string;
+  /** PAPER vs LIVE: set when the row is enqueued; `getTrades()` fills missing values via infer. */
+  executionMode?: "PAPER" | "LIVE";
 }
 
 export interface Status {
@@ -143,6 +146,10 @@ export interface Status {
   olaKillTriggered?: boolean;
   phase: BotPhase;
   phaseReason?: string;
+  /** Runtime session env (after Go LIVE / Switch to PAPER). */
+  paperTrading: boolean;
+  paperOnly: boolean;
+  executeTrades: boolean;
 }
 
 /** Effective + env defaults for auto size, limits, cooldown, paper stop (runtime overrides via API). */
