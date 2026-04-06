@@ -60,6 +60,7 @@ import {
 } from "./copyProUi";
 import { SettingsScreenPoly, StrategyConfigScreen, WizardScreenPoly } from "./polySnipeScreens";
 import type { SnipeRoute } from "./snipeUi";
+import { MarketDataHealthPanel } from "./MarketDataHealthPanel";
 
 /** Vite resolves the PNG URL; gradient kept lighter so dark artwork stays visible. */
 const appShellBackground: CSSProperties = {
@@ -2154,6 +2155,10 @@ export function App() {
           <>
             <StrategyModulesStrip onOpenStrategies={() => setSnipeRoute("strategies")} />
             <OverviewSubNav value={overviewSub} onChange={setOverviewSub} />
+            {overviewSub === "live" &&
+            (tradingState?.synthesis?.telemetry?.enabled || synthesisTelemetryWs?.enabled) ? (
+              <MarketDataHealthPanel health={synthesisHealthWs ?? tradingState?.synthesis?.health ?? null} />
+            ) : null}
             {overviewSub === "configuration" ? (
               <div className="card border-copy-border/40">
                 <StrategyConfigScreen
