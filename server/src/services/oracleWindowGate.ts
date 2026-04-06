@@ -25,7 +25,14 @@ export type OracleGateEnv = {
   oppositeTicksBlock: number;
   mismatchEarlyWindowMs: number;
   mismatchStrongBps: number;
+  minWindowDeltaBps: number;
 };
+
+const ORACLE_CHAINLINK_ENTRY_ASSETS = new Set(["BTC", "ETH", "SOL", "XRP"]);
+
+export function isOracleChainlinkEntryAsset(assetUpper: string): boolean {
+  return ORACLE_CHAINLINK_ENTRY_ASSETS.has(assetUpper.trim().toUpperCase());
+}
 
 export function loadOracleGateEnv(): OracleGateEnv {
   const soft = (() => {
@@ -61,6 +68,10 @@ export function loadOracleGateEnv(): OracleGateEnv {
     const n = Number(process.env.ORACLE_MISMATCH_STRONG_BPS ?? 8);
     return Number.isFinite(n) && n > 0 ? n : 8;
   })();
+  const minWindowDeltaBps = (() => {
+    const n = Number(process.env.MIN_WINDOW_DELTA_BPS ?? 4);
+    return Number.isFinite(n) && n > 0 ? n : 4;
+  })();
   return {
     softStaleMs: soft,
     hardStaleMs: hard,
@@ -69,7 +80,8 @@ export function loadOracleGateEnv(): OracleGateEnv {
     flipBlockCount,
     oppositeTicksBlock,
     mismatchEarlyWindowMs,
-    mismatchStrongBps
+    mismatchStrongBps,
+    minWindowDeltaBps
   };
 }
 
@@ -168,7 +180,24 @@ export function classifyOracleStale(ageMs: number | null, env: OracleGateEnv): O
   return "ok";
 }
 
+/** BTC/ETH/SOL/XRP: require non-FLAT strike trend and |deltaBps| ≥ min (window open vs spot). */
+export function evaluateOracleWindowMinTrendGate(
+  assetUpper: string,
+  state: OracleWindowState,
+  env: OracleGateEnv
+): { ok: true } | { ok: false; code: "WINDOW_ORACLE_FLAT" | "WINDOW_DELTA_BELOW_MIN" } {
+  if (!isOracleChainlinkEntryAsset(assetUpper)) return { ok: true };
+  if (state.trend !== "UP" && state.trend !== "DOWN") {
+    return { ok: false, code: "WINDOW_ORACLE_FLAT" };
+  }
+  if (Math.abs(state.trendDeltaBps) < env.minWindowDeltaBps) {
+    return { ok: false, code: "WINDOW_DELTA_BELOW_MIN" };
+  }
+  return { ok: true };
+}
+
 export type OracleDirectionGateInput = {
+  assetUpper: string;
   intendedDir: Direction;
   state: OracleWindowState;
   nowMs: number;
@@ -184,17 +213,27 @@ export type OracleDirectionGateResult =
       flips: number;
       oppTicks: number;
     }
-  | { ok: false; code: "STRIKE_PENDING" | "TREND_MISMATCH_CONFIRMED" };
+  | {
+      ok: false;
+      code:
+        | "STRIKE_PENDING"
+        | "TREND_MISMATCH_CONFIRMED"
+        | "WINDOW_ORACLE_FLAT"
+        | "WINDOW_DELTA_BELOW_MIN";
+    };
 
 /** Strike / flip-aware direction gate (call after soft/hard stale passes). */
 export function evaluateOracleDirectionFlipGate(inp: OracleDirectionGateInput): OracleDirectionGateResult {
-  const { env, intendedDir, state, nowMs, windowStartMs } = inp;
+  const { assetUpper, env, intendedDir, state, nowMs, windowStartMs } = inp;
   if (state.strikePrice == null || !Number.isFinite(state.strikePrice) || state.strikePrice <= 0) {
     return { ok: false, code: "STRIKE_PENDING" };
   }
+  const minTr = evaluateOracleWindowMinTrendGate(assetUpper, state, env);
+  if (!minTr.ok) return minTr;
+
   const trend = state.trend;
   const deltaBps = state.trendDeltaBps;
-  if (trend === "NA" || trend === "FLAT") {
+  if (!isOracleChainlinkEntryAsset(assetUpper) && (trend === "NA" || trend === "FLAT")) {
     return {
       ok: true,
       trend,

@@ -1,0 +1,2 @@
+[console_scripts]
+hf-anchor-bot = hf_anchor_bot.__main__:main
