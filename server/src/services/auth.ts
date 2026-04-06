@@ -34,17 +34,25 @@ export class AuthService {
     return nonce;
   }
 
+  /**
+   * EIP-191 message for wallet login. URI is included only when configured — no localhost default.
+   * Prefer `SIGN_IN_MESSAGE_URI` (exact string shown to the user), else `APP_ORIGIN`.
+   */
   buildMessage(address: string, nonce: string) {
-    const uri =
-      String(process.env.SIGN_IN_MESSAGE_URI ?? process.env.APP_ORIGIN ?? "").trim() ||
-      "http://localhost:5174";
-    return `PolyBot Sign-In
-Address: ${address}
-Nonce: ${nonce}
-Statement: Sign this message to authenticate with PolyBot.
-URI: ${uri}
-Version: 1
-Chain ID: 137`;
+    const signInUri = String(process.env.SIGN_IN_MESSAGE_URI ?? "").trim();
+    const appOrigin = String(process.env.APP_ORIGIN ?? "").trim();
+    const uri = signInUri || appOrigin;
+    const lines = [
+      "PolyBot Sign-In",
+      `Address: ${address}`,
+      `Nonce: ${nonce}`,
+      "Statement: Sign this message to authenticate with PolyBot."
+    ];
+    if (uri) {
+      lines.push(`URI: ${uri}`);
+    }
+    lines.push("Version: 1", "Chain ID: 137");
+    return lines.join("\n");
   }
 
   verifySignature(input: { address: string; signature: string }) {
