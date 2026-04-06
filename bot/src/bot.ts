@@ -26,7 +26,11 @@ const PM_FILE = new URL("../post-mortems.jsonl", import.meta.url).pathname;
 const BOT_PORT = parseInt(process.env.BOT_PORT || "3847");
 const USDC_ADDRESS = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174";
 const CTF_ADDRESS = "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045";
-const WALLET_ADDRESS = process.env.WALLET_ADDRESS || "0x1a1E1b82Da7E91E9567a40b0f952748b586389F9";
+function walletAddressFromEnv(): string | null {
+  const w = process.env.WALLET_ADDRESS?.trim();
+  if (w && /^0x[a-fA-F0-9]{40}$/i.test(w)) return w;
+  return null;
+}
 
 // ── Types ───────────────────────────────────────────────────
 interface Trade {
@@ -87,16 +91,22 @@ function getProvider(): JsonRpcProvider {
   return provider;
 }
 
-/** USDC.e balance for the address that signs live orders, or WALLET_ADDRESS in dry-run / no key. */
-function balanceReaderAddress(): string {
-  return signer?.address ?? WALLET_ADDRESS;
+/** Address that signs live orders, or explicit `WALLET_ADDRESS` for read-only balance — never a hardcoded default. */
+function balanceReaderAddress(): string | null {
+  if (signer) return signer.address;
+  return walletAddressFromEnv();
 }
 
 async function getWalletBalance(): Promise<number> {
+  const addr = balanceReaderAddress();
+  if (addr == null) {
+    console.warn("[wallet] No signer and WALLET_ADDRESS unset — USDC balance not queried (safe dry-run)");
+    return -1;
+  }
   try {
     const p = getProvider();
     const usdc = new Contract(USDC_ADDRESS, ["function balanceOf(address) view returns (uint256)"], p);
-    const bal = await usdc.balanceOf(balanceReaderAddress());
+    const bal = await usdc.balanceOf(addr);
     return parseFloat(formatUnits(bal, 6));
   } catch (e: any) {
     console.error("[wallet] Balance check failed:", e.message);

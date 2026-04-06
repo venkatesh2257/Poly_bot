@@ -80,3 +80,19 @@ def test_cooldown_after_close():
     assert fsm.state.value == "COOLDOWN"
     fsm.process(UnifiedTick(4, _book(50_040.0, True), anchor, ()))
     assert fsm.cooldown_left == 1
+
+
+def test_time_to_close_gate_fails_closed_without_timing_metadata():
+    """When the gate is on, missing now/window metadata must not allow entries."""
+    cfg = BotConfig(enable_time_to_close_gate=True)
+    fsm = AnchorFlowStateMachine(cfg)
+    b = _book(100_000.0, True)
+    tick = UnifiedTick(
+        seq=1,
+        book=b,
+        anchor_price=100_000.0,
+        trades_since_last=(),
+        now_unix=None,
+        window_start_unix=None,
+    )
+    assert fsm._time_to_close_ok(tick) is False

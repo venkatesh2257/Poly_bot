@@ -433,7 +433,10 @@ export function createApiRouter(
     res.setHeader("Content-Disposition", "attachment; filename=trade-log-export.csv");
     return res.send(csv);
   });
-  router.get("/wallet", async (_req, res) => res.json(await engine.getWalletSummary()));
+  router.get("/wallet", async (req, res) => {
+    if (!requireDashboardAuth(req, res)) return;
+    return res.json(await engine.getWalletSummary());
+  });
   router.get("/markets", (_req, res) => res.json(engine.getMarkets()));
   router.get("/insights", (_req, res) => res.json(engine.getInsights()));
   router.get("/polymarket/gamma/markets", async (req, res) => res.json(await poly.gammaMarkets(req.query as any)));

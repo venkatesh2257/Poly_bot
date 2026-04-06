@@ -121,7 +121,7 @@ export function generateSignal(
 
   // ── Check minimum move (time-scaled) ──
   // Earlier in window = needs bigger move (more time for reversal)
-  // Scales to ~1.0 at 80% of the window length (same shape as legacy 5m tuning).
+  // Scales to ~1.0 at 80% of the window length (same response shape as earlier 5m tuning, window length from Gamma).
   const windowSec = BTC_UPDOWN_MARKET_WINDOW_SEC;
   const scaleRef = windowSec * 0.8;
   const tw = Math.min(timeInWindow, scaleRef);

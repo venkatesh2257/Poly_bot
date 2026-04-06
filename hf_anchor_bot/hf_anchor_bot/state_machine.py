@@ -141,7 +141,7 @@ class AnchorFlowStateMachine:
         if not self.cfg.enable_time_to_close_gate:
             return True
         if tick.now_unix is None or tick.window_start_unix is None:
-            return True
+            return False
         now = float(tick.now_unix)
         w0 = int(tick.window_start_unix)
         end = w0 + int(self.cfg.window_length_sec)
