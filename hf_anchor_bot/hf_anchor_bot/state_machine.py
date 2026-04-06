@@ -11,6 +11,7 @@ from collections import deque
 
 from hf_anchor_bot.config import BotConfig
 from hf_anchor_bot.execution import open_allowed_by_slippage
+from hf_anchor_bot.smoke_log import line as smoke_line
 from hf_anchor_bot.signals.anchor import anchor_deviation, directional_edge
 from hf_anchor_bot.signals.chop import chop_block_new_entries, update_consolidation
 from hf_anchor_bot.signals.flow import flow_supports_direction, net_flow_bias
@@ -141,6 +142,7 @@ class AnchorFlowStateMachine:
         if not self.cfg.enable_time_to_close_gate:
             return True
         if tick.now_unix is None or tick.window_start_unix is None:
+            smoke_line("gate", "time_to_close blocked: missing now_unix or window_start_unix")
             return False
         now = float(tick.now_unix)
         w0 = int(tick.window_start_unix)
@@ -206,6 +208,7 @@ class AnchorFlowStateMachine:
             return True
         if tick.window_start_unix is None:
             log.warning("WINDOW_RISK_LIMP: window_start_unix missing; blocking new entries")
+            smoke_line("gate", "window_pnl_limp blocked: window_start_unix missing")
             return False
         self._sync_pnl_window(tick)
         if self._window_cum_pnl_usdc < self.cfg.max_loss_per_window_usdc:

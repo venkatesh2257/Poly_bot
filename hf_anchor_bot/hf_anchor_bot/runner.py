@@ -11,6 +11,7 @@ from hf_anchor_bot.execution import DryRunExecutor, OrderExecutor
 from hf_anchor_bot.ingestion.chainlink import ChainlinkAnchorFeed
 from hf_anchor_bot.ingestion.polymarket import PolymarketClobIngestion
 from hf_anchor_bot.state_machine import AnchorFlowStateMachine
+from hf_anchor_bot.smoke_log import enabled as smoke_enabled, line as smoke_line, record as smoke_record
 from hf_anchor_bot.types import JsEdgeContext, TradePrint, UnifiedTick
 
 log = logging.getLogger(__name__)
@@ -66,7 +67,14 @@ def run_loop(
                 now = time.time()
                 snap, bids_levels, asks_levels = book_ingest.fetch_book_with_depth()
                 if anchor_feed is None:
+                    smoke_line("chainlink", "lazy ChainlinkAnchorFeed construct attempt asset=%s", asset)
                     anchor_feed = ChainlinkAnchorFeed(asset=asset)
+                    smoke_line(
+                        "chainlink",
+                        "lazy ChainlinkAnchorFeed construct success feed=%s",
+                        anchor_feed.feed_address[:14],
+                    )
+                    smoke_record("chainlinkFeedAddress", anchor_feed.feed_address)
                 ap, _ = anchor_feed.read_anchor()
                 raw_trades = book_ingest.fetch_trades_slice(limit=max(50, cfg.flow_lookback_trades))
                 trades_since, prev_trade_keys = trades_new_since_prev(
@@ -97,7 +105,12 @@ def run_loop(
                 err_backoff_s = poll_interval_s
             except KeyboardInterrupt:
                 raise
-            except Exception:
+            except Exception as e:
+                if smoke_enabled():
+                    log.warning(
+                        "[smoke][chainlink] tick failed before next steady-state tick (will retry/backoff): %s",
+                        e,
+                    )
                 log.exception("tick failed; retrying after %.1fs", err_backoff_s)
                 time.sleep(err_backoff_s)
                 err_backoff_s = min(max_err_backoff_s, max(poll_interval_s, err_backoff_s * 2.0))

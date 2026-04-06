@@ -32,6 +32,21 @@ function walletAddressFromEnv(): string | null {
   return null;
 }
 
+/** Gated smoke-test logs + last snapshot for /status (set SMOKE_TEST_LOGS=1|true|yes). */
+function smokeTestLogsEnabled(): boolean {
+  const v = (process.env.SMOKE_TEST_LOGS ?? "").trim().toLowerCase();
+  return v === "1" || v === "true" || v === "yes";
+}
+function smokeLog(...args: unknown[]): void {
+  if (smokeTestLogsEnabled()) console.log(...args);
+}
+
+const lastSmokeStatus: {
+  market?: { slug: string; acceptingOrders: boolean; upToken: string; downToken: string };
+  fill?: { orderId?: string; ok: boolean; matched?: number; note?: string };
+  settle?: { slug: string; tradeDirection: string; resolvedWinner: string; won: boolean };
+} = {};
+
 // ── Types ───────────────────────────────────────────────────
 interface Trade {
   timestamp: number;
@@ -237,6 +252,18 @@ async function settleTrades() {
     const won = (trade.direction === "UP" && winner === "Up") ||
                 (trade.direction === "DOWN" && winner === "Down");
 
+    if (smokeTestLogsEnabled()) {
+      lastSmokeStatus.settle = {
+        slug: trade.market,
+        tradeDirection: trade.direction,
+        resolvedWinner: winner,
+        won,
+      };
+      smokeLog(
+        `[smoke][settle] slug=${trade.market} tradeDir=${trade.direction} resolved=${winner} result=${won ? "win" : "loss"}`
+      );
+    }
+
     if (won) {
       trade.result = "win";
       state.wins++;
@@ -406,9 +433,24 @@ async function onTick(price: number) {
     const market = await findCurrentMarket();
     if (!market) { checking = false; return; }
 
+    if (smokeTestLogsEnabled()) {
+      lastSmokeStatus.market = {
+        slug: market.slug,
+        acceptingOrders: market.acceptingOrders,
+        upToken: market.upTokenId.slice(0, 12) + "…",
+        downToken: market.downTokenId.slice(0, 12) + "…",
+      };
+      smokeLog(
+        `[smoke][market] slug=${market.slug} acceptingOrders=${market.acceptingOrders} upTok=${market.upTokenId.slice(0, 16)}… downTok=${market.downTokenId.slice(0, 16)}…`
+      );
+    }
+
     if (!market.acceptingOrders) {
       if (tickCount % 300 === 1) {
         console.log(`[skip] Market not accepting orders (${market.slug})`);
+      }
+      if (smokeTestLogsEnabled()) {
+        smokeLog(`[smoke][market] skip: acceptingOrders=false slug=${market.slug}`);
       }
       checking = false;
       return;
@@ -579,6 +621,9 @@ async function onTick(price: number) {
         trade.orderId = orderId;
         trade.conditionId = market.conditionId;
         console.log(`[bot] 📋 Order on book: ${orderId}`);
+        if (smokeTestLogsEnabled()) {
+          smokeLog(`[smoke][fill] live order posted orderId=${orderId}`);
+        }
 
         // Wait briefly for matching then verify fill
         await new Promise(r => setTimeout(r, 3000));
@@ -592,6 +637,10 @@ async function onTick(price: number) {
           if (matched === 0) {
             // Order not filled — cancel it and skip
             console.error(`[bot] ❌ Order NOT filled (size_matched=0, status=${status}). Canceling.`);
+            if (smokeTestLogsEnabled()) {
+              lastSmokeStatus.fill = { orderId, ok: false, matched: 0, note: "zero_fill" };
+              smokeLog(`[smoke][fill] verification: zero fill status=${status} orderId=${orderId}`);
+            }
             try { await clobClient.cancelOrder({ orderID: orderId }); } catch {}
             checking = false;
             return;
@@ -601,10 +650,28 @@ async function onTick(price: number) {
           trade.size = matched;
           trade.cost = matched * bidPrice;
           console.log(`[bot] ✅ Order filled: ${matched}/${requestedSize} tokens matched (status=${status})`);
+          if (smokeTestLogsEnabled()) {
+            const partial = matched < requestedSize;
+            lastSmokeStatus.fill = {
+              orderId,
+              ok: true,
+              matched,
+              note: partial ? "partial_fill" : "verified_fill",
+            };
+            smokeLog(
+              `[smoke][fill] verification ok ${partial ? "partial" : "full"} matched=${matched}/${requestedSize} status=${status}`
+            );
+          }
         } catch (e: any) {
           console.error(
             `[bot] ❌ Fill verification failed (${e?.message ?? e}) — trade NOT recorded. Canceling order ${orderId}.`
           );
+          if (smokeTestLogsEnabled()) {
+            lastSmokeStatus.fill = { orderId, ok: false, note: "verify_failed" };
+            smokeLog(
+              `[smoke][fill] trade NOT recorded: fill verification failed orderId=${orderId} err=${e?.message ?? e}`
+            );
+          }
           try {
             await clobClient.cancelOrder({ orderID: orderId });
           } catch {
@@ -656,6 +723,8 @@ app.get("/status", (_req, res) => {
     running: true,
     paused: state.paused,
     dryRun: state.config.dryRun,
+    smokeTestLogs: smokeTestLogsEnabled(),
+    ...(smokeTestLogsEnabled() ? { smokeLast: lastSmokeStatus } : {}),
     uptime: `${Math.floor((Date.now() - startedAt) / 60000)}m`,
     price: {
       binance: priceEngine.lastBinancePrice,

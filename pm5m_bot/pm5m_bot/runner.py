@@ -13,6 +13,7 @@ from pm5m_bot.gamma_client import GammaClient
 from pm5m_bot.market_scanner import MarketCandidate, MarketScanner
 from pm5m_bot.risk_manager import size_position
 from pm5m_bot.signal import SpotTrendFetcher, evaluate
+from pm5m_bot.smoke_log import line as smoke_line, record as smoke_record
 from pm5m_bot.trader import OpenPosition, Trader, read_account_usdc
 
 logger = logging.getLogger(__name__)
@@ -35,6 +36,7 @@ def _run_early_exit_monitor(settings: Settings, pos: OpenPosition, market_end_ts
 
 
 def spawn_early_exit_monitor(settings: Settings, pos: OpenPosition, market_end_ts: float) -> None:
+    smoke_line("monitor", "early_exit monitor start slug=%s end_ts=%.1f", pos.slug[:64], market_end_ts)
     name = f"pm5m_early_exit_{pos.slug[:24]}"
     threading.Thread(
         target=_run_early_exit_monitor,
@@ -87,17 +89,26 @@ def run_cycle(
 
         if settings.dry_run:
             account = read_account_usdc(settings)
+            smoke_line("balance", "dry_sizing source=PM5M_ACCOUNT_USDC account_usdc=%.4f", account)
+            smoke_record("drySizingUsdc", account)
         else:
+            smoke_line("balance", "live collateral fetch attempt (CLOB get_balance_allowance)")
             account = trader.fetch_live_collateral_usdc()
             if account is None:
+                smoke_line("balance", "live entries skipped: collateral fetch failed or unparseable")
+                smoke_record("liveCollateralUsdc", None)
                 logger.warning(
                     "LIVE: cannot fetch USDC collateral from CLOB for sizing; skipping entries "
                     "(not using PM5M_ACCOUNT_USDC)"
                 )
                 return out
             if account <= 0:
+                smoke_line("balance", "live entries skipped: collateral <= 0")
+                smoke_record("liveCollateralUsdc", account)
                 logger.warning("LIVE: CLOB USDC balance is zero; skipping entries")
                 return out
+            smoke_line("balance", "live collateral fetch success usdc=%.4f", account)
+            smoke_record("liveCollateralUsdc", account)
 
         ordered = sorted(candidates, key=lambda c: c.liquidity_usd, reverse=True)
         done = 0

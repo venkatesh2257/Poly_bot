@@ -12,6 +12,7 @@ from pm5m_bot.config import Settings
 from pm5m_bot.gamma_client import GammaClient
 from pm5m_bot.signal import TradeIntent
 from pm5m_bot.risk_manager import SizedOrder
+from pm5m_bot.smoke_log import line as smoke_line
 
 logger = logging.getLogger(__name__)
 
@@ -159,13 +160,16 @@ class Trader:
                 BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
             )
         except Exception as e:
+            smoke_line("balance", "get_balance_allowance raised: %s", e)
             logger.warning("LIVE: get_balance_allowance failed: %s", e)
             return None
         if not isinstance(resp, dict):
+            smoke_line("balance", "unexpected balance response type=%s", type(resp).__name__)
             logger.warning("LIVE: unexpected balance response type: %s", type(resp).__name__)
             return None
         parsed = _collateral_usdc_from_balance_payload(resp)
         if parsed is None:
+            smoke_line("balance", "could not parse balance keys=%s", list(resp.keys()))
             logger.warning("LIVE: could not parse USDC balance from CLOB response keys=%s", list(resp.keys()))
         return parsed
 
@@ -226,8 +230,10 @@ class Trader:
                 str(resp)[:400],
             )
             return None
+        smoke_line("entry", "live order posted orderId=%s slug=%s", order_id[:32], intent.candidate.slug[:48])
         matched, st = poll_fak_entry_fill(self._clob, order_id)
         if matched <= 0:
+            smoke_line("entry", "zero fill matched=%s status=%s orderId=%s", matched, st, order_id[:32])
             logger.warning(
                 "LIVE entry not filled (matched=%s status=%s) slug=%s orderID=%s… — no position",
                 matched,
@@ -241,6 +247,13 @@ class Trader:
                 logger.debug("cancel unfilled entry failed", exc_info=True)
             return None
         if matched + 1e-9 < float(sized.size_shares):
+            smoke_line(
+                "entry",
+                "partial fill matched=%.6f requested=%.6f status=%s",
+                matched,
+                float(sized.size_shares),
+                st,
+            )
             logger.info(
                 "LIVE partial fill slug=%s matched=%.6f requested=%.6f status=%s",
                 intent.candidate.slug,
@@ -248,6 +261,8 @@ class Trader:
                 float(sized.size_shares),
                 st,
             )
+        else:
+            smoke_line("entry", "verified fill matched=%.6f status=%s orderId=%s", matched, st, order_id[:32])
         usdc_filled = matched * float(intent.limit_price)
         return OpenPosition(
             token_id=intent.token_id,

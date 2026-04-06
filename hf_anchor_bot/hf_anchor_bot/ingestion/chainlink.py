@@ -2,9 +2,14 @@
 
 from __future__ import annotations
 
+import logging
 import os
 
 from web3 import Web3
+
+from hf_anchor_bot.smoke_log import line as smoke_line
+
+log = logging.getLogger(__name__)
 
 # Reuse same Polygon mainnet feeds as the TS bot.
 DEFAULT_FEEDS: dict[str, str] = {
@@ -50,6 +55,7 @@ class ChainlinkAnchorFeed:
         self._contract = self._w3.eth.contract(address=self.feed_address, abi=AGGREGATOR_V3_ABI)
         # decimals() deferred to first read — __init__ does not hit the network.
         self._decimals: int | None = None
+        self._smoke_logged_first_read = False
 
     def _decimals_value(self) -> int:
         if self._decimals is None:
@@ -57,10 +63,18 @@ class ChainlinkAnchorFeed:
         return self._decimals
 
     def read_anchor(self) -> tuple[float, int]:
-        d = self._decimals_value()
-        _rid, ans, _sa, updated_at, _air = self._contract.functions.latestRoundData().call()
-        price = float(ans) / (10**d)
-        return price, int(updated_at) * 1000
+        try:
+            d = self._decimals_value()
+            _rid, ans, _sa, updated_at, _air = self._contract.functions.latestRoundData().call()
+            price = float(ans) / (10**d)
+            ts_ms = int(updated_at) * 1000
+            if not self._smoke_logged_first_read:
+                self._smoke_logged_first_read = True
+                smoke_line("chainlink", "first anchor read ok price=%.4f asset=%s", price, self.asset)
+            return price, ts_ms
+        except Exception as e:
+            smoke_line("chainlink", "read_anchor failed (will surface to runner retry): %s", e)
+            raise
 
 
 def _resolve_rpc_url() -> str:
