@@ -6,7 +6,7 @@ import logging
 import os
 import time
 from dataclasses import dataclass
-from typing import Any, Callable, Optional
+from typing import Any, Optional
 
 from pm5m_bot.config import Settings
 from pm5m_bot.gamma_client import GammaClient
@@ -24,6 +24,68 @@ class OpenPosition:
     size_shares: float
     usdc_notional: float
     slug: str
+
+
+def _order_id_from_post_response(resp: Any) -> str | None:
+    if resp is None:
+        return None
+    if isinstance(resp, dict):
+        if resp.get("success") is False:
+            return None
+        oid = resp.get("orderID") or resp.get("orderId") or resp.get("id")
+        return str(oid) if oid else None
+    for attr in ("orderID", "order_id", "id"):
+        oid = getattr(resp, attr, None)
+        if oid:
+            return str(oid)
+    return None
+
+
+def _matched_and_status(order_row: Any) -> tuple[float, str]:
+    if isinstance(order_row, dict):
+        raw_m = (
+            order_row.get("size_matched")
+            or order_row.get("sizeMatched")
+            or order_row.get("matched")
+            or 0
+        )
+        try:
+            matched = float(raw_m)
+        except (TypeError, ValueError):
+            matched = 0.0
+        status = str(order_row.get("status", "unknown"))
+        return matched, status
+    try:
+        matched = float(getattr(order_row, "size_matched", None) or getattr(order_row, "sizeMatched", None) or 0)
+    except (TypeError, ValueError):
+        matched = 0.0
+    status = str(getattr(order_row, "status", "unknown"))
+    return matched, status
+
+
+_TERMINAL_UNFILLED_STATUS_SUBSTR = ("CANCEL", "REJECT", "EXPIR", "KILL", "INVALID")
+
+
+def poll_fak_entry_fill(
+    clob: Any,
+    order_id: str,
+    *,
+    timeout_sec: float = 45.0,
+    poll_sec: float = 0.4,
+) -> tuple[float, str]:
+    """Return (size_matched, last_status) after fill, terminal empty, or timeout."""
+    deadline = time.time() + timeout_sec
+    last_status = "unknown"
+    while time.time() < deadline:
+        row = clob.get_order(order_id)
+        matched, last_status = _matched_and_status(row)
+        if matched > 0:
+            return matched, last_status
+        up = last_status.upper()
+        if any(s in up for s in _TERMINAL_UNFILLED_STATUS_SUBSTR):
+            return 0.0, last_status
+        time.sleep(poll_sec)
+    return 0.0, "timeout"
 
 
 def _mid_from_book(book: dict[str, Any] | None) -> float | None:
@@ -123,12 +185,50 @@ class Trader:
         )
         resp = self._clob.post_order(order, OrderType.FAK)
         logger.info("LIVE order posted %s resp=%s", intent.candidate.slug, str(resp)[:500])
+        if isinstance(resp, dict) and resp.get("success") is False:
+            logger.error(
+                "LIVE order rejected slug=%s errorMsg=%s",
+                intent.candidate.slug,
+                resp.get("errorMsg") or resp.get("error") or resp,
+            )
+            return None
+        order_id = _order_id_from_post_response(resp)
+        if not order_id:
+            logger.error(
+                "LIVE post_order missing orderID slug=%s resp_head=%s",
+                intent.candidate.slug,
+                str(resp)[:400],
+            )
+            return None
+        matched, st = poll_fak_entry_fill(self._clob, order_id)
+        if matched <= 0:
+            logger.warning(
+                "LIVE entry not filled (matched=%s status=%s) slug=%s orderID=%s… — no position",
+                matched,
+                st,
+                intent.candidate.slug,
+                order_id[:20],
+            )
+            try:
+                self._clob.cancel(order_id)
+            except Exception:
+                logger.debug("cancel unfilled entry failed", exc_info=True)
+            return None
+        if matched + 1e-9 < float(sized.size_shares):
+            logger.info(
+                "LIVE partial fill slug=%s matched=%.6f requested=%.6f status=%s",
+                intent.candidate.slug,
+                matched,
+                float(sized.size_shares),
+                st,
+            )
+        usdc_filled = matched * float(intent.limit_price)
         return OpenPosition(
             token_id=intent.token_id,
             entry_mid=entry_mid,
             entry_ts=time.time(),
-            size_shares=sized.size_shares,
-            usdc_notional=sized.usdc_notional,
+            size_shares=matched,
+            usdc_notional=usdc_filled,
             slug=intent.candidate.slug,
         )
 

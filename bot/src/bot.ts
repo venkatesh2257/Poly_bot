@@ -1,13 +1,19 @@
 /**
- * Polymarket BTC 5-Min Trading Bot v6
+ * Polymarket BTC 15m Up/Down Trading Bot v6
  * Pure latency arbitrage — event-driven on WebSocket price ticks
  * P&L tracked via wallet balance, not calculated
+ * Market windows match Gamma: btc-updown-15m-{unixStart} (900s)
  */
 
 import express from "express";
 import { readFileSync, writeFileSync, existsSync, appendFileSync } from "fs";
 import { PriceEngine } from "./price-engine.js";
-import { findCurrentMarket, checkMarketOutcome, type MarketInfo } from "./market-engine.js";
+import {
+  findCurrentMarket,
+  checkMarketOutcome,
+  BTC_UPDOWN_MARKET_WINDOW_SEC,
+  currentBtcUpdownWindowStartSec,
+} from "./market-engine.js";
 import { generateSignal, DEFAULT_CONFIG, type Signal, type SignalConfig } from "./signal-engine.js";
 import { ClobClient } from "@polymarket/clob-client";
 import { Contract, JsonRpcProvider, Wallet, ZeroHash, formatUnits } from "ethers";
@@ -81,11 +87,16 @@ function getProvider(): JsonRpcProvider {
   return provider;
 }
 
+/** USDC.e balance for the address that signs live orders, or WALLET_ADDRESS in dry-run / no key. */
+function balanceReaderAddress(): string {
+  return signer?.address ?? WALLET_ADDRESS;
+}
+
 async function getWalletBalance(): Promise<number> {
   try {
     const p = getProvider();
     const usdc = new Contract(USDC_ADDRESS, ["function balanceOf(address) view returns (uint256)"], p);
-    const bal = await usdc.balanceOf(WALLET_ADDRESS);
+    const bal = await usdc.balanceOf(balanceReaderAddress());
     return parseFloat(formatUnits(bal, 6));
   } catch (e: any) {
     console.error("[wallet] Balance check failed:", e.message);
@@ -205,8 +216,10 @@ async function initClobClient() {
 // ── Settlement ──────────────────────────────────────────────
 async function settleTrades() {
   const pending = state.trades.filter(t => t.result === "pending");
+  const nowSec = Math.floor(Date.now() / 1000);
   for (const trade of pending) {
-    if (Date.now() / 1000 < trade.windowStart + 360) continue;
+    // Same slug as entry: btc-updown-15m-{windowStart}; wait until window end + buffer for resolution
+    if (nowSec < trade.windowStart + BTC_UPDOWN_MARKET_WINDOW_SEC + 90) continue;
 
     const winner = await checkMarketOutcome(trade.windowStart);
     if (!winner || winner === "pending") continue;
@@ -316,9 +329,9 @@ async function onTick(price: number) {
   // Log tick count every 60 ticks (~1 per sec from Bybit)
   if (tickCount % 60 === 1) {
     const now = Math.floor(Date.now() / 1000);
-    const cws = Math.floor(now / 300) * 300;
+    const cws = currentBtcUpdownWindowStartSec(now);
     const tiw = now - cws;
-    console.log(`[tick] #${tickCount} price=$${price.toFixed(2)} window=${tiw}s`);
+    console.log(`[tick] #${tickCount} price=$${price.toFixed(2)} window=${tiw}s/900`);
   }
 
   // Always try to settle pending trades, regardless of price movement
@@ -333,15 +346,15 @@ async function onTick(price: number) {
   }
 
   const now = Math.floor(Date.now() / 1000);
-  const currentWindowStart = Math.floor(now / 300) * 300;
+  const currentWindowStart = currentBtcUpdownWindowStartSec(now);
   const timeInWindow = now - currentWindowStart;
 
   // Track window open price
   if (!windowOpenPrices.has(currentWindowStart)) {
     windowOpenPrices.set(currentWindowStart, price);
-    // Cleanup old
+    // Cleanup old windows (keep ~10 markets)
     for (const [k] of windowOpenPrices) {
-      if (k < currentWindowStart - 3600) windowOpenPrices.delete(k);
+      if (k < currentWindowStart - 10 * BTC_UPDOWN_MARKET_WINDOW_SEC) windowOpenPrices.delete(k);
     }
   }
 
@@ -471,8 +484,15 @@ async function onTick(price: number) {
 
     const cost = size * bidPrice;
     const tokenId = signal.direction === "UP" ? market.upTokenId : market.downTokenId;
-    const fairValue = signal.priceDelta ? 
-      Math.min(state.config.fairValueBase + (Math.abs(signal.priceDelta.percent) * state.config.fairValueMultiplier * (0.5 + timeInWindow / 600)), state.config.fairValueCap) : 0;
+    const fairValue = signal.priceDelta
+      ? Math.min(
+          state.config.fairValueBase +
+            Math.abs(signal.priceDelta.percent) *
+              state.config.fairValueMultiplier *
+              (0.5 + timeInWindow / BTC_UPDOWN_MARKET_WINDOW_SEC),
+          state.config.fairValueCap
+        )
+      : 0;
 
     console.log(`\n[bot] 🎯 ${signal.direction} | ${size} tokens @ $${bidPrice} = $${cost.toFixed(2)} | ${timeInWindow}s into window`);
     signal.reasons.forEach(r => console.log(`  → ${r}`));
@@ -480,7 +500,7 @@ async function onTick(price: number) {
     const trade: Trade = {
       timestamp: Date.now(),
       market: market.slug,
-      windowStart: currentWindowStart,
+      windowStart: market.windowStart,
       direction: signal.direction,
       price: bidPrice,
       size,
@@ -549,7 +569,8 @@ async function onTick(price: number) {
           const orderStatus = await clobClient.getOrder(orderId);
           const matched = parseInt(orderStatus?.size_matched || "0");
           const status = orderStatus?.status || "unknown";
-          
+          const requestedSize = trade.size;
+
           if (matched === 0) {
             // Order not filled — cancel it and skip
             console.error(`[bot] ❌ Order NOT filled (size_matched=0, status=${status}). Canceling.`);
@@ -557,11 +578,11 @@ async function onTick(price: number) {
             checking = false;
             return;
           }
-          
+
           // Partially or fully filled
           trade.size = matched;
           trade.cost = matched * bidPrice;
-          console.log(`[bot] ✅ Order filled: ${matched}/${trade.size} tokens matched (status=${status})`);
+          console.log(`[bot] ✅ Order filled: ${matched}/${requestedSize} tokens matched (status=${status})`);
         } catch (e: any) {
           // If we can't verify, assume it went through but log warning
           console.log(`[bot] ⚠️ Could not verify fill (${e.message}), proceeding with trade`);
@@ -578,7 +599,7 @@ async function onTick(price: number) {
 
     state.trades.push(trade);
     if (state.trades.length > 200) state.trades.shift();
-    tradedWindows.add(currentWindowStart);
+    tradedWindows.add(market.windowStart);
     lastTradeTime = Date.now();
     saveState();
 
@@ -600,7 +621,7 @@ app.use(express.json());
 
 app.get("/status", (_req, res) => {
   const nowSec = Math.floor(Date.now() / 1000);
-  const cwStart = Math.floor(nowSec / 300) * 300;
+  const cwStart = currentBtcUpdownWindowStartSec(nowSec);
   const wop = windowOpenPrices.get(cwStart);
   const timeInWindow = nowSec - cwStart;
 
@@ -749,7 +770,7 @@ app.post("/stop", (_req, res) => {
 // ── Lifecycle ───────────────────────────────────────────────
 async function start() {
   console.log("═══════════════════════════════════════════════");
-  console.log("  Polymarket BTC 5-Min Bot v5 — Kelly Arb");
+  console.log("  Polymarket BTC 15m Bot v5 — Kelly Arb");
   console.log(`  Mode: ${state.config.dryRun ? "DRY RUN" : "LIVE"}`);
   console.log(`  Position: $${state.config.positionSize}/trade`);
   console.log(`  Min delta: ${state.config.minDeltaPercent}% / $${state.config.minDeltaAbsolute}`);

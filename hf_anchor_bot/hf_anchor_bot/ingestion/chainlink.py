@@ -46,13 +46,13 @@ class ChainlinkAnchorFeed:
         if not addr:
             raise ValueError(f"No default Chainlink feed for asset={self.asset}")
         self.feed_address = Web3.to_checksum_address(addr)
+        self._w3 = Web3(Web3.HTTPProvider(self.rpc_url))
+        self._contract = self._w3.eth.contract(address=self.feed_address, abi=AGGREGATOR_V3_ABI)
+        self._decimals = int(self._contract.functions.decimals().call())
 
     def read_anchor(self) -> tuple[float, int]:
-        w3 = Web3(Web3.HTTPProvider(self.rpc_url))
-        c = w3.eth.contract(address=self.feed_address, abi=AGGREGATOR_V3_ABI)
-        dec = int(c.functions.decimals().call())
-        _rid, ans, _sa, updated_at, _air = c.functions.latestRoundData().call()
-        price = float(ans) / (10**dec)
+        _rid, ans, _sa, updated_at, _air = self._contract.functions.latestRoundData().call()
+        price = float(ans) / (10**self._decimals)
         return price, int(updated_at) * 1000
 
 

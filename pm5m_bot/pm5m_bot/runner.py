@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import os
+import threading
 import time
 from typing import List
 
@@ -12,11 +13,35 @@ from pm5m_bot.gamma_client import GammaClient
 from pm5m_bot.market_scanner import MarketCandidate, MarketScanner
 from pm5m_bot.risk_manager import size_position
 from pm5m_bot.signal import SpotTrendFetcher, evaluate
-from pm5m_bot.trader import Trader, read_account_usdc
+from pm5m_bot.trader import OpenPosition, Trader, read_account_usdc
 
 logger = logging.getLogger(__name__)
 
 MIN_NOTIONAL_USDC = float(os.getenv("PM5M_MIN_NOTIONAL_USDC", "1.0"))
+
+
+def _run_early_exit_monitor(settings: Settings, pos: OpenPosition, market_end_ts: float) -> None:
+    """Owns a short-lived GammaClient so the main cycle can close its client without racing the monitor."""
+    from pm5m_bot.gamma_client import GammaClient
+
+    g = GammaClient(settings)
+    try:
+        trader = Trader(settings, g)
+        trader.monitor_early_exit(pos, market_end_ts)
+    except Exception:
+        logger.exception("monitor_early_exit failed slug=%s", pos.slug)
+    finally:
+        g.close()
+
+
+def spawn_early_exit_monitor(settings: Settings, pos: OpenPosition, market_end_ts: float) -> None:
+    name = f"pm5m_early_exit_{pos.slug[:24]}"
+    threading.Thread(
+        target=_run_early_exit_monitor,
+        args=(settings, pos, market_end_ts),
+        name=name,
+        daemon=True,
+    ).start()
 
 
 def run_cycle(
@@ -96,9 +121,9 @@ def run_cycle(
             if monitor_early_exit:
                 try:
                     end_ts = cand.end_date.timestamp()
-                    trader.monitor_early_exit(pos, end_ts)
+                    spawn_early_exit_monitor(settings, pos, end_ts)
                 except Exception:
-                    logger.exception("monitor_early_exit failed slug=%s", cand.slug)
+                    logger.exception("spawn_early_exit_monitor failed slug=%s", cand.slug)
         return out
     finally:
         spot.close()

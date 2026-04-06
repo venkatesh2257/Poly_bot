@@ -322,6 +322,52 @@ function tradeRowInsightLoss(t: Trade): boolean {
   return t.status === "LOSS" || (t.status === "CLOSED" && Number(t.pnl ?? 0) <= 0);
 }
 
+/** In-memory only: join ENTRY_TIME_BTC_5M → settlement for MIN_MS_TO_WINDOW_END_BTC tuning. */
+type Btc5mAutoEntryContext = {
+  windowSec: number;
+  asset: string;
+  direction: Direction;
+  trade_type: string;
+  ms_before_window_end: number;
+  signalPercent: number;
+  entryPrice: number;
+  createdAtMs: number;
+  /** Optional lifecycle hint for debugging (e.g. orphaned TTL cleanup). */
+  lastSeenState?: string;
+};
+
+const BTC_5M_ENTRY_BUCKET_KEYS = ["0-5s", "5-8s", "8-12s", "12-20s", ">20s"] as const;
+type Btc5mEntryBucketKey = (typeof BTC_5M_ENTRY_BUCKET_KEYS)[number];
+
+function btc5mEntryBucketForMsBeforeEnd(msBeforeWindowEnd: number): Btc5mEntryBucketKey {
+  const s = msBeforeWindowEnd / 1000;
+  if (s < 5) return "0-5s";
+  if (s < 8) return "5-8s";
+  if (s < 12) return "8-12s";
+  if (s < 20) return "12-20s";
+  return ">20s";
+}
+
+function btc5mEntryBucketRollupEveryN(): number {
+  const n = Number(process.env.BTC_5M_ENTRY_BUCKET_ROLLUP_EVERY ?? 10);
+  return Number.isFinite(n) && n > 0 ? Math.floor(n) : 10;
+}
+
+function btc5mEntryContextTtlMs(): number {
+  const n = Number(process.env.BTC_5M_ENTRY_CONTEXT_TTL_MS ?? 900_000);
+  return Number.isFinite(n) && n >= 60_000 ? Math.floor(n) : 900_000;
+}
+
+function btc5mFreshBucketStats(): Record<Btc5mEntryBucketKey, { trades: number; wins: number; pnlSum: number }> {
+  return {
+    "0-5s": { trades: 0, wins: 0, pnlSum: 0 },
+    "5-8s": { trades: 0, wins: 0, pnlSum: 0 },
+    "8-12s": { trades: 0, wins: 0, pnlSum: 0 },
+    "12-20s": { trades: 0, wins: 0, pnlSum: 0 },
+    ">20s": { trades: 0, wins: 0, pnlSum: 0 }
+  };
+}
+
 export class TradingEngine {
   private wallet = new WalletService();
   private running = false;
@@ -481,6 +527,11 @@ export class TradingEngine {
   /** Paper early-exit: retry simulated market sell when book had no bid liquidity (do not force −entry as final P&amp;L). */
   private paperExitRetryTimerByTradeId = new Map<string, ReturnType<typeof setTimeout>>();
   private paperExitInFlightIds = new Set<string>();
+
+  /** AUTO BTC ~5m: entry snapshot by trade id → result log + entry-time buckets (measurement only). */
+  private btc5mAutoEntryByTradeId = new Map<string, Btc5mAutoEntryContext>();
+  private btc5mEntryBucketStats = btc5mFreshBucketStats();
+  private btc5mTradeResultCount = 0;
 
   /** Anchor Strategy: bid-depth imbalance history (5s cadence, max 10). */
   private anchorImbalanceHistoryUp: number[] = [];
@@ -2666,6 +2717,31 @@ export class TradingEngine {
       "SIGNAL",
       `[HEALTH] rtds=${rtdsConnected ? "OK" : "OFF"} bookAgeSec=${bookAgeSec ?? "—"} pos pending=${pending} wins=${wins} losses=${losses} rtdsAgeMs {${rtdsAges}} cache/oracleAgeMs {${oracleAges}} oracleSource {${oracleSources}} ${this.formatOracleTrendHealthBracket()}`
     );
+    this.cleanupStaleBtc5mAutoEntryContexts(now);
+  }
+
+  /** Drop orphaned BTC 5m analytics contexts (no settlement); measurement logs unchanged for live paths. */
+  private cleanupStaleBtc5mAutoEntryContexts(nowMs: number): void {
+    const ttl = btc5mEntryContextTtlMs();
+    const before = this.btc5mAutoEntryByTradeId.size;
+    if (before === 0) return;
+    let removed = 0;
+    for (const [tradeId, ctx] of [...this.btc5mAutoEntryByTradeId.entries()]) {
+      const ageMs = nowMs - ctx.createdAtMs;
+      if (ageMs <= ttl) continue;
+      this.btc5mAutoEntryByTradeId.delete(tradeId);
+      removed += 1;
+      this.log(
+        "SIGNAL",
+        `[BTC_5M_CONTEXT_CLEANUP] tradeId=${tradeId} windowSec=${ctx.windowSec} ageMs=${Math.round(ageMs)} reason=TTL_EXPIRED`
+      );
+    }
+    if (removed > 0) {
+      this.log(
+        "SIGNAL",
+        `[BTC_5M_CONTEXT_HEALTH] activeContexts=${this.btc5mAutoEntryByTradeId.size} removed=${removed} ttlMs=${ttl}`
+      );
+    }
   }
 
   onMarket?: (data: MarketWsPayload) => void;
@@ -2676,20 +2752,69 @@ export class TradingEngine {
   onBetLog?: (data: BetLogEntry) => void;
 
   /**
-   * When the active slot is a BTC ~5m up/down window and an entry proceeds, log ms before window end for
-   * histogram tuning (correlate with the following `[AUTO] Placed …` / `[ANCHOR]` trade line via `windowSec`).
+   * BTC ~5m AUTO commit: log ENTRY_TIME_BTC_5M and store context on trade id for [BTC_5M_TRADE_RESULT] at close.
    */
-  private logEntryTimeBtc5mIfApplicable(tradeType: string, signalPercent: number): void {
+  private registerAndLogBtc5mAutoEntry(
+    tradeId: string,
+    direction: Direction,
+    tradeType: string,
+    signalPercent: number,
+    entryPrice: number
+  ): void {
     const asset = this.wallet.getActiveDiscoveredAsset() ?? "?";
     const meta = this.wallet.getDiscoveredMeta();
     if (!isBtcFiveMinuteWindow(asset, meta) || meta?.windowStartSec == null || !meta.endDateIso) return;
     const end = new Date(meta.endDateIso).getTime();
     if (Number.isNaN(end)) return;
-    const msBefore = end - Date.now();
+    const msBefore = Math.round(end - Date.now());
+    const sp = Number.isFinite(signalPercent) ? signalPercent : 0;
     this.log(
       "SIGNAL",
-      `[ENTRY_TIME_BTC_5M] windowSec=${meta.windowStartSec} ms_before_window_end=${Math.round(msBefore)} signalPercent=${signalPercent.toFixed(1)} trade_type=${tradeType}`
+      `[ENTRY_TIME_BTC_5M] windowSec=${meta.windowStartSec} ms_before_window_end=${msBefore} signalPercent=${sp.toFixed(1)} trade_type=${tradeType}`
     );
+    const createdAtMs = Date.now();
+    this.btc5mAutoEntryByTradeId.set(tradeId, {
+      windowSec: meta.windowStartSec,
+      asset: "BTC",
+      direction,
+      trade_type: tradeType,
+      ms_before_window_end: msBefore,
+      signalPercent: sp,
+      entryPrice,
+      createdAtMs,
+      lastSeenState: "REGISTERED"
+    });
+  }
+
+  /** On settlement / close: correlate with entry context; update buckets; periodic [BTC_5M_ENTRY_BUCKETS]. */
+  private finalizeBtc5mAutoAnalytics(tradeId: string, settled: Trade, exitPrice: number, pnl: number): void {
+    const ctx = this.btc5mAutoEntryByTradeId.get(tradeId);
+    if (!ctx) return;
+    this.btc5mAutoEntryByTradeId.delete(tradeId);
+    const win = tradeRowInsightWin(settled);
+    const result: "WIN" | "LOSS" = win ? "WIN" : "LOSS";
+    this.log(
+      "SIGNAL",
+      `[BTC_5M_TRADE_RESULT] windowSec=${ctx.windowSec} asset=${ctx.asset} direction=${ctx.direction} trade_type=${ctx.trade_type} ms_before_window_end=${ctx.ms_before_window_end} signalPercent=${ctx.signalPercent.toFixed(1)} entryPrice=${ctx.entryPrice.toFixed(4)} exitPrice=${Number.isFinite(exitPrice) ? exitPrice.toFixed(4) : "nan"} pnl=${Number(pnl).toFixed(2)} result=${result}`
+    );
+    const bucket = btc5mEntryBucketForMsBeforeEnd(ctx.ms_before_window_end);
+    const agg = this.btc5mEntryBucketStats[bucket];
+    agg.trades += 1;
+    if (win) agg.wins += 1;
+    agg.pnlSum += pnl;
+    this.btc5mTradeResultCount += 1;
+    const every = btc5mEntryBucketRollupEveryN();
+    if (this.btc5mTradeResultCount % every === 0) {
+      for (const b of BTC_5M_ENTRY_BUCKET_KEYS) {
+        const s = this.btc5mEntryBucketStats[b];
+        const winRatePct = s.trades > 0 ? (100 * s.wins) / s.trades : 0;
+        const avgPnl = s.trades > 0 ? s.pnlSum / s.trades : 0;
+        this.log(
+          "SIGNAL",
+          `[BTC_5M_ENTRY_BUCKETS] bucket=${b} trades=${s.trades} winRate=${winRatePct.toFixed(1)}% avgPnl=${avgPnl.toFixed(2)}`
+        );
+      }
+    }
   }
 
   /**
@@ -4679,7 +4804,13 @@ export class TradingEngine {
     const commitTradeEntry = () => {
       if (source === "AUTO") {
         const tradeType = anchorAutoAnchorPath ? "anchor" : strat;
-        this.logEntryTimeBtc5mIfApplicable(tradeType, this.prediction.confidence);
+        this.registerAndLogBtc5mAutoEntry(
+          pendingRow.id,
+          direction,
+          tradeType,
+          this.prediction.confidence,
+          Number(pendingRow.price)
+        );
       }
       this.lastTradeAtBySlug.set(cdKey, Date.now());
       this.trades = [pendingRow, ...this.trades].slice(0, 250);
@@ -5207,6 +5338,7 @@ export class TradingEngine {
     this.balance += settled.pnl;
     this.trades[idx] = settled;
     this.maybeRecordOlaPnlAndCheckKill(settled, settled.pnl);
+    this.finalizeBtc5mAutoAnalytics(t.id, settled, payoutPerShare, pnl);
     const drawdown = START_BALANCE - this.balance;
     if (drawdown >= this.effStopLossUsd()) {
       this.stopLossTriggered = true;
@@ -5325,6 +5457,7 @@ export class TradingEngine {
       this.balance += settled.pnl;
       this.trades[idx] = settled;
       this.maybeRecordOlaPnlAndCheckKill(settled, settled.pnl);
+      this.finalizeBtc5mAutoAnalytics(t.id, settled, fill.vwap, settled.pnl);
 
       const drawdown = START_BALANCE - this.balance;
       if (drawdown >= this.effStopLossUsd()) {
@@ -5419,6 +5552,7 @@ export class TradingEngine {
     this.balance += settled.pnl;
     this.trades[idx] = settled;
     this.maybeRecordOlaPnlAndCheckKill(settled, settled.pnl);
+    this.finalizeBtc5mAutoAnalytics(t.id, settled, payoutPerShare, pnl);
     const drawdown = START_BALANCE - this.balance;
     if (drawdown >= this.effStopLossUsd()) {
       this.stopLossTriggered = true;
@@ -5699,6 +5833,7 @@ export class TradingEngine {
     this.balance += settled.pnl;
     this.trades[idx] = settled;
     this.maybeRecordOlaPnlAndCheckKill(settled, settled.pnl);
+    this.finalizeBtc5mAutoAnalytics(t.id, settled, payoutPerShare, pnl);
 
     const drawdown = START_BALANCE - this.balance;
     if (drawdown >= this.effStopLossUsd()) {

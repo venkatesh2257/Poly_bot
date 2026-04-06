@@ -6,6 +6,7 @@
   "main": "src/index.ts",
   "scripts": {
     "typecheck": "tsc --noEmit -p tsconfig.json",
+    "test": "vitest run",
     "debug:bot": "npx tsx src/bot.ts"
   },
   "dependencies": {
@@ -17,6 +18,7 @@
     "@types/express": "^5.0.0",
     "@types/node": "^22.10.5",
     "tsx": "^4.19.2",
-    "typescript": "^5.7.3"
+    "typescript": "^5.7.3",
+    "vitest": "^3.0.5"
   }
 }

@@ -281,25 +281,44 @@ export class PriceEngine extends EventEmitter {
   }
 
   /**
-   * Subscribe to a new market's tokens for real-time orderbook updates
+   * Subscribe to a new market's tokens for real-time orderbook updates.
+   * Idempotent: same token pair does not reset the book or re-send subscribe (avoids WS churn / log spam).
    */
   subscribeMarket(upTokenId: string, downTokenId: string) {
+    if (
+      this.polySubscribedTokens.length === 2 &&
+      this.polySubscribedTokens[0] === upTokenId &&
+      this.polySubscribedTokens[1] === downTokenId
+    ) {
+      return;
+    }
+
+    for (const t of this.polySubscribedTokens) {
+      this.polyTokenMap.delete(t);
+    }
+
     this.polyTokenMap.set(upTokenId, "UP");
     this.polyTokenMap.set(downTokenId, "DOWN");
     this.polySubscribedTokens = [upTokenId, downTokenId];
-    
-    // Reset book state for new market
+
     this.polyBook = {
-      upBestBid: 0, upBestAsk: 0, downBestBid: 0, downBestAsk: 0,
-      upAskDepth: 0, downAskDepth: 0, lastUpdate: 0,
+      upBestBid: 0,
+      upBestAsk: 0,
+      downBestBid: 0,
+      downBestAsk: 0,
+      upAskDepth: 0,
+      downAskDepth: 0,
+      lastUpdate: 0,
     };
 
     if (this.polyWs?.readyState === WebSocket.OPEN) {
-      this.polyWs.send(JSON.stringify({
-        type: "market",
-        assets_ids: [upTokenId, downTokenId],
-      }));
-      console.log(`[price] Subscribed to Polymarket market tokens`);
+      this.polyWs.send(
+        JSON.stringify({
+          type: "market",
+          assets_ids: [upTokenId, downTokenId],
+        })
+      );
+      console.log(`[price] Subscribed to Polymarket market tokens (new pair)`);
     }
   }
 

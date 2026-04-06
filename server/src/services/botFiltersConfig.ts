@@ -11,6 +11,10 @@
  * Example:
  *   MIN_MS_TO_WINDOW_END=20000
  *   MIN_MS_TO_WINDOW_END_BTC=8000
+ *
+ * BTC 5m entry/result analytics (SIGNAL only, `engine.ts`): ENTRY_TIME_BTC_5M, BTC_5M_TRADE_RESULT,
+ * BTC_5M_ENTRY_BUCKETS every N results — `BTC_5M_ENTRY_BUCKET_ROLLUP_EVERY` (default 10).
+ * Orphan context TTL: `BTC_5M_ENTRY_CONTEXT_TTL_MS` (default 900000).
  */
 
 import fs from "node:fs";

@@ -1,7 +1,19 @@
 /**
- * Market Engine — finds and tracks Polymarket 5-min BTC markets
+ * Market Engine — Polymarket BTC 15m up/down markets (slug btc-updown-15m-*)
  * Uses EU proxy to bypass US geo-block
  */
+
+import {
+  BTC_UPDOWN_MARKET_WINDOW_SEC,
+  btcUpdown15mEventSlug,
+  currentBtcUpdownWindowStartSec,
+} from "./btcUpdownWindow.js";
+
+export {
+  BTC_UPDOWN_MARKET_WINDOW_SEC,
+  btcUpdown15mEventSlug,
+  currentBtcUpdownWindowStartSec,
+} from "./btcUpdownWindow.js";
 
 export interface MarketInfo {
   slug: string;
@@ -14,11 +26,11 @@ export interface MarketInfo {
   downTokenId: string;
   upPrice: number;
   downPrice: number;
-  upBestBid: number;   // highest buy offer on this token's book
+  upBestBid: number; // highest buy offer on this token's book
   downBestBid: number; // highest buy offer on this token's book
-  upBestAsk: number;   // lowest sell offer on this token's book
+  upBestAsk: number; // lowest sell offer on this token's book
   downBestAsk: number; // lowest sell offer on this token's book
-  upAskDepth: number;  // total size available at best ask
+  upAskDepth: number; // total size available at best ask
   downAskDepth: number;
   acceptingOrders: boolean;
 }
@@ -38,19 +50,19 @@ async function proxiedFetch(targetUrl: string): Promise<Response> {
 
 export async function findCurrentMarket(): Promise<MarketInfo | null> {
   const now = Math.floor(Date.now() / 1000);
-  const currentWindowStart = Math.floor(now / 900) * 900;
+  const currentWindowStart = currentBtcUpdownWindowStartSec(now);
   const timeIntoWindow = now - currentWindowStart;
 
   // Only trade current window, skip if too close to end
-  if (timeIntoWindow > 895) return null;  // Allow trades up to 895s (v8.1 Last Look 15m needs 780-870s)
+  if (timeIntoWindow > BTC_UPDOWN_MARKET_WINDOW_SEC - 5) return null;
 
-  const slug = `btc-updown-15m-${currentWindowStart}`;
+  const slug = btcUpdown15mEventSlug(currentWindowStart);
 
   try {
     const res = await proxiedFetch(`${GAMMA_BASE}/events/slug/${slug}`);
     if (!res.ok) return null;
 
-    const event = await res.json() as any;
+    const event = (await res.json()) as any;
     if (!event?.id || !event?.markets?.length) return null;
 
     const market = event.markets[0];
@@ -69,21 +81,24 @@ export async function findCurrentMarket(): Promise<MarketInfo | null> {
     const downMid = parseFloat(outcomePrices[downIdx >= 0 ? downIdx : 1]);
 
     // Fetch orderbook for both tokens — get best bids AND best asks
-    let upBestBid = 0, downBestBid = 0;
-    let upBestAsk = 0, downBestAsk = 0;
-    let upAskDepth = 0, downAskDepth = 0;
+    let upBestBid = 0,
+      downBestBid = 0;
+    let upBestAsk = 0,
+      downBestAsk = 0;
+    let upAskDepth = 0,
+      downAskDepth = 0;
     try {
       const upBookRes = await proxiedFetch(`https://clob.polymarket.com/book?token_id=${upTokenId}`);
       if (upBookRes.ok) {
-        const book = await upBookRes.json() as any;
+        const book = (await upBookRes.json()) as any;
         const bids = book?.bids || [];
         const asks = book?.asks || [];
         if (bids.length > 0) {
           upBestBid = Math.max(...bids.map((b: any) => parseFloat(b.price)));
         }
         if (asks.length > 0) {
-          // Best ask = lowest price
-          const sortedAsks = asks.map((a: any) => ({ price: parseFloat(a.price), size: parseFloat(a.size) }))
+          const sortedAsks = asks
+            .map((a: any) => ({ price: parseFloat(a.price), size: parseFloat(a.size) }))
             .sort((a: any, b: any) => a.price - b.price);
           upBestAsk = sortedAsks[0].price;
           upAskDepth = sortedAsks[0].size;
@@ -91,20 +106,21 @@ export async function findCurrentMarket(): Promise<MarketInfo | null> {
       }
       const downBookRes = await proxiedFetch(`https://clob.polymarket.com/book?token_id=${downTokenId}`);
       if (downBookRes.ok) {
-        const book = await downBookRes.json() as any;
+        const book = (await downBookRes.json()) as any;
         const bids = book?.bids || [];
         const asks = book?.asks || [];
         if (bids.length > 0) {
           downBestBid = Math.max(...bids.map((b: any) => parseFloat(b.price)));
         }
         if (asks.length > 0) {
-          const sortedAsks = asks.map((a: any) => ({ price: parseFloat(a.price), size: parseFloat(a.size) }))
+          const sortedAsks = asks
+            .map((a: any) => ({ price: parseFloat(a.price), size: parseFloat(a.size) }))
             .sort((a: any, b: any) => a.price - b.price);
           downBestAsk = sortedAsks[0].price;
           downAskDepth = sortedAsks[0].size;
         }
       }
-    } catch (e) {
+    } catch {
       // Fall back to mid prices if orderbook fetch fails
     }
 
@@ -114,7 +130,7 @@ export async function findCurrentMarket(): Promise<MarketInfo | null> {
       conditionId: market.conditionId,
       endDate: market.endDate,
       windowStart: currentWindowStart,
-      windowEnd: currentWindowStart + 900,
+      windowEnd: currentWindowStart + BTC_UPDOWN_MARKET_WINDOW_SEC,
       upTokenId,
       downTokenId,
       upPrice: upMid,
@@ -127,7 +143,7 @@ export async function findCurrentMarket(): Promise<MarketInfo | null> {
       downAskDepth,
       acceptingOrders: market.acceptingOrders ?? true,
     };
-  } catch (e) {
+  } catch {
     return null;
   }
 }
@@ -137,11 +153,11 @@ export async function findCurrentMarket(): Promise<MarketInfo | null> {
  * outcomePrices: ["1","0"] = Up won, ["0","1"] = Down won
  */
 export async function checkMarketOutcome(windowStart: number): Promise<"Up" | "Down" | "pending" | null> {
-  const slug = `btc-updown-15m-${windowStart}`;
+  const slug = btcUpdown15mEventSlug(windowStart);
   try {
     const res = await proxiedFetch(`${GAMMA_BASE}/events/slug/${slug}`);
     if (!res.ok) return null;
-    const event = await res.json() as any;
+    const event = (await res.json()) as any;
     const market = event?.markets?.[0];
     if (!market) return null;
     const prices = JSON.parse(market.outcomePrices || "[]");
