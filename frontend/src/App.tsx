@@ -36,6 +36,9 @@ import type {
   MarketPoint,
   Mode,
   PingResponse,
+  SynthesisChartMode,
+  SynthesisMarketDataHealthPayload,
+  SynthesisTelemetryPayload,
   PolymarketAccountSummary,
   Prediction,
   Trade,
@@ -286,11 +289,14 @@ function chartStrokeForAsset(a: string): string {
 function AssetSpotChartCard({
   asset,
   points,
-  stroke
+  stroke,
+  synthesisRefUsd
 }: {
   asset: string;
   points: MarketPoint[];
   stroke: string;
+  /** Latest Synthesis reference USD (Chainlink feed) — label only; primary line stays native spot. */
+  synthesisRefUsd?: number | null;
 }): ReactElement {
   const last = points[points.length - 1];
   const target = last?.btcTargetUsd ?? null;
@@ -393,6 +399,12 @@ function AssetSpotChartCard({
           Loading {asset} spot…
         </div>
       )}
+      {synthesisRefUsd != null && Number.isFinite(synthesisRefUsd) ? (
+        <p className="mt-2 text-[10px] text-violet-300/90">
+          Synthesis Chainlink ref: <span className="font-mono">{formatUsdSpot(synthesisRefUsd)}</span> (dashboard
+          only; engine spot unchanged)
+        </p>
+      ) : null}
     </div>
   );
 }
@@ -413,6 +425,11 @@ function buildXTickTimes(points: MarketPoint[], maxLabels = 12): string[] {
 export function App() {
   const [chartData, setChartData] = useState<MarketPoint[]>([]);
   const [assetCharts, setAssetCharts] = useState<Record<string, MarketPoint[]>>({});
+  /** Synthesis Chainlink/price overlay (from WS `market.synthesis`). */
+  const [synthesisPriceOverlay, setSynthesisPriceOverlay] = useState<Array<{ t: number; priceUsd: number }>>([]);
+  const [synthesisChartMode, setSynthesisChartMode] = useState<SynthesisChartMode | null>(null);
+  const [synthesisTelemetryWs, setSynthesisTelemetryWs] = useState<SynthesisTelemetryPayload | null>(null);
+  const [synthesisHealthWs, setSynthesisHealthWs] = useState<SynthesisMarketDataHealthPayload | null>(null);
   const [prediction, setPrediction] = useState<Prediction | null>(null);
   const [logs, setLogs] = useState<LogEntry[]>([]);
   const [betLogs, setBetLogs] = useState<BetLogEntry[]>([]);
@@ -844,6 +861,31 @@ export function App() {
   }, [tradingState?.updownAssetsConfigured, assetCharts]);
 
   const chartPrimaryAsset = tradingState?.updownAssetsConfigured?.[0] ?? chartAssetsList[0] ?? "BTC";
+
+  const synthesisRefLastUsd = useMemo(() => {
+    const o = synthesisPriceOverlay;
+    if (!o.length) return null;
+    const last = o[o.length - 1];
+    return last != null && Number.isFinite(last.priceUsd) ? last.priceUsd : null;
+  }, [synthesisPriceOverlay]);
+
+  const synthesisMarketHint = useMemo(() => {
+    const tel = tradingState?.synthesis?.telemetry ?? synthesisTelemetryWs;
+    const src = tradingState?.synthesis?.dashboardOrderbookSource;
+    const health = tradingState?.synthesis?.health ?? synthesisHealthWs;
+    if (!tel?.enabled) return null;
+    const st = tel.stale ? "stale" : "ok";
+    const srcL = src ? String(src).replace(/_/g, " ") : "";
+    let guard = "";
+    if (health) {
+      const h = health.staleness;
+      const nat = h.nativeOrderbook.stale ? "stale" : "fresh";
+      const syn = h.synthesisOrderbook.stale ? "stale" : "fresh";
+      const fb = health.fallbackEligible ? "on" : `off (${health.fallbackBlockReason})`;
+      guard = ` · drift ${health.drift.level} ${health.drift.maxBps.toFixed(0)}bps · books nat ${nat} syn ${syn} · fb ${fb}`;
+    }
+    return `Synthesis ${st}${srcL ? ` · ${srcL}` : ""}${guard}`;
+  }, [tradingState?.synthesis, synthesisTelemetryWs, synthesisHealthWs]);
   const selectedMarketLabel = useMemo(
     () => markets.find((m) => m.tokenID === selectedTokenID)?.label ?? "BTC 5s Market",
     [markets, selectedTokenID]
@@ -1027,10 +1069,36 @@ export function App() {
         if (Array.isArray(p)) {
           setChartData(p);
           setAssetCharts({});
+          setSynthesisPriceOverlay([]);
+          setSynthesisChartMode(null);
+          setSynthesisTelemetryWs(null);
+          setSynthesisHealthWs(null);
         } else if (p && typeof p === "object") {
-          const pack = p as { primary?: MarketPoint[]; byAsset?: Record<string, MarketPoint[]> };
+          const pack = p as {
+            primary?: MarketPoint[];
+            byAsset?: Record<string, MarketPoint[]>;
+            synthesis?: {
+              priceOverlayUsd: Array<{ t: number; priceUsd: number }>;
+              chartMode: SynthesisChartMode;
+              telemetry: SynthesisTelemetryPayload;
+              health?: SynthesisMarketDataHealthPayload;
+            };
+          };
           setChartData(Array.isArray(pack.primary) ? pack.primary : []);
           setAssetCharts(pack.byAsset && typeof pack.byAsset === "object" ? pack.byAsset : {});
+          if (pack.synthesis) {
+            setSynthesisPriceOverlay(
+              Array.isArray(pack.synthesis.priceOverlayUsd) ? pack.synthesis.priceOverlayUsd : []
+            );
+            setSynthesisChartMode(pack.synthesis.chartMode ?? null);
+            setSynthesisTelemetryWs(pack.synthesis.telemetry ?? null);
+            setSynthesisHealthWs(pack.synthesis.health ?? null);
+          } else {
+            setSynthesisPriceOverlay([]);
+            setSynthesisChartMode(null);
+            setSynthesisTelemetryWs(null);
+            setSynthesisHealthWs(null);
+          }
         }
       }
       if (msg.type === "prediction") setPrediction(msg.payload);
@@ -2031,6 +2099,7 @@ export function App() {
         modeToggleLoading={modeToggleLoading}
         metaMaskAutoEnabled={metaMaskAutoEnabled}
         executionEnvBadge={executionEnvBadge}
+        synthesisHint={synthesisMarketHint}
         onStop={handleStopBotClick}
         onStart={handleStartBotClick}
         onPaper={() => void setTradingMode("SIMULATION")}
@@ -2453,6 +2522,14 @@ export function App() {
             One chart per <span className="text-slate-400">UPDOWN_ASSETS</span> symbol. Line = exchange spot (Coinbase / Binance); dashed
             target = Polymarket price to beat when available, else window-open anchor. Engine momentum still tracks{" "}
             <span className="font-medium text-slate-400">{chartPrimaryAsset}</span> (first in list).
+            {synthesisChartMode === "synthesis_overlay" ? (
+              <>
+                {" "}
+                <span className="text-violet-400/90">
+                  Synthesis Chainlink ref is shown as a label when enabled — native spot series unchanged for the bot.
+                </span>
+              </>
+            ) : null}
           </p>
           {chartAssetsList.length > 0 ? (
             <div className="grid gap-4 sm:grid-cols-1 lg:grid-cols-2">
@@ -2464,12 +2541,27 @@ export function App() {
                       ? chartData
                       : [];
                 return (
-                  <AssetSpotChartCard key={a} asset={a} points={series} stroke={chartStrokeForAsset(a)} />
+                  <AssetSpotChartCard
+                    key={a}
+                    asset={a}
+                    points={series}
+                    stroke={chartStrokeForAsset(a)}
+                    synthesisRefUsd={
+                      a === chartPrimaryAsset && synthesisChartMode === "synthesis_overlay"
+                        ? synthesisRefLastUsd
+                        : null
+                    }
+                  />
                 );
               })}
             </div>
           ) : chartData.length > 0 && chartData.some((p) => p.btcUsd != null) ? (
-            <AssetSpotChartCard asset="Spot" points={chartData} stroke="#F7931A" />
+            <AssetSpotChartCard
+              asset="Spot"
+              points={chartData}
+              stroke="#F7931A"
+              synthesisRefUsd={synthesisChartMode === "synthesis_overlay" ? synthesisRefLastUsd : null}
+            />
           ) : (
             <div className="flex min-h-[240px] items-center justify-center rounded-lg bg-[#0f1114] text-sm text-slate-500">
               Loading spot feeds…

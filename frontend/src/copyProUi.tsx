@@ -31,6 +31,8 @@ export function CopyProTopBar(props: {
   onLogin: () => void;
   onLogout: () => void;
   onOpenRiskSettings?: () => void;
+  /** Optional: Synthesis market-data status (non-execution). */
+  synthesisHint?: string | null;
 }) {
   const {
     wsConnected,
@@ -47,7 +49,8 @@ export function CopyProTopBar(props: {
     onLive,
     onLogin,
     onLogout,
-    onOpenRiskSettings
+    onOpenRiskSettings,
+    synthesisHint
   } = props;
 
   const execBadgeClass =
@@ -107,6 +110,14 @@ export function CopyProTopBar(props: {
               title="Server session: PAPER_TRADING / EXECUTE_TRADES (set by Go LIVE or .env)"
             >
               {executionEnvBadge.label}
+            </span>
+          ) : null}
+          {synthesisHint ? (
+            <span
+              className="max-w-[220px] truncate rounded border border-violet-800/60 bg-violet-950/50 px-2 py-1 text-[10px] font-semibold text-violet-200"
+              title="Synthesis market data (dashboard/analytics). Execution remains native Polymarket CLOB."
+            >
+              {synthesisHint}
             </span>
           ) : null}
           <button

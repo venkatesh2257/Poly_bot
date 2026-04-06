@@ -1,6 +1,6 @@
 /**
  * Polymarket crypto Up/Down ~5m: sparse directional entries using oracle/chart momentum,
- * with Gamma expiry gating and executable YES-token ask checks (no late overpay).
+ * with Gamma expiry gating (TTE band: not too early, not too close) and executable YES-token ask checks.
  */
 
 import type { Direction } from "../types/index.js";
@@ -25,10 +25,16 @@ export type Polymarket5mSelectiveMomentumConfig = {
   /** Max bid–ask spread on each YES outcome token (Polymarket 0–1). */
   maxOutcomeSpread: number;
   requireBookConfirm: boolean;
-  /** Min seconds to Gamma expiry (avoid resolution noise). */
-  minSecToGammaExpiry: number;
-  /** Max seconds to Gamma expiry (avoid chasing late / illiquid tail). */
-  maxSecToGammaExpiry: number;
+  /**
+   * Minimum seconds **remaining** until Gamma expiry to allow entry.
+   * If `secToGammaExpiry <` this, NO_TRADE (too close to resolution / illiquid tail).
+   */
+  minSecRemainingToExpiry: number;
+  /**
+   * Maximum seconds **remaining** until Gamma expiry to allow entry (upper bound on TTE).
+   * If `secToGammaExpiry >` this, NO_TRADE (too **early** in the window — still too much time left).
+   */
+  maxSecRemainingToExpiry: number;
   /** Max executable ask (0–1) for the outcome we buy — avoids overpaying. */
   maxYesTokenAsk: number;
 };
@@ -40,8 +46,14 @@ export function loadPolymarket5mSelectiveMomentumConfigFromEnv(): Polymarket5mSe
     persistenceTicks: Math.max(1, Math.floor(envNum("SM_PERSISTENCE_TICKS", 3))),
     maxOutcomeSpread: Math.max(0.001, envNum("SM_PM5M_MAX_OUTCOME_SPREAD", envNum("SM_MAX_SPREAD", 0.12))),
     requireBookConfirm: envBool("SM_REQUIRE_BOOK_CONFIRM", true),
-    minSecToGammaExpiry: Math.max(0, envNum("SM_PM5M_MIN_SEC_TO_EXPIRY", envNum("SM_MIN_SEC_LEFT", 45))),
-    maxSecToGammaExpiry: Math.max(0, envNum("SM_PM5M_MAX_SEC_TO_EXPIRY", envNum("SM_MAX_SEC_LEFT", 240))),
+    minSecRemainingToExpiry: Math.max(
+      0,
+      envNum("SM_PM5M_MIN_SEC_REMAINING", envNum("SM_PM5M_MIN_SEC_TO_EXPIRY", envNum("SM_MIN_SEC_LEFT", 45)))
+    ),
+    maxSecRemainingToExpiry: Math.max(
+      0,
+      envNum("SM_PM5M_MAX_SEC_REMAINING", envNum("SM_PM5M_MAX_SEC_TO_EXPIRY", envNum("SM_MAX_SEC_LEFT", 240)))
+    ),
     maxYesTokenAsk: Math.min(0.99, Math.max(0.01, envNum("SM_PM5M_MAX_YES_ASK", envNum("SM_MAX_ENTRY_ASK", 0.72))))
   };
 }
@@ -183,20 +195,20 @@ export function evaluatePolymarket5mSelectiveMomentum(
 
   const sec = input.secToGammaExpiry;
   if (sec != null && sec >= 0) {
-    if (sec < cfg.minSecToGammaExpiry) {
+    if (sec < cfg.minSecRemainingToExpiry) {
       return {
         prediction: direction,
         confidence,
         recommendation: "NO_TRADE",
-        reason: `${prefix}: ${sec}s to Gamma expiry < SM_PM5M_MIN_SEC_TO_EXPIRY=${cfg.minSecToGammaExpiry}`
+        reason: `${prefix}: TTE ${sec}s < SM_PM5M_MIN_SEC_REMAINING=${cfg.minSecRemainingToExpiry} (too close to Gamma expiry)`
       };
     }
-    if (sec > cfg.maxSecToGammaExpiry) {
+    if (sec > cfg.maxSecRemainingToExpiry) {
       return {
         prediction: direction,
         confidence,
         recommendation: "NO_TRADE",
-        reason: `${prefix}: ${sec}s to expiry > SM_PM5M_MAX_SEC_TO_EXPIRY=${cfg.maxSecToGammaExpiry} (avoid late chase)`
+        reason: `${prefix}: TTE ${sec}s > SM_PM5M_MAX_SEC_REMAINING=${cfg.maxSecRemainingToExpiry} (too early in window — excess time before expiry)`
       };
     }
   }

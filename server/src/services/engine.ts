@@ -15,6 +15,9 @@ import type {
   MarketOption,
   MarketPoint,
   MarketWsPayload,
+  NormalizedSynthesisTradePayload,
+  SynthesisMarketDataHealthPayload,
+  DriftStatusLevel,
   Prediction,
   RiskSettingsSnapshot,
   Status,
@@ -112,6 +115,18 @@ import {
   evaluatePolymarket5mSelectiveMomentum,
   loadPolymarket5mSelectiveMomentumConfigFromEnv
 } from "./selectiveMomentumStrategy.js";
+import { loadSynthesisConfigFromEnv, type SynthesisRuntimeConfig } from "./synthesisConfig.js";
+import { SynthesisMarketDataHub } from "./synthesisHub.js";
+import { resolveDashboardChartMode, resolveDashboardOrderbookSource } from "./marketDataProvider.js";
+import {
+  loadSynthesisGuardrailConfigFromEnv,
+  computeNativeSynthesisDrift,
+  driftResultToTelemetryPayload,
+  computeNativeOrderbookStale,
+  computeAgeStale,
+  evaluateSynthesisBotFallbackEligibility
+} from "./marketDataHealth.js";
+import { SynthesisMarketDataHistory } from "./marketDataHistory.js";
 
 const START_BALANCE = Number(process.env.START_BALANCE ?? 1000);
 /** Default caps; effective values read inside trade() after dotenv (engine imports before index loads .env). */
@@ -434,6 +449,18 @@ export class TradingEngine {
 
   /** Polymarket RTDS — Chainlink/Binance feeds used on polymarket.com for crypto Up/Down. */
   private polymarketRtds = new PolymarketRtdsFeed();
+  /** Optional Synthesis (synthesis.trade) market-data hub — never used for order placement. */
+  private synthesisHub: SynthesisMarketDataHub | null = null;
+  private synthesisRuntimeConfig: SynthesisRuntimeConfig = loadSynthesisConfigFromEnv();
+  private lastSynthFallbackLogMs = 0;
+  /** Throttle `[SYNTHESIS]` guardrail logs (drift / stale / fallback). */
+  private lastSynthHealthLogKey = "";
+  private lastSynthDriftGuardLogMs = 0;
+  private lastSynthDriftLevel: DriftStatusLevel = "ok";
+  private lastSynthStalenessSig = "";
+  private lastSynthAnyStale = false;
+  private lastSynthFbBlockReason = "";
+  private readonly synthesisMarketDataHistory = new SynthesisMarketDataHistory();
   /** On-chain Chainlink BTC/USD (authoritative) oracle + staleness protection. */
   private chainlinkFeed = new ChainlinkFeedService();
   /** Cached latest Chainlink tick; used as “oracle spot” for multi-asset strike/oracle. */
@@ -1384,12 +1411,187 @@ export class TradingEngine {
     this.assetSpotSeries.set(a, [...series.slice(-(CHART_MAX_POINTS - 1)), point]);
   }
 
+  private buildSynthesisMarketDataHealth(nowMs: number): SynthesisMarketDataHealthPayload | null {
+    const hub = this.synthesisHub;
+    if (!hub || !this.synthesisRuntimeConfig.enabled) return null;
+    const guard = loadSynthesisGuardrailConfigFromEnv();
+    this.synthesisRuntimeConfig = loadSynthesisConfigFromEnv();
+    const snap = hub.getSnapshot();
+    const native = this.directionalContext;
+    const driftRaw = computeNativeSynthesisDrift(native, snap.books.up, snap.books.down, guard, nowMs);
+    const driftTelemetry = driftResultToTelemetryPayload(driftRaw);
+    const nativeSt = computeNativeOrderbookStale(this.lastBookRefreshMs, nowMs, guard.nativeBookStaleMs);
+    const tel = hub.getTelemetry();
+    const synOb = computeAgeStale(tel.lastOrderbookMsgMs, nowMs, guard.synthesisOrderbookStaleMs);
+    const synTr = computeAgeStale(tel.lastTradesMsgMs, nowMs, guard.synthesisTradesStaleMs);
+    const prWall = hub.getPricesBufferLastUpdateMs();
+    const synPr = computeAgeStale(prWall > 0 ? prWall : null, nowMs, guard.synthesisPriceStaleMs);
+    const synthesisOrderbookStale = synOb.stale || snap.books.stale;
+    const syn = hub.getDirectionalContextFromSynthesis();
+    const fb = evaluateSynthesisBotFallbackEligibility({
+      synthesisEnabled: this.synthesisRuntimeConfig.enabled,
+      botFallbackEnabled: this.synthesisRuntimeConfig.botFallbackEnabled,
+      nativeBookStale: nativeSt.stale,
+      synthesisOrderbookStale,
+      synthesisReady: syn != null,
+      drift: driftRaw,
+      guard
+    });
+    return {
+      drift: driftTelemetry,
+      staleness: {
+        nativeOrderbook: nativeSt,
+        synthesisOrderbook: synOb,
+        synthesisTrades: synTr,
+        synthesisPrices: synPr
+      },
+      fallbackEligible: fb.allowed,
+      fallbackBlockReason: fb.reason
+    };
+  }
+
+  private maybeLogSynthesisGuardrails(health: SynthesisMarketDataHealthPayload, nowMs: number): void {
+    const guard = loadSynthesisGuardrailConfigFromEnv();
+    const key = `${health.drift.level}|${health.fallbackBlockReason}`;
+    const staleSig = [
+      health.staleness.nativeOrderbook.stale ? 1 : 0,
+      health.staleness.synthesisOrderbook.stale ? 1 : 0,
+      health.staleness.synthesisTrades.stale ? 1 : 0,
+      health.staleness.synthesisPrices.stale ? 1 : 0
+    ].join("");
+    if (staleSig !== this.lastSynthStalenessSig) {
+      const wasInit = this.lastSynthStalenessSig === "";
+      this.lastSynthStalenessSig = staleSig;
+      const s = health.staleness;
+      const anyStale = staleSig !== "0000";
+      if (!wasInit && this.lastSynthAnyStale && !anyStale) {
+        this.log("SIGNAL", "[SYNTHESIS][stale] recovered to healthy (all sources fresh)");
+      }
+      this.lastSynthAnyStale = anyStale;
+      if (!wasInit) {
+        this.log(
+          "SIGNAL",
+          `[SYNTHESIS][stale] nativeOb=${s.nativeOrderbook.stale ? "stale" : "fresh"} synOb=${s.synthesisOrderbook.stale ? "stale" : "fresh"} trades=${s.synthesisTrades.stale ? "stale" : "fresh"} prices=${s.synthesisPrices.stale ? "stale" : "fresh"}`
+        );
+      }
+    }
+    if (key === this.lastSynthHealthLogKey && nowMs - this.lastSynthDriftGuardLogMs < guard.driftLogThrottleMs) {
+      return;
+    }
+    this.lastSynthDriftGuardLogMs = nowMs;
+    this.lastSynthHealthLogKey = key;
+    if (this.lastSynthDriftLevel !== "ok" && health.drift.level === "ok") {
+      this.log("SIGNAL", "[SYNTHESIS][drift] recovered to ok");
+    } else if (this.lastSynthDriftLevel === "ok" && health.drift.level === "warn") {
+      this.log("SIGNAL", `[SYNTHESIS][drift] warn threshold maxBps=${health.drift.maxBps.toFixed(0)}`);
+    } else if (this.lastSynthDriftLevel !== "critical" && health.drift.level === "critical") {
+      this.log("SIGNAL", `[SYNTHESIS][drift] critical maxBps=${Number.isFinite(health.drift.maxBps) ? health.drift.maxBps.toFixed(0) : "inf"}`);
+    }
+    if (health.fallbackBlockReason === "drift_too_high" && this.lastSynthFbBlockReason !== "drift_too_high") {
+      this.log("SIGNAL", "[SYNTHESIS][fallback] blocked: drift above SYNTHESIS_BOT_FALLBACK_MAX_DRIFT_BPS");
+    }
+    this.lastSynthFbBlockReason = health.fallbackBlockReason;
+    this.lastSynthDriftLevel = health.drift.level;
+    this.log(
+      "SIGNAL",
+      `[SYNTHESIS][guard] drift=${health.drift.level} maxBps=${health.drift.maxBps.toFixed(0)} fb=${
+        health.fallbackBlockReason
+      } eligible=${health.fallbackEligible}`
+    );
+  }
+
   private buildMarketWsPayload(): MarketWsPayload {
     const byAsset: Record<string, MarketPoint[]> = {};
     for (const [k, v] of this.assetSpotSeries.entries()) {
       if (v.length > 0) byAsset[k] = v;
     }
-    return { primary: this.marketData, byAsset };
+    const base: MarketWsPayload = { primary: this.marketData, byAsset };
+    this.synthesisRuntimeConfig = loadSynthesisConfigFromEnv();
+    const hub = this.synthesisHub;
+    if (!hub || !this.synthesisRuntimeConfig.enabled) {
+      return base;
+    }
+    const snap = hub.getSnapshot();
+    const tel = snap.telemetry;
+    const hasBooks = Boolean(snap.books.up && snap.books.down);
+    const orderbookSource = resolveDashboardOrderbookSource({
+      synthesisEnabled: tel.enabled,
+      dashboardPreferred: tel.dashboardPreferred,
+      synthesisStale: tel.stale,
+      synthesisHasBooks: hasBooks
+    });
+    const chartMode = resolveDashboardChartMode({
+      synthesisEnabled: tel.enabled,
+      synthesisHasPrices: snap.priceSeries.length > 0
+    });
+    const trades: NormalizedSynthesisTradePayload[] = snap.trades.map((t) => ({
+      venue: "polymarket",
+      tokenId: t.tokenId,
+      price: t.price,
+      shares: t.shares,
+      notionalUsd: t.notionalUsd,
+      side: t.side,
+      createdAtMs: t.createdAtMs
+    }));
+    const priceOverlayUsd = snap.priceSeries.map((p) => ({ t: p.t, priceUsd: p.priceUsd }));
+    const nowMs = Date.now();
+    const health = this.buildSynthesisMarketDataHealth(nowMs);
+    if (health) {
+      this.maybeLogSynthesisGuardrails(health, nowMs);
+      this.synthesisMarketDataHistory.observe(nowMs, health);
+    }
+    base.synthesis = {
+      telemetry: {
+        enabled: tel.enabled,
+        orderbookConnected: tel.orderbookConnected,
+        tradesConnected: tel.tradesConnected,
+        dataConnected: tel.dataConnected,
+        subscribedTokenIds: tel.subscribedTokenIds,
+        conditionId: tel.conditionId,
+        activeAsset: tel.activeAsset,
+        lastOrderbookMsgMs: tel.lastOrderbookMsgMs,
+        lastTradesMsgMs: tel.lastTradesMsgMs,
+        lastDataMsgMs: tel.lastDataMsgMs,
+        stale: tel.stale,
+        dashboardPreferred: tel.dashboardPreferred,
+        botFallbackEnabled: tel.botFallbackEnabled,
+        lastError: tel.lastError
+      },
+      trades,
+      booksSynthesis: {
+        up: snap.books.up,
+        down: snap.books.down,
+        stale: snap.books.stale
+      },
+      orderbookSource,
+      chartMode,
+      priceOverlayUsd,
+      health: health
+        ? { ...health, history: this.synthesisMarketDataHistory.getWirePayload() }
+        : undefined
+    };
+    return base;
+  }
+
+  /** Native CLOB books only — execution / Anchor / settlement. */
+  private effectiveStrategyDirectionalContext(): DirectionalContext | null {
+    const native = this.directionalContext;
+    this.synthesisRuntimeConfig = loadSynthesisConfigFromEnv();
+    const hub = this.synthesisHub;
+    const syn = hub?.getDirectionalContextFromSynthesis() ?? null;
+    const health = this.buildSynthesisMarketDataHealth(Date.now());
+    if (health?.fallbackEligible && syn != null) {
+      const now = Date.now();
+      if (now - this.lastSynthFallbackLogMs > 30_000) {
+        this.lastSynthFallbackLogMs = now;
+        this.log(
+          "SIGNAL",
+          "[BOOK][synthesis] Strategy eval using Synthesis books (fallback_ok). Execution still native CLOB."
+        );
+      }
+      return syn;
+    }
+    return native;
   }
 
   /** Net momentum: positive → UP bias. `from_open` uses last BTC vs 5m window open. */
@@ -2118,6 +2320,7 @@ export class TradingEngine {
   }
 
   getTradingState(): TradingState {
+    this.synthesisRuntimeConfig = loadSynthesisConfigFromEnv();
     const mode = this.wallet.getMode();
     const meta = this.wallet.getDiscoveredMeta();
     const endParsed = meta?.endDateIso ? new Date(meta.endDateIso).getTime() : NaN;
@@ -2196,7 +2399,53 @@ export class TradingEngine {
         recommendation: this.prediction.recommendation,
         reason: this.prediction.reason
       },
-      anchorStrategy: this.buildAnchorStrategySnapshotPayload()
+      anchorStrategy: this.buildAnchorStrategySnapshotPayload(),
+      synthesis: (() => {
+        const hub = this.synthesisHub;
+        if (!hub || !this.synthesisRuntimeConfig.enabled) return undefined;
+        const snap = hub.getSnapshot();
+        const tel = snap.telemetry;
+        const hasBooks = Boolean(snap.books.up && snap.books.down);
+        const dashboardOrderbookSource = resolveDashboardOrderbookSource({
+          synthesisEnabled: tel.enabled,
+          dashboardPreferred: tel.dashboardPreferred,
+          synthesisStale: tel.stale,
+          synthesisHasBooks: hasBooks
+        });
+        const recentTrades: NormalizedSynthesisTradePayload[] = snap.trades.slice(0, 80).map((t) => ({
+          venue: "polymarket",
+          tokenId: t.tokenId,
+          price: t.price,
+          shares: t.shares,
+          notionalUsd: t.notionalUsd,
+          side: t.side,
+          createdAtMs: t.createdAtMs
+        }));
+        const health = this.buildSynthesisMarketDataHealth(Date.now());
+        return {
+          telemetry: {
+            enabled: tel.enabled,
+            orderbookConnected: tel.orderbookConnected,
+            tradesConnected: tel.tradesConnected,
+            dataConnected: tel.dataConnected,
+            subscribedTokenIds: tel.subscribedTokenIds,
+            conditionId: tel.conditionId,
+            activeAsset: tel.activeAsset,
+            lastOrderbookMsgMs: tel.lastOrderbookMsgMs,
+            lastTradesMsgMs: tel.lastTradesMsgMs,
+            lastDataMsgMs: tel.lastDataMsgMs,
+            stale: tel.stale,
+            dashboardPreferred: tel.dashboardPreferred,
+            botFallbackEnabled: tel.botFallbackEnabled,
+            lastError: tel.lastError
+          },
+          dashboardOrderbookSource,
+          recentTrades,
+          health: health
+            ? { ...health, history: this.synthesisMarketDataHistory.getWirePayload() }
+            : undefined
+        };
+      })()
     };
   }
 
@@ -2211,7 +2460,7 @@ export class TradingEngine {
     const asset = this.wallet.getActiveDiscoveredAsset() ?? "BTC";
     const spot = this.oracleSpotUsdForAsset(asset);
     const strike = this.priceToBeatByAsset.get(asset) ?? null;
-    const ctx = this.directionalContext;
+    const ctx = this.effectiveStrategyDirectionalContext();
     const meta = this.wallet.getDiscoveredMeta();
     const secLeft =
       meta?.endDateIso != null
@@ -2242,7 +2491,7 @@ export class TradingEngine {
     const cfg = loadPolymarket5mSelectiveMomentumConfigFromEnv();
     const lb = envNum("MOMENTUM_SCORE_LOOKBACK", 8);
     const momentumScalar = this.momentumScalar(lb);
-    const ctx = this.directionalContext;
+    const ctx = this.effectiveStrategyDirectionalContext();
     const meta = this.wallet.getDiscoveredMeta();
     const secLeft =
       meta?.endDateIso != null
@@ -2286,7 +2535,7 @@ export class TradingEngine {
   private async runMarketMakingAutoOnce(anchorFastLaneTick: boolean): Promise<void> {
     if (anchorFastLaneTick) return;
     const cfg = loadPolymarket5mMarketMakingConfigFromEnv();
-    const ctx = this.directionalContext;
+    const ctx = this.effectiveStrategyDirectionalContext();
     const meta = this.wallet.getDiscoveredMeta();
     const asset = this.wallet.getActiveDiscoveredAsset();
     const secLeft =
@@ -2338,7 +2587,7 @@ export class TradingEngine {
 
   private buildMarketMakingEvaluation(): StrategyEvaluation & { quoteNote: string } {
     const cfg = loadPolymarket5mMarketMakingConfigFromEnv();
-    const ctx = this.directionalContext;
+    const ctx = this.effectiveStrategyDirectionalContext();
     const meta = this.wallet.getDiscoveredMeta();
     const asset = this.wallet.getActiveDiscoveredAsset();
     const secLeft =
@@ -3392,6 +3641,14 @@ export class TradingEngine {
       this.log("SIGNAL", `BONE entry filters enabled: ${boneActive.join(", ")}`);
     }
     this.polymarketRtds.start();
+    this.synthesisRuntimeConfig = loadSynthesisConfigFromEnv();
+    if (this.synthesisRuntimeConfig.enabled) {
+      this.synthesisHub = new SynthesisMarketDataHub(this.synthesisRuntimeConfig);
+      this.synthesisHub.start();
+    } else {
+      this.synthesisHub?.stop();
+      this.synthesisHub = null;
+    }
     this.syncAssetAutoTradeKeysFromConfigured();
     this.binanceAgg.start(this.wallet.getUpdownAssetsConfigured());
     this.running = autoStart;
@@ -3493,6 +3750,16 @@ export class TradingEngine {
           ]);
           this.marketContext = mc;
           this.directionalContext = dc;
+          const metaSyn = this.wallet.getDiscoveredMeta();
+          const assetSyn = this.wallet.getActiveDiscoveredAsset() ?? "BTC";
+          if (this.synthesisHub && metaSyn?.tokenIdUp && metaSyn?.tokenIdDown) {
+            this.synthesisHub.resyncSubscription({
+              tokenIdUp: metaSyn.tokenIdUp,
+              tokenIdDown: metaSyn.tokenIdDown,
+              conditionId: metaSyn.conditionId,
+              asset: assetSyn
+            });
+          }
           if (slots.length > 0) {
             this.polymarketRtds.start();
             const chainlinkAssets = ["BTC", "ETH", "SOL", "XRP"] as const;

@@ -62,10 +62,116 @@ export interface MarketPoint {
   btcTargetUsd?: number;
 }
 
+export type DashboardOrderbookSource =
+  | "native_polymarket"
+  | "synthesis"
+  | "synthesis_stale_fallback_native";
+
+export type SynthesisChartMode = "native_primary" | "synthesis_overlay" | "native_only";
+
+export type DriftStatusLevel = "ok" | "warn" | "critical";
+
+export type SynthesisFallbackBlockReason =
+  | "native_fresh"
+  | "synthesis_stale"
+  | "drift_too_high"
+  | "incomplete_book_match"
+  | "synthesis_disabled"
+  | "bot_fallback_disabled"
+  | "drift_unavailable"
+  | "fallback_ok";
+
+export type SynthesisStalenessSlice = {
+  stale: boolean;
+  ageMs: number | null;
+  thresholdMs: number;
+  lastUpdateMs: number | null;
+  staleReason?: "never_updated" | "age_exceeded";
+};
+
+export interface SynthesisMarketDataHealthPayload {
+  drift: {
+    level: DriftStatusLevel;
+    maxBps: number;
+    comparedAtMs: number | null;
+    perOutcome: Array<{
+      outcome: "up" | "down";
+      bidBps: number;
+      askBps: number;
+      midBps: number;
+      spreadDeltaBps: number;
+    }>;
+    incomplete: boolean;
+    incompleteReason?: string;
+  };
+  staleness: {
+    nativeOrderbook: SynthesisStalenessSlice;
+    synthesisOrderbook: SynthesisStalenessSlice;
+    synthesisTrades: SynthesisStalenessSlice;
+    synthesisPrices: SynthesisStalenessSlice;
+  };
+  fallbackEligible: boolean;
+  fallbackBlockReason: SynthesisFallbackBlockReason;
+}
+
+export interface SynthesisTelemetryPayload {
+  enabled: boolean;
+  orderbookConnected: boolean;
+  tradesConnected: boolean;
+  dataConnected: boolean;
+  subscribedTokenIds: string[];
+  conditionId: string | null;
+  activeAsset: string | null;
+  lastOrderbookMsgMs: number | null;
+  lastTradesMsgMs: number | null;
+  lastDataMsgMs: number | null;
+  stale: boolean;
+  dashboardPreferred: boolean;
+  botFallbackEnabled: boolean;
+  lastError?: string;
+}
+
+export interface NormalizedSynthesisTradePayload {
+  venue: "polymarket";
+  tokenId: string;
+  price: number;
+  shares: number;
+  notionalUsd: number;
+  side: "buy" | "sell" | "unknown";
+  createdAtMs: number;
+}
+
 /** WebSocket `market` payload (server may still send a bare `MarketPoint[]` for older builds). */
 export interface MarketWsPayload {
   primary: MarketPoint[];
   byAsset: Record<string, MarketPoint[]>;
+  synthesis?: {
+    telemetry: SynthesisTelemetryPayload;
+    trades: NormalizedSynthesisTradePayload[];
+    booksSynthesis: {
+      up: {
+        tokenID: string;
+        mid: number;
+        spread: number;
+        liquidity: number;
+        bestBid: number;
+        bestAsk: number;
+      } | null;
+      down: {
+        tokenID: string;
+        mid: number;
+        spread: number;
+        liquidity: number;
+        bestBid: number;
+        bestAsk: number;
+      } | null;
+      stale: boolean;
+    };
+    orderbookSource: DashboardOrderbookSource;
+    chartMode: SynthesisChartMode;
+    priceOverlayUsd: Array<{ t: number; priceUsd: number }>;
+    health?: SynthesisMarketDataHealthPayload;
+  };
 }
 
 export interface Prediction {
@@ -216,6 +322,12 @@ export interface TradingState {
   /** Mirrors WS `prediction` for REST clients (newer servers). */
   predictionLive?: Pick<Prediction, "prediction" | "confidence" | "ts" | "recommendation" | "reason">;
   anchorStrategy?: AnchorStrategySnapshot;
+  synthesis?: {
+    telemetry: SynthesisTelemetryPayload;
+    dashboardOrderbookSource: DashboardOrderbookSource;
+    recentTrades: NormalizedSynthesisTradePayload[];
+    health?: SynthesisMarketDataHealthPayload;
+  };
 }
 
 export interface AnchorStrategySnapshot {

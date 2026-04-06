@@ -51,10 +51,147 @@ export interface MarketPoint {
   btcTargetUsd?: number;
 }
 
+export type DashboardOrderbookSource =
+  | "native_polymarket"
+  | "synthesis"
+  | "synthesis_stale_fallback_native";
+
+export type SynthesisChartMode = "native_primary" | "synthesis_overlay" | "native_only";
+
+/** Telemetry for Synthesis market-data integration (non-execution). */
+export interface SynthesisTelemetryPayload {
+  enabled: boolean;
+  orderbookConnected: boolean;
+  tradesConnected: boolean;
+  dataConnected: boolean;
+  subscribedTokenIds: string[];
+  conditionId: string | null;
+  activeAsset: string | null;
+  lastOrderbookMsgMs: number | null;
+  lastTradesMsgMs: number | null;
+  lastDataMsgMs: number | null;
+  stale: boolean;
+  dashboardPreferred: boolean;
+  botFallbackEnabled: boolean;
+  lastError?: string;
+}
+
+export interface NormalizedSynthesisTradePayload {
+  venue: "polymarket";
+  tokenId: string;
+  price: number;
+  shares: number;
+  notionalUsd: number;
+  side: "buy" | "sell" | "unknown";
+  createdAtMs: number;
+}
+
+export type DriftStatusLevel = "ok" | "warn" | "critical";
+
+export type SynthesisFallbackBlockReason =
+  | "native_fresh"
+  | "synthesis_stale"
+  | "drift_too_high"
+  | "incomplete_book_match"
+  | "synthesis_disabled"
+  | "bot_fallback_disabled"
+  | "drift_unavailable"
+  | "fallback_ok";
+
+export interface SynthesisStalenessTelemetryPayload {
+  nativeOrderbook: {
+    stale: boolean;
+    ageMs: number | null;
+    thresholdMs: number;
+    lastUpdateMs: number | null;
+    staleReason?: "never_updated" | "age_exceeded";
+  };
+  synthesisOrderbook: {
+    stale: boolean;
+    ageMs: number | null;
+    thresholdMs: number;
+    lastUpdateMs: number | null;
+    staleReason?: "never_updated" | "age_exceeded";
+  };
+  synthesisTrades: {
+    stale: boolean;
+    ageMs: number | null;
+    thresholdMs: number;
+    lastUpdateMs: number | null;
+    staleReason?: "never_updated" | "age_exceeded";
+  };
+  synthesisPrices: {
+    stale: boolean;
+    ageMs: number | null;
+    thresholdMs: number;
+    lastUpdateMs: number | null;
+    staleReason?: "never_updated" | "age_exceeded";
+  };
+}
+
+export interface SynthesisDriftTelemetryPayload {
+  level: DriftStatusLevel;
+  maxBps: number;
+  comparedAtMs: number | null;
+  perOutcome: Array<{
+    outcome: "up" | "down";
+    bidBps: number;
+    askBps: number;
+    midBps: number;
+    spreadDeltaBps: number;
+  }>;
+  incomplete: boolean;
+  incompleteReason?: string;
+}
+
+/** Rolling observability — parallel arrays + capped events (WS/REST). */
+export interface SynthesisMarketDataHistoryWirePayload {
+  maxPoints: number;
+  sampleMs: number;
+  maxEvents: number;
+  t: number[];
+  mb: number[];
+  lv: Array<0 | 1 | 2>;
+  ub: number[];
+  ua: number[];
+  db: number[];
+  da: number[];
+  na: Array<number | null>;
+  so: Array<number | null>;
+  sp: Array<number | null>;
+  fb: Array<0 | 1>;
+  events: Array<{ t: number; k: string; d?: string }>;
+  lastEvent?: { t: number; k: string; d?: string };
+}
+
+/** Guardrails for Synthesis vs native (dashboard + bot-fallback gating only). */
+export interface SynthesisMarketDataHealthPayload {
+  drift: SynthesisDriftTelemetryPayload;
+  staleness: SynthesisStalenessTelemetryPayload;
+  fallbackEligible: boolean;
+  fallbackBlockReason: SynthesisFallbackBlockReason;
+  /** Populated on WS broadcast; REST may mirror last snapshot. */
+  history?: SynthesisMarketDataHistoryWirePayload;
+}
+
 /** WebSocket `market` message: primary series (first UPDOWN asset, momentum engine) + per-asset spot charts. */
 export interface MarketWsPayload {
   primary: MarketPoint[];
   byAsset: Record<string, MarketPoint[]>;
+  /** Optional Synthesis augmentation — omitted when `SYNTHESIS_ENABLED=false`. */
+  synthesis?: {
+    telemetry: SynthesisTelemetryPayload;
+    trades: NormalizedSynthesisTradePayload[];
+    booksSynthesis: {
+      up: MarketContext | null;
+      down: MarketContext | null;
+      stale: boolean;
+    };
+    orderbookSource: DashboardOrderbookSource;
+    chartMode: SynthesisChartMode;
+    priceOverlayUsd: Array<{ t: number; priceUsd: number }>;
+    health?: SynthesisMarketDataHealthPayload;
+  };
 }
 
 export interface Prediction {
@@ -263,6 +400,14 @@ export interface TradingState {
   predictionLive: PredictionLiveSnapshot;
   /** Anchor Strategy: book + Chainlink snapshot for dashboard (optional on older servers). */
   anchorStrategy?: AnchorStrategySnapshot;
+  /** Synthesis market-data provider (dashboard / optional bot fallback) — omitted when disabled. */
+  synthesis?: {
+    telemetry: SynthesisTelemetryPayload;
+    dashboardOrderbookSource: DashboardOrderbookSource;
+    /** Recent venue trades from Synthesis (truncated). */
+    recentTrades: NormalizedSynthesisTradePayload[];
+    health?: SynthesisMarketDataHealthPayload;
+  };
 }
 
 /** Polymarket Anchor Strategy — bid dominance + Chainlink momentum (server-driven). */
