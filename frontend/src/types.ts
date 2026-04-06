@@ -89,7 +89,28 @@ export type SynthesisStalenessSlice = {
   staleReason?: "never_updated" | "age_exceeded";
 };
 
+/** Matches server `SynthesisMarketDataHistoryWirePayload` — compact series for charts. */
+export interface SynthesisMarketDataHistoryWirePayload {
+  maxPoints: number;
+  sampleMs: number;
+  maxEvents: number;
+  t: number[];
+  mb: number[];
+  lv: Array<0 | 1 | 2>;
+  ub: number[];
+  ua: number[];
+  db: number[];
+  da: number[];
+  na: Array<number | null>;
+  so: Array<number | null>;
+  sp: Array<number | null>;
+  fb: Array<0 | 1>;
+  events: Array<{ t: number; k: string; d?: string }>;
+  lastEvent?: { t: number; k: string; d?: string };
+}
+
 export interface SynthesisMarketDataHealthPayload {
+  history?: SynthesisMarketDataHistoryWirePayload;
   drift: {
     level: DriftStatusLevel;
     maxBps: number;
