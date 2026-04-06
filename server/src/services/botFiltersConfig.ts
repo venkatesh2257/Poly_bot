@@ -4,6 +4,13 @@
  *
  * Env (override file): TRADE_ASSETS_JSON, MIN_EDGE, MIN_SIGNAL_CONF,
  * MAX_SLIPPAGE_PCT, REQUIRE_MOMENTUM_SIGNAL_AGREE (true/false)
+ *
+ * Window-end paper / oracle-binary guard (ORACLE_TOO_CLOSE) lives in `engine.ts`:
+ * MIN_MS_TO_WINDOW_END (global), MIN_MS_TO_WINDOW_END_BTC (BTC 5m only), legacy PAPER_ENTRY_MIN_MS_TO_WINDOW_END.
+ * BTC 5m uses the BTC override when set; logs `ORACLE_TOO_CLOSE_BTC_5M` / `ENTRY_TIME_BTC_5M` with `windowSec` for histograms.
+ * Example:
+ *   MIN_MS_TO_WINDOW_END=20000
+ *   MIN_MS_TO_WINDOW_END_BTC=8000
  */
 
 import fs from "node:fs";
