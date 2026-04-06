@@ -249,6 +249,8 @@ export interface BotStatus {
   lastAutoTradeTickMs?: number | null;
   lastAutoTradeDecisionMs?: number | null;
   lastAutoTradeSkipReason?: string | null;
+  executionTruth?: ExecutionTruthSnapshot;
+  sessionTelemetry?: SessionTelemetrySnapshot;
 }
 
 export interface RiskSettingsSnapshot {
@@ -272,14 +274,16 @@ export type DashboardEntryStrategyId =
   | "anchor"
   | "market_making"
   | "fair_value_arb"
-  | "selective_momentum";
+  | "selective_momentum"
+  | "professional_trader";
 
 export type EntryStrategyKind =
   | "momentum"
   | "anchor"
   | "market_making"
   | "fair_value_arb"
-  | "selective_momentum";
+  | "selective_momentum"
+  | "professional_trader";
 
 export interface EntryStrategyState {
   effective: EntryStrategyKind;
@@ -320,6 +324,30 @@ export interface ExecutionEligibilityWire {
   blockedReasons: string[];
   selectedEligible: boolean;
   primaryBlockedReason?: string;
+}
+
+export interface CounterTop {
+  reason: string;
+  count: number;
+}
+
+export interface ExecutionTruthSnapshot {
+  lastSignalRecommendation: string | null;
+  lastStrategyDecision: string | null;
+  lastExecutionAttempt: string | null;
+  lastExecutionBlockReason: string | null;
+  lastOrderPostedAt: number | null;
+  lastOrderId: string | null;
+}
+
+export interface SessionTelemetrySnapshot {
+  topAutoTradeSkips: CounterTop[];
+  topAnchorSkips: CounterTop[];
+  topExecutionBlocks: CounterTop[];
+  topOrderPostFailures: CounterTop[];
+  topFillVerificationFailures: CounterTop[];
+  topDiscoveryFailures: CounterTop[];
+  topOracleStaleEvents: CounterTop[];
 }
 
 export interface TradingState {
@@ -378,6 +406,8 @@ export interface TradingState {
   anchorReadiness?: AnchorReadinessSnapshot;
   liveReadiness?: LiveReadinessSnapshot;
   executionEligibility?: ExecutionEligibilityWire;
+  executionTruth?: ExecutionTruthSnapshot;
+  sessionTelemetry?: SessionTelemetrySnapshot;
   /** CLOB/Gamma/RTDS-aligned snapshot (matches `/api/status` phase when polling). */
   liveEngine?: LiveEngineSnapshot;
   /** Mirrors WS `prediction` for REST clients (newer servers). */

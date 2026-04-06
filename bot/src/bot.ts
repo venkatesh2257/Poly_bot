@@ -26,6 +26,10 @@ const PM_FILE = new URL("../post-mortems.jsonl", import.meta.url).pathname;
 const BOT_PORT = parseInt(process.env.BOT_PORT || "3847");
 const USDC_ADDRESS = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174";
 const CTF_ADDRESS = "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045";
+function hasPrivateKey(): boolean {
+  const k = process.env.EVM_PRIVATE_KEY?.trim();
+  return Boolean(k);
+}
 function walletAddressFromEnv(): string | null {
   const w = process.env.WALLET_ADDRESS?.trim();
   if (w && /^0x[a-fA-F0-9]{40}$/i.test(w)) return w;
@@ -210,6 +214,11 @@ let startedAt = Date.now();
 let lastSignal: Signal | null = null;
 let tickCount = 0;
 let checkCount = 0;
+
+/** Runtime-only mode gate: never force-persist dryRun due to missing credentials. */
+function effectiveDryRunMode(): boolean {
+  return state.config.dryRun || !hasPrivateKey();
+}
 
 // Populate tradedWindows from existing trades
 for (const t of state.trades) {
@@ -567,7 +576,7 @@ async function onTick(price: number) {
       cost,
       confidence: signal.confidence,
       reasons: signal.reasons,
-      result: state.config.dryRun ? "dry-run" : "pending",
+      result: effectiveDryRunMode() ? "dry-run" : "pending",
       pnl: 0,
       btcAtEntry: price,
       btcWindowOpen: windowOpenPrice,
@@ -578,7 +587,7 @@ async function onTick(price: number) {
       hourUTC: new Date().getUTCHours(),
     };
 
-    if (!state.config.dryRun && clobClient) {
+    if (!effectiveDryRunMode() && clobClient) {
       // Snapshot wallet balance BEFORE the order
       const balBefore = await getWalletBalance();
       trade.walletBefore = balBefore;
@@ -722,14 +731,15 @@ app.get("/status", (_req, res) => {
     version: "v3-pure-arb",
     running: true,
     paused: state.paused,
-    dryRun: state.config.dryRun,
+    dryRun: effectiveDryRunMode(),
     smokeTestLogs: smokeTestLogsEnabled(),
     ...(smokeTestLogsEnabled() ? { smokeLast: lastSmokeStatus } : {}),
     uptime: `${Math.floor((Date.now() - startedAt) / 60000)}m`,
     price: {
-      binance: priceEngine.lastBinancePrice,
+      exchange: priceEngine.lastSpotPrice,
       windowOpen: wop ?? null,
-      delta: wop ? `$${(priceEngine.lastBinancePrice - wop).toFixed(0)} (${(((priceEngine.lastBinancePrice - wop) / wop) * 100).toFixed(3)}%)` : null,
+      delta: wop ? `$${(priceEngine.lastSpotPrice - wop).toFixed(0)} (${(((priceEngine.lastSpotPrice - wop) / wop) * 100).toFixed(3)}%)` : null,
+      feed: priceEngine.getFeedDiagnostics(),
       timeInWindow: `${timeInWindow}s`,
     },
     ticks: { total: tickCount, checks: checkCount },
@@ -864,9 +874,17 @@ app.post("/stop", (_req, res) => {
 
 // ── Lifecycle ───────────────────────────────────────────────
 async function start() {
+  // Runtime safety only: keep persisted config unchanged if key is missing on this startup.
+  if (!hasPrivateKey() && !state.config.dryRun) {
+    console.log("[bot] EVM_PRIVATE_KEY missing; forcing dry-run mode for this session.");
+  }
+
   console.log("═══════════════════════════════════════════════");
   console.log("  Polymarket BTC 15m Bot v5 — Kelly Arb");
-  console.log(`  Mode: ${state.config.dryRun ? "DRY RUN" : "LIVE"}`);
+  console.log(`  Mode: ${effectiveDryRunMode() ? "DRY RUN" : "LIVE"}`);
+  console.log(
+    `  Readiness: key=${hasPrivateKey() ? "present" : "missing"} persistedDryRun=${state.config.dryRun} effectiveDryRun=${effectiveDryRunMode()}`
+  );
   console.log(`  Position: $${state.config.positionSize}/trade`);
   console.log(`  Min delta: ${state.config.minDeltaPercent}% / $${state.config.minDeltaAbsolute}`);
   console.log(`  Min edge: ${state.config.minEdgeCents}¢`);
@@ -874,7 +892,7 @@ async function start() {
   console.log(`  History: ${state.trades.length} trades, ${state.wins}W/${state.losses}L, $${state.totalPnL.toFixed(2)} P&L`);
   console.log("═══════════════════════════════════════════════\n");
 
-  if (!state.config.dryRun) {
+  if (!effectiveDryRunMode()) {
     clobClient = await initClobClient();
   }
 
@@ -892,13 +910,19 @@ async function start() {
   }
 
   await priceEngine.bootstrap();
-  priceEngine.connectBinance();
+  {
+    const fd = priceEngine.getFeedDiagnostics();
+    console.log(
+      `[bot] Feed setup: bootstrap=${fd.bootstrapSource} live=${fd.liveFeedSource} (public market data only)`
+    );
+  }
+  priceEngine.connectExchangeFeed();
   priceEngine.connectPolymarket();
   priceEngine.startCoinGeckoPolling();
 
   // Event-driven: check on every price tick from Bybit WebSocket
   priceEngine.on("tick", ({ source, price }: { source: string; price: number }) => {
-    if (source === "binance") {
+    if (source === "exchange") {
       onTick(price);
     }
   });

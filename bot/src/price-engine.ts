@@ -1,7 +1,10 @@
 /**
- * Price Engine — maintains rolling candle buffer from Bybit WebSocket
- * (Binance.us WS silently drops data from this server)
- * and cross-checks via CoinGecko polling
+ * Price Engine:
+ * - Bootstrap candles: Binance US REST (public)
+ * - Live tick/candle stream: Bybit public spot WS (BTCUSDT)
+ * - Cross-check oracle-ish reference: CoinGecko polling
+ *
+ * NOTE: This module is market-data only; it does not place orders.
  */
 
 import WebSocket from "ws";
@@ -33,10 +36,13 @@ export class PriceEngine extends EventEmitter {
   private polySubscribedTokens: string[] = [];
   private candles: Candle[] = [];
   private maxCandles = 120; // 2 hours of 1-min candles
-  public lastBinancePrice = 0; // keeping field name for compat
+  public lastSpotPrice = 0;
   public lastChainlinkPrice = 0;
-  public lastPriceTime = 0;
-  public connected = { binance: false, chainlink: false, polymarket: false };
+  public lastSpotPriceTime = 0;
+  public connected = { exchange: false, chainlink: false, polymarket: false };
+  private bootstrapSource: "binance_us_rest" | "none" = "none";
+  private liveFeedSource: "bybit_spot_ws" | "none" = "none";
+  private exchangeReconnects = 0;
   public polyBook: PolymarketBook = {
     upBestBid: 0, upBestAsk: 0, downBestBid: 0, downBestAsk: 0,
     upAskDepth: 0, downAskDepth: 0, lastUpdate: 0,
@@ -45,7 +51,7 @@ export class PriceEngine extends EventEmitter {
   public windowOpenPrices: Map<number, number> = new Map();
 
   async bootstrap() {
-    // Seed with REST data from Binance.us (REST still works, just WS is dead)
+    // Seed historical candles from Binance US REST (public endpoint).
     console.log("[price] Bootstrapping with Binance REST candles...");
     try {
       const res = await fetch(
@@ -61,26 +67,31 @@ export class PriceEngine extends EventEmitter {
         volume: parseFloat(k[5]),
         final: true,
       }));
-      this.lastBinancePrice = this.candles[this.candles.length - 1]?.close ?? 0;
+      this.lastSpotPrice = this.candles[this.candles.length - 1]?.close ?? 0;
+      this.lastSpotPriceTime = Date.now();
+      this.bootstrapSource = "binance_us_rest";
       console.log(
-        `[price] Bootstrapped ${this.candles.length} candles. Latest: $${this.lastBinancePrice}`
+        `[price] Bootstrapped ${this.candles.length} candles from Binance US REST. Latest: $${this.lastSpotPrice}`
       );
     } catch (e: any) {
       console.error(`[price] Bootstrap failed: ${e.message}. Starting with empty candles.`);
     }
   }
 
-  connectBinance() {
-    // Using Bybit spot WebSocket — Binance.us WS connects but sends no data
+  connectExchangeFeed() {
+    // Live stream from Bybit spot WS. Binance US WS is intentionally not used due to data reliability.
     const url = "wss://stream.bybit.com/v5/public/spot";
-    console.log("[price] Connecting to Bybit WebSocket...");
+    this.liveFeedSource = "bybit_spot_ws";
+    console.log("[price] Connecting live exchange feed: Bybit spot WS...");
 
     const connect = () => {
       this.bybitWs = new WebSocket(url);
 
       this.bybitWs.on("open", () => {
-        console.log("[price] Bybit WS connected");
-        this.connected.binance = true;
+        console.log("[price] Bybit WS connected (live exchange feed)");
+        this.connected.exchange = true;
+        this.lastSpotPriceTime = Date.now();
+        this.emit("exchange:connected");
         this.emit("binance:connected");
         // Subscribe to both trades (real-time ticks) and 1-min kline (candle structure)
         this.bybitWs!.send(JSON.stringify({
@@ -106,8 +117,8 @@ export class PriceEngine extends EventEmitter {
             const trade = msg.data[msg.data.length - 1]; // latest trade
             if (!trade) return;
             const price = parseFloat(trade.p);
-            this.lastBinancePrice = price;
-            this.lastPriceTime = Date.now();
+            this.lastSpotPrice = price;
+            this.lastSpotPriceTime = Date.now();
             
             // Update current candle with trade price
             const last = this.candles[this.candles.length - 1];
@@ -117,7 +128,7 @@ export class PriceEngine extends EventEmitter {
               if (price < last.low) last.low = price;
             }
             
-            this.emit("tick", { source: "binance", price, time: Date.now() });
+            this.emit("tick", { source: "exchange", price, time: Date.now() });
             return;
           }
 
@@ -137,8 +148,8 @@ export class PriceEngine extends EventEmitter {
             final: k.confirm === true,
           };
 
-          this.lastBinancePrice = candle.close;
-          this.lastPriceTime = Date.now();
+          this.lastSpotPrice = candle.close;
+          this.lastSpotPriceTime = Date.now();
 
           if (candle.final) {
             const existing = this.candles.findIndex((c) => c.time === candle.time);
@@ -164,7 +175,8 @@ export class PriceEngine extends EventEmitter {
 
       this.bybitWs.on("close", () => {
         console.log("[price] Bybit WS disconnected. Reconnecting in 5s...");
-        this.connected.binance = false;
+        this.connected.exchange = false;
+        this.exchangeReconnects += 1;
         setTimeout(connect, 5000);
       });
 
@@ -183,6 +195,11 @@ export class PriceEngine extends EventEmitter {
     };
 
     connect();
+  }
+
+  /** Compatibility alias; prefer `connectExchangeFeed()`. */
+  connectBinance() {
+    this.connectExchangeFeed();
   }
 
   /**
@@ -360,12 +377,34 @@ export class PriceEngine extends EventEmitter {
   }
 
   getPriceDivergence(): { diff: number; pct: number } {
-    if (!this.lastBinancePrice || !this.lastChainlinkPrice) {
+    if (!this.lastSpotPrice || !this.lastChainlinkPrice) {
       return { diff: 0, pct: 0 };
     }
-    const diff = Math.abs(this.lastBinancePrice - this.lastChainlinkPrice);
-    const pct = (diff / this.lastBinancePrice) * 100;
+    const diff = Math.abs(this.lastSpotPrice - this.lastChainlinkPrice);
+    const pct = (diff / this.lastSpotPrice) * 100;
     return { diff, pct };
+  }
+
+  getFeedDiagnostics() {
+    const ts = this.lastSpotPriceTime || 0;
+    const ageMs = ts > 0 ? Math.max(0, Date.now() - ts) : null;
+    const staleThresholdMs = 20_000;
+    return {
+      bootstrapSource: this.bootstrapSource,
+      liveFeedSource: this.liveFeedSource,
+      connected: { ...this.connected },
+      lastExternalPrice: this.lastSpotPrice || null,
+      lastExternalPriceTs: ts > 0 ? ts : null,
+      lastExternalPriceAgeMs: ageMs,
+      externalFeedStale: ageMs != null ? ageMs > staleThresholdMs : true,
+      staleThresholdMs,
+      reconnectCount: this.exchangeReconnects
+    };
+  }
+
+  /** Compatibility read alias; prefer `lastSpotPrice`. */
+  get lastBinancePrice(): number {
+    return this.lastSpotPrice;
   }
 
   stop() {

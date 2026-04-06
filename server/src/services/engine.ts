@@ -51,6 +51,10 @@ import {
   getChainlinkPriceHistoryBufferForAsset,
   getOracleAgeMsForTrend
 } from "../realtime.js";
+import { loadProfessionalTraderConfigFromEnv } from "../strategies/professionalTrader/config.js";
+import { buildOneMinuteCandles } from "../strategies/professionalTrader/syntheticCandles.js";
+import { ProfessionalTradingStateMachine } from "../strategies/professionalTrader/stateMachine.js";
+import type { ProfessionalTickInput } from "../strategies/professionalTrader/professionalTypes.js";
 import {
   classifyOracleStale,
   evaluateOracleDirectionFlipGate,
@@ -303,9 +307,10 @@ function parseEnvEntryStrategy(): EntryStrategyKind {
   if (s === "market_making" || s === "mm") return "market_making";
   if (s === "fair_value_arb" || s === "fva") return "fair_value_arb";
   if (s === "selective_momentum" || s === "sm") return "selective_momentum";
+  if (s === "professional_trader" || s === "professional" || s === "pro") return "professional_trader";
   if (raw != null && String(raw).trim() !== "") {
     console.warn(
-      `[ENTRY_STRATEGY] Unknown value "${String(raw).trim()}" — using momentum. Valid: momentum, anchor, market_making, fair_value_arb, selective_momentum.`
+      `[ENTRY_STRATEGY] Unknown value "${String(raw).trim()}" — using momentum. Valid: momentum, anchor, market_making, fair_value_arb, selective_momentum, professional_trader.`
     );
   }
   return "momentum";
@@ -319,6 +324,7 @@ function parseDashboardEntryStrategyId(raw: unknown): DashboardEntryStrategyId |
   if (s === "market_making" || s === "mm") return "market_making";
   if (s === "fair_value_arb" || s === "fva") return "fair_value_arb";
   if (s === "selective_momentum" || s === "sm") return "selective_momentum";
+  if (s === "professional_trader" || s === "professional" || s === "pro") return "professional_trader";
   return null;
 }
 
@@ -536,6 +542,23 @@ export class TradingEngine {
   private lastAutoTradeSkipReason: string | null = null;
   private lastAutoTradeHeartbeatLogMs = 0;
   private lastAutoTradeSilentNoopLogMs = 0;
+  /** Compact operator truth for signal→strategy→execution chain. */
+  private executionTruth = {
+    lastSignalRecommendation: null as string | null,
+    lastStrategyDecision: null as string | null,
+    lastExecutionAttempt: null as string | null,
+    lastExecutionBlockReason: null as string | null,
+    lastOrderPostedAt: null as number | null,
+    lastOrderId: null as string | null
+  };
+  /** Session counters (bounded, reset on process restart). */
+  private autoTradeSkipCounts = new Map<string, number>();
+  private anchorSkipCounts = new Map<string, number>();
+  private executionBlockCounts = new Map<string, number>();
+  private orderPostFailureCounts = new Map<string, number>();
+  private fillVerificationFailureCounts = new Map<string, number>();
+  private discoveryFailureCounts = new Map<string, number>();
+  private oracleStaleEventCounts = new Map<string, number>();
 
   /** Runtime overrides (API); unset fields fall back to process.env. */
   private riskOverrides: Partial<{
@@ -596,6 +619,9 @@ export class TradingEngine {
   private anchorPrimaryWindowHadAnchorStrategy = false;
   /** Samples for selective momentum persistence (newest at end). */
   private selectiveMomentumRecent: number[] = [];
+  /** Chainlink oracle spot samples for `professional_trader` synthetic 1m OHLC (Chainlink-only; no TA feeds). */
+  private professionalSpotSamples: { t: number; p: number }[] = [];
+  private professionalTradingFsm: ProfessionalTradingStateMachine | null = null;
   /** Virtual MM inventory notionals for logging (SIM). */
   /** Simulated Polymarket YES-token notional (UP vs DOWN outcome) for MM[PM5m] inventory skew. */
   private mmPm5mYesUpNotionalUsd = 0;
@@ -1294,6 +1320,8 @@ export class TradingEngine {
         return "Fair value arb (executable edge)";
       case "selective_momentum":
         return "Selective momentum (sparse)";
+      case "professional_trader":
+        return "Professional (Chainlink + book FSM)";
       default:
         return kind;
     }
@@ -1329,7 +1357,8 @@ export class TradingEngine {
       if (!id) {
         return {
           ok: false,
-          reason: "strategy must be momentum, anchor, market_making, fair_value_arb, or selective_momentum"
+          reason:
+            "strategy must be momentum, anchor, market_making, fair_value_arb, selective_momentum, or professional_trader"
         };
       }
       this.entryStrategyRuntime = id;
@@ -1771,6 +1800,14 @@ export class TradingEngine {
       }
       return { prediction: "UP", confidence: 88, ts: Date.now() };
     }
+    if (strat === "professional_trader") {
+      if (this.directionalContext) {
+        const { up, down } = this.directionalContext;
+        const direction: Direction = up.mid >= down.mid ? "UP" : "DOWN";
+        return { prediction: direction, confidence: 62, ts: Date.now() };
+      }
+      return { prediction: "UP", confidence: 55, ts: Date.now() };
+    }
     const predictLb = envNum("MOMENTUM_PREDICT_LOOKBACK", 10);
     const trend = this.momentumScalar(predictLb);
     const direction: Direction = trend >= 0 ? "UP" : "DOWN";
@@ -1993,7 +2030,7 @@ export class TradingEngine {
       };
     }
 
-    if (strat === "anchor") {
+    if (strat === "anchor" || strat === "professional_trader") {
       return { ok: true };
     }
 
@@ -2701,6 +2738,8 @@ export class TradingEngine {
       lagSnipeBanner: this.lagSnipeEnabled ? "Lag Snipe: HOLD Manual Exit" : undefined,
       anchorReadiness,
       executionEligibility,
+      executionTruth: this.executionTruthSnapshot(),
+      sessionTelemetry: this.sessionTelemetrySnapshot(),
       liveReadiness,
       liveEngine: {
         phase: this.phase,
@@ -3140,11 +3179,79 @@ export class TradingEngine {
 
   private noteAutoTradeSkip(reason: string): void {
     this.lastAutoTradeSkipReason = reason;
+    this.executionTruth.lastStrategyDecision = `skip:${reason}`;
+    this.bumpSessionCount(this.autoTradeSkipCounts, reason);
+    if (reason.includes("discovery")) {
+      this.bumpSessionCount(this.discoveryFailureCounts, reason);
+    }
+    if (reason.includes("oracle_stale")) {
+      this.bumpSessionCount(this.oracleStaleEventCounts, reason);
+    }
   }
 
   private noteAutoTradeDecision(): void {
     this.lastAutoTradeDecisionMs = Date.now();
     this.lastAutoTradeSkipReason = null;
+    this.executionTruth.lastStrategyDecision = "decision:run";
+  }
+
+  private bumpSessionCount(map: Map<string, number>, key: string): void {
+    const k = (key || "unknown").trim().slice(0, 120);
+    if (!k) return;
+    map.set(k, (map.get(k) ?? 0) + 1);
+    const maxKeys = 64;
+    if (map.size <= maxKeys) return;
+    let minKey: string | null = null;
+    let minVal = Number.POSITIVE_INFINITY;
+    for (const [rk, rv] of map.entries()) {
+      if (rv < minVal) {
+        minVal = rv;
+        minKey = rk;
+      }
+    }
+    if (minKey) map.delete(minKey);
+  }
+
+  private topSessionCounts(map: Map<string, number>, n = 4): Array<{ reason: string; count: number }> {
+    return [...map.entries()]
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, n)
+      .map(([reason, count]) => ({ reason, count }));
+  }
+
+  private markExecutionBlocked(reason: string): void {
+    this.executionTruth.lastExecutionBlockReason = reason;
+    this.bumpSessionCount(this.executionBlockCounts, reason);
+  }
+
+  private markExecutionAttempt(direction: Direction, source: "MANUAL" | "AUTO", strategy: EntryStrategyKind): void {
+    this.executionTruth.lastExecutionAttempt = `${source}:${strategy}:${direction}`;
+  }
+
+  private markOrderPosted(orderId?: string | null): void {
+    this.executionTruth.lastOrderPostedAt = Date.now();
+    const oid = orderId == null ? null : String(orderId);
+    this.executionTruth.lastOrderId = oid && oid.trim() !== "" ? oid : null;
+    this.executionTruth.lastExecutionBlockReason = null;
+  }
+
+  private executionTruthSnapshot() {
+    return {
+      ...this.executionTruth,
+      lastSignalRecommendation: `${this.prediction.prediction}|${this.prediction.recommendation}|${this.prediction.reason}`
+    };
+  }
+
+  private sessionTelemetrySnapshot() {
+    return {
+      topAutoTradeSkips: this.topSessionCounts(this.autoTradeSkipCounts),
+      topAnchorSkips: this.topSessionCounts(this.anchorSkipCounts),
+      topExecutionBlocks: this.topSessionCounts(this.executionBlockCounts),
+      topOrderPostFailures: this.topSessionCounts(this.orderPostFailureCounts),
+      topFillVerificationFailures: this.topSessionCounts(this.fillVerificationFailureCounts),
+      topDiscoveryFailures: this.topSessionCounts(this.discoveryFailureCounts),
+      topOracleStaleEvents: this.topSessionCounts(this.oracleStaleEventCounts)
+    };
   }
 
   private maybeLogAutoTradeIdle(reason: string): void {
@@ -3504,6 +3611,12 @@ export class TradingEngine {
         await this.monitorAnchorExits();
       }
 
+      if (strategy === "professional_trader") {
+        this.noteAutoTradeDecision();
+        await this.maybeRunProfessionalTraderStrategy();
+        return;
+      }
+
       const choice = this.chooseDirectionalEntry();
       this.noteAutoTradeDecision();
 
@@ -3660,6 +3773,129 @@ export class TradingEngine {
     }
   }
 
+  private professionalTraderFsm(): ProfessionalTradingStateMachine {
+    if (!this.professionalTradingFsm) {
+      this.professionalTradingFsm = new ProfessionalTradingStateMachine(loadProfessionalTraderConfigFromEnv());
+    }
+    return this.professionalTradingFsm;
+  }
+
+  /** Chainlink anchor + Polymarket book state machine (no classic TA). */
+  private async maybeRunProfessionalTraderStrategy(): Promise<void> {
+    const fsm = this.professionalTraderFsm();
+    const cfg = loadProfessionalTraderConfigFromEnv();
+    const asset = this.wallet.getActiveDiscoveredAsset()?.trim().toUpperCase() ?? "";
+    const ptb = this.priceToBeatByAsset.get(asset);
+    const anchorUsd =
+      ptb != null && Number.isFinite(ptb) && ptb > 0 ? ptb : (this.oracleSpotUsdForAsset(asset) ?? 0);
+    const spotUsd = this.oracleSpotUsdForAsset(asset) ?? 0;
+    const snap = await this.buildAnchorOrderBookSnapshot();
+    if (!snap) {
+      this.log("SIGNAL", `[PROFESSIONAL][SKIP] no_order_book_snapshot asset=${asset}`);
+      return;
+    }
+    const upBid = snap.bidDepthUp / (snap.bidDepthUp + snap.askDepthUp + 1e-12);
+    const downBid = snap.bidDepthDown / (snap.bidDepthDown + snap.askDepthDown + 1e-12);
+    const bookBias =
+      upBid > 0.56 && upBid >= downBid ? "UP" : downBid > 0.56 && downBid > upBid ? "DOWN" : null;
+
+    const upBook = this.liveBookForDirection("UP");
+    const downBook = this.liveBookForDirection("DOWN");
+    const tickIn: ProfessionalTickInput = {
+      nowMs: Date.now(),
+      anchorUsd,
+      spotUsd,
+      upBidDepthShare: upBid,
+      downBidDepthShare: downBid,
+      bookBias,
+      upMid: upBook.mid,
+      downMid: downBook.mid,
+      baseEntryUsd: this.effEntryUsd(),
+      minDeviationUsd: cfg.minDeviationUsd
+    };
+
+    const samples = this.professionalSpotSamples.map((s) => ({ tMs: s.t, price: s.p }));
+    const candles = buildOneMinuteCandles(samples, Date.now(), 8);
+    const step = fsm.step(tickIn, candles, this.anchorImbalanceHistoryUp);
+    for (const line of step.logs) {
+      this.log("SIGNAL", line);
+      if (line.includes("[PROFESSIONAL][SKIP]")) this.executionTruth.lastStrategyDecision = "professional_skip";
+      if (line.includes("[PROFESSIONAL][ENTER]")) this.executionTruth.lastStrategyDecision = "professional_enter_signal";
+      if (line.includes("[PROFESSIONAL][EXIT]")) this.executionTruth.lastStrategyDecision = "professional_exit_signal";
+    }
+
+    const { decision } = step;
+    if (decision.kind === "exit_open") {
+      const tid = decision.tradeId;
+      const idx = this.trades.findIndex((x) => x.id === tid && tradeRowIsOpen(x.status));
+      if (idx < 0) {
+        fsm.clearOpenTrade();
+        return;
+      }
+      const t = this.trades[idx]!;
+      const midAtExit = t.direction === "UP" ? upBook.mid : downBook.mid;
+      this.log(
+        "TRADE",
+        `[PROFESSIONAL][EXIT] trade=${tid.slice(0, 8)} reason=${decision.reason} mid≈${midAtExit.toFixed(4)}`
+      );
+      if (this.wallet.getMode() === "SIMULATION" && t.paper?.entryShares && t.paper?.tokenId) {
+        await this.finalizePaperTradeExit(idx);
+        const settled = this.trades[idx]!;
+        const pnlPositive =
+          settled.status === "WIN" || (settled.status === "CLOSED" && Number(settled.pnl ?? 0) > 0);
+        fsm.onPositionClosed(pnlPositive);
+      } else if (this.wallet.getMode() === "LIVE" && !paperOnlyEnv()) {
+        const tok =
+          t.direction === "UP" ? this.directionalContext?.up.tokenID : this.directionalContext?.down.tokenID;
+        const sh = t.paper?.entryShares ?? (t.price > 1e-9 ? t.amount / t.price : 0);
+        if (tok && sh > 0) {
+          const r = await this.wallet.postMarketSellShares(tok, sh);
+          if (r?.orderID) {
+            this.log("TRADE", `[PROFESSIONAL][EXIT] LIVE market SELL posted ${String(r.orderID).slice(0, 12)}…`);
+          }
+        }
+        const estWin = t.direction === "UP" ? midAtExit >= t.price - 1e-6 : midAtExit >= t.price - 1e-6;
+        fsm.onPositionClosed(estWin);
+      } else {
+        fsm.onPositionClosed(midAtExit >= t.price - 1e-6);
+      }
+      fsm.clearOpenTrade();
+      return;
+    }
+
+    if (decision.kind === "enter") {
+      const { amount } = await this.computeAutoTradeAmount();
+      if (amount < this.effMinTrade()) {
+        fsm.abortPendingEntry();
+        this.log("SIGNAL", `[PROFESSIONAL][SKIP] size_below_min available=${amount.toFixed(2)}`);
+        return;
+      }
+      const sized = Math.min(
+        this.effMaxTrade(),
+        Math.max(this.effMinTrade(), Number((amount * decision.sizeMultiplier).toFixed(2)))
+      );
+      let result: Awaited<ReturnType<TradingEngine["trade"]>>;
+      try {
+        result = await this.trade(decision.direction, sized, "AUTO", decision.reason);
+      } catch (e) {
+        fsm.abortPendingEntry();
+        throw e;
+      }
+      if (result.accepted && result.trade) {
+        const entryMid = decision.direction === "UP" ? upBook.mid : downBook.mid;
+        fsm.attachOpenTrade({
+          tradeId: result.trade.id,
+          direction: decision.direction,
+          entryTokenMid: entryMid
+        });
+        this.anchorTradedThisWindow = true;
+      } else {
+        fsm.abortPendingEntry();
+        this.log("SIGNAL", `[PROFESSIONAL][SKIP] trade_blocked=${result.reason ?? "unknown"}`);
+      }
+    }
+  }
+
   private getAnchorWindowKey(): string | null {
     const meta = this.wallet.getDiscoveredMeta();
     if (!meta?.slug) return null;
@@ -3698,6 +3934,10 @@ export class TradingEngine {
       }
       this.lastAnchorWindowKey = key;
       this.anchorTradedThisWindow = false;
+      if (this.effectiveEntryStrategy() === "professional_trader") {
+        this.professionalSpotSamples = [];
+        this.professionalTradingFsm?.reset();
+      }
       this.anchorPrimaryLoggedForWindowKey = null;
       this.anchorPrimaryWindowSec = null;
       this.anchorPrimaryWindowAsset = null;
@@ -3762,6 +4002,17 @@ export class TradingEngine {
     this.anchorImbalanceHistoryDown.push(downImb);
     while (this.anchorImbalanceHistoryUp.length > 10) this.anchorImbalanceHistoryUp.shift();
     while (this.anchorImbalanceHistoryDown.length > 10) this.anchorImbalanceHistoryDown.shift();
+
+    if (this.effectiveEntryStrategy() === "professional_trader") {
+      const active = this.wallet.getActiveDiscoveredAsset()?.trim().toUpperCase() ?? "";
+      if (active) {
+        const spot = this.oracleSpotUsdForAsset(active);
+        if (spot != null && Number.isFinite(spot) && spot > 0) {
+          this.professionalSpotSamples.push({ t: now, p: spot });
+          while (this.professionalSpotSamples.length > 240) this.professionalSpotSamples.shift();
+        }
+      }
+    }
   }
 
   private buildAnchorStrategySnapshotPayload(): AnchorStrategySnapshot {
@@ -3801,6 +4052,13 @@ export class TradingEngine {
     event: "ANCHOR_SKIP" | "ANCHOR_SIGNAL" | "ANCHOR_ENTRY" | "ANCHOR_EXIT",
     payload: Record<string, unknown>
   ) {
+    if (event === "ANCHOR_SKIP") {
+      const c = typeof payload.category === "string" ? payload.category : "UNKNOWN";
+      this.bumpSessionCount(this.anchorSkipCounts, c);
+      this.executionTruth.lastStrategyDecision = `anchor_skip:${c}`;
+    } else if (event === "ANCHOR_ENTRY") {
+      this.executionTruth.lastStrategyDecision = "anchor_enter";
+    }
     const cfg = loadAnchorConfigFromEnv(this.effEntryUsd());
     const line = JSON.stringify({ event, ts: Date.now(), ...payload });
     if (event === "ANCHOR_SIGNAL" && !cfg.anchorDebugLogs) return;
@@ -4504,6 +4762,7 @@ export class TradingEngine {
             const withinGrace = nowMs - this.lastDiscoverySlotsNonEmptyMs < graceMs;
             if (withinGrace) {
               this.discoveryTransientStateActive = true;
+              this.bumpSessionCount(this.discoveryFailureCounts, "discovery_transient_gap");
               if (nowMs - this.lastDiscoveryGraceLogMs > 30_000) {
                 this.lastDiscoveryGraceLogMs = nowMs;
                 this.log(
@@ -4513,6 +4772,7 @@ export class TradingEngine {
               }
             } else {
               this.discoveryTransientStateActive = false;
+              this.bumpSessionCount(this.discoveryFailureCounts, "discovery_empty_beyond_grace");
               this.multiSlotBooks = null;
               this.gammaDisplayByAsset.clear();
               this.priceToBeatByAsset.clear();
@@ -4570,8 +4830,13 @@ export class TradingEngine {
         `WARNING: Bot started, but no execution-eligible auto-trading strategy is enabled — ${detail}`
       );
     } else {
-      this.log("TRADE", "Bot started (directional momentum auto-trading enabled)");
+      const selectedLabel = this.entryStrategyLabel(sel);
+      this.log("TRADE", `Bot started (${selectedLabel} auto-trading enabled)`);
     }
+    this.log(
+      "SIGNAL",
+      `[START][READINESS] mode=${mode} strategy=${sel} selectedEligible=${exec.selectedEligible} clobAuth=${this.wallet.isClobAuthenticated()} canExecuteLive=${this.canExecuteLiveOrders()} discovery=${this.wallet.isAutoDiscoverEnabled()} slots=${this.wallet.getDiscoveredSlotCount()}`
+    );
     const md = this.computeMarketDataBlockReason();
     this.log(
       "SIGNAL",
@@ -4657,7 +4922,9 @@ export class TradingEngine {
       executeTrades: executeTradesEnv(),
       lastAutoTradeTickMs: this.lastAutoTradeTickMs,
       lastAutoTradeDecisionMs: this.lastAutoTradeDecisionMs,
-      lastAutoTradeSkipReason: this.lastAutoTradeSkipReason
+      lastAutoTradeSkipReason: this.lastAutoTradeSkipReason,
+      executionTruth: this.executionTruthSnapshot(),
+      sessionTelemetry: this.sessionTelemetrySnapshot()
     };
   }
 
@@ -4875,6 +5142,112 @@ export class TradingEngine {
       warmupWindow: timing.warmupWindow,
       ...extra
     };
+  }
+
+  /**
+   * Underlying (oracle/Chainlink spot) vs window target (price-to-beat / strike).
+   * YES/UP only when spot is strictly above target; NO/DOWN only when strictly below.
+   * Token mids are logged for execution quality only — never used as the underlying price.
+   * Opt out: set ENTRY_UNDERLYING_TARGET_GATE=false or include UNDERLYING_TARGET_BYPASS in decisionReason.
+   */
+  private evaluateUnderlyingVersusTargetEntryGate(
+    direction: Direction,
+    source: "MANUAL" | "AUTO",
+    decisionReason?: string | null
+  ):
+    | { ok: true; debug: Record<string, unknown> }
+    | { ok: false; reason: string; debug: Record<string, unknown> } {
+    const asset = (this.wallet.getActiveDiscoveredAsset() ?? "?").trim().toUpperCase();
+    const ctx = this.directionalContext;
+    const targetRaw = this.priceToBeatByAsset.get(asset);
+    const underlyingPrice = this.oracleSpotUsdForAsset(asset);
+    const yesPrice = ctx?.up.mid ?? null;
+    const noPrice = ctx?.down.mid ?? null;
+    const signalDirection = this.prediction.prediction;
+    const ow = this.oracleWindowStateByAsset.get(asset);
+    const trendDirection = (ow?.trend as string | undefined) ?? this.rawMomentumSide();
+
+    const bypass =
+      typeof decisionReason === "string" && decisionReason.includes("UNDERLYING_TARGET_BYPASS");
+    const gateEnabled = String(process.env.ENTRY_UNDERLYING_TARGET_GATE ?? "true").toLowerCase() !== "false";
+
+    const base: Record<string, unknown> = {
+      asset,
+      side: direction === "UP" ? "YES" : "NO",
+      underlyingPrice,
+      targetPrice: targetRaw ?? null,
+      yesPrice,
+      noPrice,
+      signalDirection,
+      trendDirection,
+      source
+    };
+
+    if (!gateEnabled) {
+      return {
+        ok: true,
+        debug: {
+          ...base,
+          comparison: "gate_disabled",
+          pass: true
+        }
+      };
+    }
+
+    if (bypass) {
+      return {
+        ok: true,
+        debug: {
+          ...base,
+          comparison: "UNDERLYING_TARGET_BYPASS",
+          pass: true
+        }
+      };
+    }
+
+    if (
+      underlyingPrice == null ||
+      !Number.isFinite(underlyingPrice) ||
+      targetRaw == null ||
+      !Number.isFinite(targetRaw) ||
+      targetRaw <= 0
+    ) {
+      return {
+        ok: true,
+        debug: {
+          ...base,
+          comparison: "insufficient_underlying_or_target",
+          pass: true
+        }
+      };
+    }
+
+    const t = targetRaw;
+    const u = underlyingPrice;
+    const eps = Math.max(1e-9, Math.abs(t) * 1e-12);
+    let pass: boolean;
+    let comparison: string;
+    if (direction === "UP") {
+      pass = u > t + eps;
+      if (pass) comparison = "underlyingPrice > targetPrice";
+      else if (u + eps < t) comparison = "underlyingPrice < targetPrice";
+      else comparison = "underlyingPrice ≈ targetPrice";
+    } else {
+      pass = u < t - eps;
+      if (pass) comparison = "underlyingPrice < targetPrice";
+      else if (u - eps > t) comparison = "underlyingPrice > targetPrice";
+      else comparison = "underlyingPrice ≈ targetPrice";
+    }
+
+    const debug = { ...base, comparison, pass };
+    if (!pass) {
+      const reason =
+        direction === "UP"
+          ? `ENTRY_UNDERLYING_VS_TARGET: YES requires underlying > target (${u.toFixed(4)} vs ${t.toFixed(4)})`
+          : `ENTRY_UNDERLYING_VS_TARGET: NO requires underlying < target (${u.toFixed(4)} vs ${t.toFixed(4)})`;
+      return { ok: false, reason, debug };
+    }
+    return { ok: true, debug };
   }
 
   /** LIVE: use UP/DOWN token book for the side we trade; else selected market (sim uses synthetic book). */
@@ -5167,11 +5540,17 @@ export class TradingEngine {
   async trade(direction: Direction, amount: number, source: "MANUAL" | "AUTO" = "MANUAL", decisionReason?: string) {
     if (!this.running) return { accepted: false, reason: "Engine is stopped" };
     const strat = this.effectiveEntryStrategy();
+    this.markExecutionAttempt(direction, source, strat);
     const anchorAutoAnchorPath =
       strat === "anchor" &&
       source === "AUTO" &&
       typeof decisionReason === "string" &&
       decisionReason.startsWith("ANCHOR:");
+    const professionalAutoPath =
+      strat === "professional_trader" &&
+      source === "AUTO" &&
+      typeof decisionReason === "string" &&
+      decisionReason.startsWith("PROFESSIONAL:");
     const botCfg = loadBotFiltersConfig();
     if (this.stopLossTriggered) {
       this.setPhase("ERROR", "Stop loss triggered");
@@ -5183,16 +5562,19 @@ export class TradingEngine {
     }
     if (amount < this.effMinTrade() || amount > this.effMaxTrade()) {
       this.setPhase("RISK_BLOCKED", "Trade limits violated");
+      this.markExecutionBlocked("trade_limits_violated");
       return { accepted: false, reason: "Trade limits violated" };
     }
     if (this.wallet.getMode() === "SIMULATION" && amount > this.balance) {
       this.setPhase("RISK_BLOCKED", "Insufficient balance");
+      this.markExecutionBlocked("insufficient_balance");
       return { accepted: false, reason: "Insufficient balance" };
     }
     const cdKey = this.wallet.getActiveDiscoveredSlug() ?? "__default__";
     const lastCd = this.lastTradeAtBySlug.get(cdKey) ?? 0;
-    if (Date.now() - lastCd < this.effCooldownMs()) {
+    if (!anchorAutoAnchorPath && !professionalAutoPath && Date.now() - lastCd < this.effCooldownMs()) {
       this.setPhase("RISK_BLOCKED", "Cooldown active");
+      this.markExecutionBlocked("cooldown_active");
       return { accepted: false, reason: "Cooldown active" };
     }
 
@@ -5207,6 +5589,7 @@ export class TradingEngine {
     const minConfPct = Number(process.env.MIN_SIGNAL_CONF_PCT ?? 75);
     if (
       !anchorAutoAnchorPath &&
+      !professionalAutoPath &&
       !this.lagSnipeEnabled &&
       source === "AUTO" &&
       Number.isFinite(minConfPct) &&
@@ -5217,6 +5600,7 @@ export class TradingEngine {
       const conf01 = c > 1 ? c / 100 : c;
       if (conf01 < minConfPct / 100 - 1e-9) {
         this.setPhase("RISK_BLOCKED", "Signal below confidence threshold");
+        this.markExecutionBlocked("min_signal_conf");
         return {
           accepted: false,
           reason: `MIN_SIGNAL_CONF: ${(conf01 * 100).toFixed(1)}% < ${minConfPct}%`
@@ -5226,22 +5610,25 @@ export class TradingEngine {
 
     if (
       !anchorAutoAnchorPath &&
+      !professionalAutoPath &&
       !this.lagSnipeEnabled &&
       this.prediction.recommendation === "NO_TRADE" &&
       !this.canIgnoreNoTradeForBookOnlyBlock(source)
     ) {
       this.setPhase("SIGNAL_READY", this.prediction.reason);
+      this.markExecutionBlocked("prediction_no_trade");
       return { accepted: false, reason: `No-trade signal: ${this.prediction.reason}` };
     }
 
     const cfgGate = this.checkConfigTradeFilters(strat, botCfg);
     if (!cfgGate.ok) {
       this.setPhase("RISK_BLOCKED", cfgGate.reason);
+      this.markExecutionBlocked("bot_filter");
       return { accepted: false, reason: cfgGate.reason };
     }
 
     const book = this.liveBookForDirection(direction);
-    if (strat !== "anchor" && !this.lagSnipeEnabled && signalModeHighConf()) {
+    if (strat !== "anchor" && strat !== "professional_trader" && !this.lagSnipeEnabled && signalModeHighConf()) {
       const thr = highConfMidThreshold();
       const mid = book.mid;
       const c = this.prediction.confidence;
@@ -5257,6 +5644,7 @@ export class TradingEngine {
             `| proj.simWinPnL_if_taken=$${projectedSimWin.toFixed(2)} on $${amount.toFixed(2)} stake | blocked#${this.highConfMidBlocked}`
         );
         this.setPhase("RISK_BLOCKED", "LOW_CONF_MID");
+        this.markExecutionBlocked("low_conf_mid");
         this.pushBetLog(
           this.buildBetLog("blocked", direction, book, {
             blockReason: `LOW_CONF_MID: mid=${mid.toFixed(4)} conf×mid=${prod.toFixed(4)} < ${thr} (proj.simWinPnL $${projectedSimWin.toFixed(2)})`
@@ -5282,15 +5670,30 @@ export class TradingEngine {
           blockReason: `Execution filter: ${exec.detail}`
         })
       );
+      this.markExecutionBlocked("execution_filter");
       return {
         accepted: false,
         reason: `Execution filter: ${exec.detail}`
       };
     }
 
+    const uGate = this.evaluateUnderlyingVersusTargetEntryGate(direction, source, decisionReason);
+    this.log("SIGNAL", `ENTRY_DEBUG ${JSON.stringify(uGate.debug)}`);
+    if (!uGate.ok) {
+      this.setPhase("SIGNAL_READY", uGate.reason);
+      this.markExecutionBlocked("underlying_vs_target");
+      this.pushBetLog(
+        this.buildBetLog("blocked", direction, book, {
+          blockReason: uGate.reason
+        })
+      );
+      return { accepted: false, reason: uGate.reason };
+    }
+
     const bone = this.checkBoneEntryFilters(direction, book);
-    if (!bone.ok) {
+    if (!bone.ok && !professionalAutoPath) {
       this.setPhase("RISK_BLOCKED", bone.code);
+      this.markExecutionBlocked(`bone:${bone.code}`);
       const replay = `BONE_BLOCK ${bone.code}: ${bone.detail}`;
       this.log("SIGNAL", replay);
       this.pushBetLog(
@@ -5333,6 +5736,7 @@ export class TradingEngine {
             )} available=${budget.availableUsdc.toFixed(6)} MIN_TRADE=${this.effMinTrade()}`
           );
           this.setPhase("RISK_BLOCKED", reason);
+          this.markExecutionBlocked("available_collateral_below_min");
           return { accepted: false, reason };
         }
 
@@ -5361,6 +5765,7 @@ export class TradingEngine {
       id: randomUUID(),
       time: new Date().toLocaleTimeString(),
       market: this.selectedMarket.label,
+      conditionId: this.wallet.getDiscoveredMeta()?.conditionId,
       price: Number(
         (this.wallet.hasLiveMarketData()
           ? book.mid
@@ -5407,6 +5812,8 @@ export class TradingEngine {
 
     if (this.externalExecution) {
       commitTradeEntry();
+      this.markOrderPosted(`external:${pendingRow.id.slice(0, 8)}`);
+      this.executionTruth.lastStrategyDecision = `entered:${strat}`;
       this.pushBetLog(this.buildBetLog("placed", direction, book, {}));
       this.setPhase("WAITING_RESOLUTION", "External execution: waiting for MetaMask fill confirmation");
       return { accepted: true, trade: pendingRow };
@@ -5426,6 +5833,7 @@ export class TradingEngine {
         `[EXECUTION][LIVE_DISABLED] reason=${rsn} MODE=${modeEn} PAPER_TRADING=${ptEn} EXECUTE_TRADES=${exEn} PAPER_ONLY=${poEn}`
       );
       this.setPhase("SIGNAL_READY", "LIVE execution disabled by env");
+      this.markExecutionBlocked("live_disabled_env");
       return { accepted: false, reason: "LIVE_DISABLED" };
     }
 
@@ -5447,6 +5855,7 @@ export class TradingEngine {
         });
         if (!order.ok) {
           const detail = order.errorMsg ?? "CLOB placeOrder failed";
+          this.bumpSessionCount(this.orderPostFailureCounts, "clob_place_order_failed");
           this.log("TRADE", `[EXECUTION][LIVE_DISABLED] reason=clob_error msg=${detail.replace(/\s+/g, " ").slice(0, 240)}`);
           this.pushBetLog(
             this.buildBetLog("blocked", direction, book, {
@@ -5454,10 +5863,12 @@ export class TradingEngine {
             })
           );
           this.setPhase("ERROR", `Live CLOB: ${detail}`);
+          this.markExecutionBlocked("live_clob_error");
           return { accepted: false, reason: detail };
         }
         const oidRaw = String(order.orderID ?? order.orderId ?? "");
         if (oidRaw === "" || oidRaw === "unknown") {
+          this.bumpSessionCount(this.orderPostFailureCounts, "clob_missing_order_id");
           this.log("TRADE", `[EXECUTION][LIVE_DISABLED] reason=no_order_id orderID=${oidRaw}`);
           this.pushBetLog(
             this.buildBetLog("blocked", direction, book, {
@@ -5465,8 +5876,10 @@ export class TradingEngine {
             })
           );
           this.log("ERROR", "Live order rejected: missing order id");
+          this.markExecutionBlocked("live_no_order_id");
           return { accepted: false, reason: "Live order validation failed" };
         }
+        this.markOrderPosted(oidRaw);
         if (order.sizeFilled <= 0) {
           this.log("TRADE", `[CLOB][NO_FILL] order accepted but no fill orderId=${oidRaw}`);
         }
@@ -5499,11 +5912,14 @@ export class TradingEngine {
           await this.postGtcExit(book.tokenID, entryShares, "BUY", direction, pendingRow.id);
         }
         this.setPhase("WAITING_RESOLUTION", "Live order posted; waiting for CLOB fill");
+        this.executionTruth.lastStrategyDecision = `entered:${strat}`;
         return { accepted: true, trade: pendingRow };
       } catch (error) {
         const reason = error instanceof Error ? error.message : "Live order request failed";
+        this.bumpSessionCount(this.orderPostFailureCounts, "clob_request_exception");
         this.log("TRADE", `[EXECUTION][LIVE_DISABLED] reason=exception msg=${reason.replace(/\s+/g, " ").slice(0, 200)}`);
         this.setPhase("ERROR", `Live execution failed: ${reason}`);
+        this.markExecutionBlocked("live_order_exception");
         this.pushBetLog(
           this.buildBetLog("blocked", direction, book, {
             blockReason: `Live order error: ${reason}`
@@ -5517,12 +5933,15 @@ export class TradingEngine {
     // --- Paper execution: SIMULATION, or LIVE with paperTrading when real posts are off / PAPER_ONLY. ---
     if (this.shouldExecutePaperTrade()) {
       commitTradeEntry();
+      this.markOrderPosted(`paper:${pendingRow.id.slice(0, 8)}`);
+      this.executionTruth.lastStrategyDecision = `entered:${strat}`;
       this.pushBetLog(this.buildBetLog("placed", direction, book, {}));
       this.executePaperTrade(pendingRow, book, effectiveAmount, direction, source, decisionReason);
       return { accepted: true, trade: pendingRow };
     }
 
     this.setPhase("SIGNAL_READY", "LIVE execution disabled by env");
+    this.markExecutionBlocked("live_disabled_env");
     return { accepted: false, reason: "LIVE_DISABLED" };
   }
 
@@ -5814,6 +6233,7 @@ export class TradingEngine {
 
   private schedulePaperExitRetry(tradeId: string, reason: string, waitMs = 1200) {
     if (this.paperExitRetryTimerByTradeId.has(tradeId)) return;
+    this.bumpSessionCount(this.fillVerificationFailureCounts, reason);
     this.log("SIGNAL", `PAPER exit retry: ${reason}; in ${waitMs}ms`);
     const timer = setTimeout(() => {
       this.paperExitRetryTimerByTradeId.delete(tradeId);
@@ -6412,6 +6832,29 @@ export class TradingEngine {
     this.onTrades?.([...this.trades]);
     this.pushStatus();
     this.log(isWin ? "WIN" : "ERROR", `LIVE CLOSED ${settled.direction} P&L $${settled.pnl.toFixed(2)}`);
+
+    if (isWin && t.conditionId) {
+      void this.wallet
+        .redeemWinningPosition(t.conditionId)
+        .then((redeem) => {
+          if (redeem.ok) {
+            this.log(
+              "TRADE",
+              `AUTO_RECLAIM: redeemed winning tokens${redeem.txHash ? ` tx=${redeem.txHash.slice(0, 12)}…` : ""}`
+            );
+            return;
+          }
+          if (redeem.skipped) {
+            this.log("SIGNAL", `AUTO_RECLAIM skipped: ${redeem.reason ?? "unknown"}`);
+            return;
+          }
+          this.log("ERROR", `AUTO_RECLAIM failed: ${redeem.reason ?? "unknown"}`);
+        })
+        .catch((error) => {
+          const msg = error instanceof Error ? error.message : String(error);
+          this.log("ERROR", `AUTO_RECLAIM exception: ${msg}`);
+        });
+    }
 
     if (this.stopLossTriggered) {
       this.setPhase("ERROR", "Stop loss reached; engine stopped");

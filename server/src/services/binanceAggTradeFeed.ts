@@ -1,6 +1,8 @@
 /**
- * Binance spot aggTrade streams — low-latency last trade price per asset (BTC, ETH, …).
- * Used by OLA to compare vs Polymarket price-to-beat before CLOB updates.
+ * Binance spot aggTrade streams — low-latency public last-trade feed per asset (BTC, ETH, ...).
+ * Role in this repo:
+ * - market-data/fallback input for charts + diagnostics
+ * - NOT an order-routing endpoint (orders still route via Polymarket CLOB paths)
  */
 
 import WebSocket from "ws";

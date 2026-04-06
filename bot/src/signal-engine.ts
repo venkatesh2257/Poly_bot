@@ -1,7 +1,7 @@
 /**
  * Signal Engine v8 — Black-Scholes Latency Arbitrage
  * 
- * Strategy: Exploit price delta between Binance spot and Polymarket odds.
+ * Strategy: Exploit price delta between external spot feed and Polymarket odds.
  * Fair value now calculated via Black-Scholes binary option model instead
  * of linear approximation. Gives proper volatility-adjusted probabilities
  * and time decay modeling.

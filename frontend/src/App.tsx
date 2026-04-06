@@ -3105,6 +3105,48 @@ export function App() {
               </span>
             </div>
           ) : null}
+          {tradingState?.executionTruth || tradingState?.sessionTelemetry ? (
+            <div className="space-y-2 rounded-md border border-slate-800/90 bg-[#0a0c10]/90 px-2.5 py-2 text-[10px] text-slate-400">
+              <p className="font-mono text-slate-300">
+                exec-truth · signal=
+                <span className="text-slate-200">
+                  {tradingState.executionTruth?.lastSignalRecommendation ?? "—"}
+                </span>
+                {" · "}strategy=
+                <span className="text-slate-200">
+                  {tradingState.executionTruth?.lastStrategyDecision ?? "—"}
+                </span>
+                {" · "}attempt=
+                <span className="text-slate-200">
+                  {tradingState.executionTruth?.lastExecutionAttempt ?? "—"}
+                </span>
+                {" · "}block=
+                <span className="text-amber-300/90">
+                  {tradingState.executionTruth?.lastExecutionBlockReason ?? "none"}
+                </span>
+                {" · "}order=
+                <span className="text-emerald-300/90">
+                  {tradingState.executionTruth?.lastOrderId ?? "none"}
+                </span>
+              </p>
+              <div className="grid gap-1 sm:grid-cols-2">
+                <p className="truncate">
+                  top skips:{" "}
+                  {(tradingState.sessionTelemetry?.topAutoTradeSkips ?? [])
+                    .slice(0, 3)
+                    .map((x) => `${x.reason}(${x.count})`)
+                    .join(" · ") || "—"}
+                </p>
+                <p className="truncate">
+                  top blockers:{" "}
+                  {(tradingState.sessionTelemetry?.topExecutionBlocks ?? [])
+                    .slice(0, 3)
+                    .map((x) => `${x.reason}(${x.count})`)
+                    .join(" · ") || "—"}
+                </p>
+              </div>
+            </div>
+          ) : null}
           <div className="space-y-2 rounded-lg border border-slate-700 bg-slate-900/70 px-3 py-2 text-xs text-slate-200">
             <p>
               <span className="text-slate-400">Entry strategy: </span>
@@ -3122,7 +3164,8 @@ export function App() {
                   ["anchor", "Anchor"],
                   ["market_making", "Market making"],
                   ["fair_value_arb", "Fair value arb"],
-                  ["selective_momentum", "Selective momentum"]
+                  ["selective_momentum", "Selective momentum"],
+                  ["professional_trader", "Professional (CL+book)"]
                 ] as const satisfies ReadonlyArray<readonly [DashboardEntryStrategyId, string]>
               ).map(([id, label]) => {
                 const active = entryStrategyUi.effective === id;
@@ -3587,6 +3630,7 @@ export function App() {
               <option value="market_making">market_making</option>
               <option value="fair_value_arb">fair_value_arb</option>
               <option value="selective_momentum">selective_momentum</option>
+              <option value="professional_trader">professional_trader</option>
             </select>
             <select
               value={tradeLogSession}

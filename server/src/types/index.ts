@@ -248,6 +248,8 @@ export interface Trade {
   id: string;
   time: string;
   market: string;
+  /** Polymarket condition id for winner redemption / reclaim after resolution. */
+  conditionId?: string;
   price: number;
   amount: number;
   pnl: number;
@@ -295,6 +297,32 @@ export interface Status {
   lastAutoTradeTickMs?: number | null;
   lastAutoTradeDecisionMs?: number | null;
   lastAutoTradeSkipReason?: string | null;
+  executionTruth?: ExecutionTruthSnapshot;
+  sessionTelemetry?: SessionTelemetrySnapshot;
+}
+
+export interface CounterTop {
+  reason: string;
+  count: number;
+}
+
+export interface ExecutionTruthSnapshot {
+  lastSignalRecommendation: string | null;
+  lastStrategyDecision: string | null;
+  lastExecutionAttempt: string | null;
+  lastExecutionBlockReason: string | null;
+  lastOrderPostedAt: number | null;
+  lastOrderId: string | null;
+}
+
+export interface SessionTelemetrySnapshot {
+  topAutoTradeSkips: CounterTop[];
+  topAnchorSkips: CounterTop[];
+  topExecutionBlocks: CounterTop[];
+  topOrderPostFailures: CounterTop[];
+  topFillVerificationFailures: CounterTop[];
+  topDiscoveryFailures: CounterTop[];
+  topOracleStaleEvents: CounterTop[];
 }
 
 /** Effective + env defaults for auto size, limits, cooldown, paper stop (runtime overrides via API). */
@@ -304,7 +332,8 @@ export type EntryStrategyKind =
   | "anchor"
   | "market_making"
   | "fair_value_arb"
-  | "selective_momentum";
+  | "selective_momentum"
+  | "professional_trader";
 
 /** Dashboard-selectable strategies (API). */
 export type DashboardEntryStrategyId =
@@ -312,7 +341,8 @@ export type DashboardEntryStrategyId =
   | "anchor"
   | "market_making"
   | "fair_value_arb"
-  | "selective_momentum";
+  | "selective_momentum"
+  | "professional_trader";
 
 export interface EntryStrategyState {
   effective: EntryStrategyKind;
@@ -450,6 +480,8 @@ export interface TradingState {
   liveReadiness: LiveReadinessSnapshot;
   /** True when the selected strategy can execute; blockedReasons explain startup/signal gaps. */
   executionEligibility: ExecutionEligibilityWire;
+  executionTruth?: ExecutionTruthSnapshot;
+  sessionTelemetry?: SessionTelemetrySnapshot;
   /**
    * Compact engine snapshot aligned with CLOB book refresh + signal logic.
    * Lets `/trading-state` polling stay in sync with live APIs when WebSocket is quiet.

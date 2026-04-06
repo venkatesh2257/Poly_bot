@@ -1,7 +1,7 @@
 /**
  * Spot USD for major symbols.
  * Order: Coinbase spot → Binance REST ticker → last-good cache (survives transient failures).
- * Used by dashboard charts and bone latency; does not affect order routing.
+ * Used by dashboard charts and market-data fallback; does not affect order routing.
  */
 
 const FETCH_TIMEOUT_MS = 5_000;
