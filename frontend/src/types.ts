@@ -113,7 +113,6 @@ export interface BotStatus {
   balance: number;
   cooldownMs: number;
   stopLossTriggered: boolean;
-  olaKillTriggered?: boolean;
   phase: BotPhase;
   phaseReason?: string;
   /** Session env from server (Go LIVE / Switch to PAPER). */
@@ -139,25 +138,18 @@ export interface RiskSettingsSnapshot {
 }
 
 export type DashboardEntryStrategyId =
-  | "ensemble"
   | "momentum"
-  | "orderbook"
-  | "mean_revert"
-  | "chart"
-  | "whale_edge"
-  | "ola"
-  | "anchor";
+  | "anchor"
+  | "market_making"
+  | "fair_value_arb"
+  | "selective_momentum";
 
 export type EntryStrategyKind =
   | "momentum"
-  | "contrarian"
-  | "orderbook"
-  | "mean_revert"
-  | "chart"
-  | "whale_edge"
-  | "ensemble"
-  | "ola"
-  | "anchor";
+  | "anchor"
+  | "market_making"
+  | "fair_value_arb"
+  | "selective_momentum";
 
 export interface EntryStrategyState {
   effective: EntryStrategyKind;

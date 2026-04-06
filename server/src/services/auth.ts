@@ -20,6 +20,13 @@ export class AuthService {
   private nonces = new Map<string, NonceEntry>();
   private sessions = new Map<string, SessionEntry>();
 
+  /** True when both `APP_USER_ID` and `APP_PASSWORD` are set (non-empty). No insecure defaults. */
+  isPasswordAuthConfigured(): boolean {
+    const u = String(process.env.APP_USER_ID ?? "").trim();
+    const p = String(process.env.APP_PASSWORD ?? "").trim();
+    return Boolean(u && p);
+  }
+
   createNonce(address: string) {
     const normalized = address.toLowerCase();
     const nonce = randomBytes(16).toString("hex");
@@ -28,11 +35,14 @@ export class AuthService {
   }
 
   buildMessage(address: string, nonce: string) {
+    const uri =
+      String(process.env.SIGN_IN_MESSAGE_URI ?? process.env.APP_ORIGIN ?? "").trim() ||
+      "http://localhost:5174";
     return `PolyBot Sign-In
 Address: ${address}
 Nonce: ${nonce}
 Statement: Sign this message to authenticate with PolyBot.
-URI: http://localhost:5173
+URI: ${uri}
 Version: 1
 Chain ID: 137`;
   }
@@ -53,8 +63,9 @@ Chain ID: 137`;
   }
 
   loginWithPassword(input: { userId: string; password: string }) {
-    const expectedUser = process.env.APP_USER_ID ?? "admin";
-    const expectedPass = process.env.APP_PASSWORD ?? "admin123";
+    const expectedUser = String(process.env.APP_USER_ID ?? "").trim();
+    const expectedPass = String(process.env.APP_PASSWORD ?? "").trim();
+    if (!expectedUser || !expectedPass) return null;
     if (input.userId !== expectedUser || input.password !== expectedPass) return null;
     const token = randomBytes(24).toString("hex");
     this.sessions.set(token, { userId: input.userId, authType: "password", expiresAt: Date.now() + SESSION_TTL_MS });

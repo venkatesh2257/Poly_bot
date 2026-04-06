@@ -11,6 +11,7 @@ import {
   YAxis
 } from "recharts";
 import { api } from "./api";
+import { resolveWsUrl } from "./apiConfig";
 import {
   getCollateralUsdcFromMetaMask,
   approveCollateralAllowanceFromMetaMask,
@@ -91,7 +92,7 @@ function dayStartLocal(d = new Date()): Date {
 
 type PortfolioRange = "1m" | "1h" | "day" | "month" | "year";
 
-const WS_URL = "ws://localhost:4011";
+const WS_URL = resolveWsUrl();
 
 /**
  * MetaMask: always market-SELL entry shares before dashboard confirm (aligns with Polymarket inventory).
@@ -529,15 +530,6 @@ export function App() {
 
   const [lagSnipeBusy, setLagSnipeBusy] = useState(false);
   const lagSnipeOn = Boolean(tradingState?.lagSnipeEnabled ?? tradingState?.liveEngine?.lagSnipeEnabled);
-  const [spotPolyLagBusy, setSpotPolyLagBusy] = useState(false);
-  const spotPolyLagOn = entryStrategyUi.effective === "spot_poly_lag";
-  const [spotPolyLagStatus, setSpotPolyLagStatus] = useState<{
-    ob_signal?: string;
-    ob_ratio?: string;
-    clob_ask?: string;
-    clob_spread?: string;
-    clob_depth?: string;
-  }>({});
 
   const applyLagSnipe = async (enabled: boolean) => {
     if (!isLoggedIn) {
@@ -569,35 +561,6 @@ export function App() {
       setLoginHint(e instanceof Error ? e.message : String(e));
     } finally {
       setLagSnipeBusy(false);
-    }
-  };
-
-  const applySpotPolyLag = async (enabled: boolean) => {
-    if (!isLoggedIn) {
-      setLoginHint("Sign in to toggle Spot-Poly Lag.");
-      setShowPasswordLogin(true);
-      return;
-    }
-    setSpotPolyLagBusy(true);
-    try {
-      const out = await api.setSpotPolyLag(enabled);
-      setTradingState((prev) =>
-        prev
-          ? {
-              ...prev,
-              entryStrategy: out.entryStrategy,
-              spotPolyLagEnabled: Boolean(out.spotPolyLagEnabled),
-              liveEngine: prev.liveEngine
-                ? { ...prev.liveEngine, spotPolyLagEnabled: Boolean(out.spotPolyLagEnabled) }
-                : prev.liveEngine
-            }
-          : prev
-      );
-      setLoginHint(Boolean(out.spotPolyLagEnabled) ? "Spot-Poly Lag ON." : "Spot-Poly Lag OFF.");
-    } catch (e) {
-      setLoginHint(e instanceof Error ? e.message : String(e));
-    } finally {
-      setSpotPolyLagBusy(false);
     }
   };
 
@@ -1087,23 +1050,6 @@ export function App() {
       }
       if (msg.type === "log") {
         setLogs((prev) => [msg.payload, ...prev].slice(0, 120));
-        const text = String(msg?.payload?.message ?? "");
-        if (text.includes("[SPL] OB:")) {
-          const ratio = text.match(/ratio=([0-9.]+)/)?.[1];
-          const signal = text.includes("BULLISH") ? "BULLISH" : text.includes("BEARISH") ? "BEARISH" : "NEUTRAL";
-          setSpotPolyLagStatus((prev) => ({ ...prev, ob_signal: signal, ob_ratio: ratio ?? prev.ob_ratio ?? "—" }));
-        }
-        if (text.includes("[SPL] CLOB:")) {
-          const ask = text.match(/ask=([0-9.]+)/)?.[1];
-          const spread = text.match(/spread=([0-9.]+%)/)?.[1];
-          const depth = text.match(/depth=([0-9.]+)/)?.[1];
-          setSpotPolyLagStatus((prev) => ({
-            ...prev,
-            clob_ask: ask ?? prev.clob_ask ?? "—",
-            clob_spread: spread ?? prev.clob_spread ?? "—",
-            clob_depth: depth ?? prev.clob_depth ?? "—"
-          }));
-        }
       }
       if (msg.type === "betLogs") setBetLogs(Array.isArray(msg.payload) ? msg.payload : []);
       if (msg.type === "betLog") {
@@ -2608,22 +2554,14 @@ export function App() {
                 <span className="ml-1 text-slate-500">· .env</span>
               )}
             </p>
-            {entryStrategyUi.fromEnv === "contrarian" && entryStrategyUi.runtimeOverride == null ? (
-              <p className="text-[10px] leading-snug text-amber-200/90">
-                Contrarian is set in <code className="text-slate-300">ENTRY_STRATEGY</code>. Choose a mode below to override from the UI.
-              </p>
-            ) : null}
             <div className="flex flex-wrap gap-1.5">
               {(
                 [
-                  ["ensemble", "Ensemble (all)"],
                   ["momentum", "Momentum"],
-                  ["spot_poly_lag", "Spot-Poly Lag"],
-                  ["orderbook", "Order book"],
-                  ["whale_edge", "Whale edge"],
-                  ["ola", "OLA (latency)"],
-                  ["mean_revert", "Mean revert"],
-                  ["chart", "Chart"]
+                  ["anchor", "Anchor"],
+                  ["market_making", "Market making"],
+                  ["fair_value_arb", "Fair value arb"],
+                  ["selective_momentum", "Selective momentum"]
                 ] as const satisfies ReadonlyArray<readonly [DashboardEntryStrategyId, string]>
               ).map(([id, label]) => {
                 const active = entryStrategyUi.effective === id;
@@ -2690,18 +2628,6 @@ export function App() {
               >
                 Lag Snipe {lagSnipeOn ? "ON" : "OFF"}
               </button>
-              <button
-                type="button"
-                disabled={!isLoggedIn || spotPolyLagBusy || entryStrategyBusy}
-                onClick={() => void applySpotPolyLag(!spotPolyLagOn)}
-                className={`rounded-md px-2.5 py-1 text-[10px] font-semibold transition ${
-                  spotPolyLagOn
-                    ? "bg-fuchsia-500/25 text-fuchsia-200 ring-1 ring-fuchsia-400/50"
-                    : "bg-slate-800 text-slate-300 hover:bg-slate-700"
-                } disabled:cursor-not-allowed disabled:opacity-50`}
-              >
-                Start Spot-Poly Lag 🎯
-              </button>
             </div>
             {anchorEnvOff ? (
               <p className="text-[10px] leading-snug text-slate-500">
@@ -2718,35 +2644,11 @@ export function App() {
                   : ""}
               </p>
             ) : null}
-            <div className="rounded-md border border-fuchsia-700/70 bg-fuchsia-950/20 px-2.5 py-2 text-[10px] text-fuchsia-100">
-              <p className="mb-1 font-semibold">🎯 Spot-Poly Lag</p>
-              <div className="grid grid-cols-2 gap-y-1">
-                <span className="text-fuchsia-200/80">OB Signal</span>
-                <span
-                  className={
-                    spotPolyLagStatus.ob_signal === "BULLISH"
-                      ? "text-emerald-300"
-                      : spotPolyLagStatus.ob_signal === "BEARISH"
-                        ? "text-rose-300"
-                        : "text-amber-300"
-                  }
-                >
-                  {spotPolyLagStatus.ob_signal ?? "NEUTRAL"}
-                </span>
-                <span className="text-fuchsia-200/80">OB Ratio</span>
-                <span>{spotPolyLagStatus.ob_ratio ?? "—"}</span>
-                <span className="text-fuchsia-200/80">CLOB Ask</span>
-                <span>{spotPolyLagStatus.clob_ask ?? "—"}</span>
-                <span className="text-fuchsia-200/80">CLOB Spread</span>
-                <span>{spotPolyLagStatus.clob_spread ?? "—"}</span>
-                <span className="text-fuchsia-200/80">CLOB Depth</span>
-                <span>{spotPolyLagStatus.clob_depth ?? "—"}</span>
-              </div>
-            </div>
             <p className="text-[10px] leading-relaxed text-slate-500">
-              <strong className="text-slate-400">Ensemble</strong> blends momentum, orderbook, mean-revert, chart, mid-flip,
-              last-second collapse, and reversal snipe; optional whale filters via{" "}
-              <code className="text-slate-400">ENSEMBLE_APPLY_WHALE_FILTER</code>. Other buttons force a single leg only.
+              <strong className="text-slate-400">Momentum</strong> and <strong className="text-slate-400">Anchor</strong> set
+              the entry strategy; <strong className="text-slate-400">Lag Snipe</strong> is a separate mode for late-window
+              entries. Use <strong className="text-slate-400">Anchor ON/OFF</strong> for runtime anchor evaluation when the
+              entry strategy is Anchor.
             </p>
           </div>
           <p className="text-[11px] text-slate-500">
@@ -3119,13 +3021,11 @@ export function App() {
             >
               <option value="ALL">Strategy: All</option>
               <option value="lag_snipe">lag_snipe</option>
-              <option value="ola">ola</option>
-              <option value="ensemble">ensemble</option>
-              <option value="whale_edge">whale_edge</option>
-              <option value="orderbook">orderbook</option>
-              <option value="mean_revert">mean_revert</option>
-              <option value="chart">chart</option>
               <option value="momentum">momentum</option>
+              <option value="anchor">anchor</option>
+              <option value="market_making">market_making</option>
+              <option value="fair_value_arb">fair_value_arb</option>
+              <option value="selective_momentum">selective_momentum</option>
             </select>
             <select
               value={tradeLogSession}

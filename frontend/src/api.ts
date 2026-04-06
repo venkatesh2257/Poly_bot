@@ -18,19 +18,26 @@ import type {
   Trade,
   WalletSummary
 } from "./types";
+import { resolveApiBase } from "./apiConfig";
 
-const API_BASE = "http://localhost:4000/api";
+const API_BASE = resolveApiBase();
+
+function mergeRequestHeaders(init: RequestInit | undefined): Headers {
+  const token = localStorage.getItem("polybot_auth_token");
+  const merged = new Headers();
+  merged.set("Content-Type", "application/json");
+  if (token) merged.set("Authorization", `Bearer ${token}`);
+  if (init?.headers) {
+    const extra = new Headers(init.headers);
+    extra.forEach((value, key) => merged.set(key, value));
+  }
+  return merged;
+}
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
-  const token = localStorage.getItem("polybot_auth_token");
-  const customHeaders = init?.headers as Record<string, string> | undefined;
   const res = await fetch(`${API_BASE}${path}`, {
-    headers: {
-      "Content-Type": "application/json",
-      ...(token ? { Authorization: `Bearer ${token}` } : {}),
-      ...(customHeaders ?? {})
-    },
-    ...init
+    ...init,
+    headers: mergeRequestHeaders(init)
   });
   if (!res.ok) {
     const raw = await res.text();
@@ -86,11 +93,6 @@ export const api = {
     }),
   setLagSnipe: (enabled: boolean) =>
     request<{ ok: true; lagSnipeEnabled: boolean; banner?: string }>("/lag-snipe", {
-      method: "POST",
-      body: JSON.stringify({ enabled })
-    }),
-  setSpotPolyLag: (enabled: boolean) =>
-    request<{ ok: true; spotPolyLagEnabled: boolean; entryStrategy: EntryStrategyState }>("/spot-poly-lag", {
       method: "POST",
       body: JSON.stringify({ enabled })
     }),
@@ -194,21 +196,6 @@ export const api = {
     if (q.strategy) params.set("strategy", q.strategy);
     if (q.session) params.set("session", q.session);
     return request<TradeLogQueryResponse>(`/trade-log/query?${params.toString()}`);
-  },
-  tradeLogExportUrl: (q: {
-    from?: string;
-    to?: string;
-    asset?: string;
-    strategy?: string;
-    session?: "24h" | "AM" | "PM";
-  }) => {
-    const params = new URLSearchParams();
-    if (q.from) params.set("from", q.from);
-    if (q.to) params.set("to", q.to);
-    if (q.asset) params.set("asset", q.asset);
-    if (q.strategy) params.set("strategy", q.strategy);
-    if (q.session) params.set("session", q.session);
-    return `${API_BASE}/trade-log/export.csv?${params.toString()}`;
   },
   polymarketConnect: async (): Promise<PolymarketAccountSummary> => {
     const [wallet, balanceAllowanceRaw, openOrders, userTrades] = await Promise.all([

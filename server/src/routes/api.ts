@@ -1,4 +1,4 @@
-import { Router } from "express";
+import { Router, type Request, type Response } from "express";
 import { TradingEngine } from "../services/engine.js";
 import { AuthService } from "../services/auth.js";
 import { PolymarketPublicService } from "../services/polymarket.js";
@@ -30,7 +30,6 @@ function shouldInspectApiPath(path: string, method: string): boolean {
         "/entry-strategy",
         "/anchor-strategy",
         "/lag-snipe",
-        "/spot-poly-lag",
         "/asset-auto-trade",
         "/auth/password-login",
         "/auth/verify",
@@ -39,7 +38,12 @@ function shouldInspectApiPath(path: string, method: string): boolean {
   ) {
     return true;
   }
-  if (method === "GET" && (p.startsWith("/polymarket/clob/") || p === "/ping")) return true;
+  if (
+    method === "GET" &&
+    (p.startsWith("/polymarket/clob/") || p === "/ping" || p.startsWith("/trade-log/"))
+  ) {
+    return true;
+  }
   return false;
 }
 
@@ -90,6 +94,23 @@ export function createApiRouter(
     return token;
   };
 
+  type DashboardSession = NonNullable<ReturnType<typeof auth.getSession>>;
+
+  /** Same rules as other dashboard control routes: session + wallet allowlist when applicable. */
+  const requireDashboardAuth = (req: Request, res: Response): DashboardSession | null => {
+    const token = getBearerToken(req.headers.authorization);
+    const session = auth.getSession(token);
+    if (!session) {
+      res.status(401).json({ ok: false, reason: "Login required" });
+      return null;
+    }
+    if (session.authType === "wallet" && !isWalletAuthorized(session.address)) {
+      res.status(403).json({ ok: false, reason: "Logged in wallet not allowed" });
+      return null;
+    }
+    return session;
+  };
+
   router.get("/auth/nonce", (req, res) => {
     const address = String(req.query.address ?? "");
     if (!/^0x[a-fA-F0-9]{40}$/i.test(address.trim())) {
@@ -114,6 +135,12 @@ export function createApiRouter(
   });
 
   router.post("/auth/password-login", (req, res) => {
+    if (!auth.isPasswordAuthConfigured()) {
+      return res.status(503).json({
+        error: "Password authentication is not configured",
+        reason: "Set APP_USER_ID and APP_PASSWORD in the server environment."
+      });
+    }
     const { userId, password } = req.body;
     if (typeof userId !== "string" || typeof password !== "string") {
       return res.status(400).json({ error: "Invalid payload" });
@@ -349,23 +376,6 @@ export function createApiRouter(
     return res.json(out);
   });
 
-  router.post("/spot-poly-lag", (req, res) => {
-    const token = getBearerToken(req.headers.authorization);
-    const session = auth.getSession(token);
-    if (!session) return res.status(401).json({ ok: false, reason: "Login required" });
-    if (session.authType === "wallet" && !isWalletAuthorized(session.address)) {
-      return res.status(403).json({ ok: false, reason: "Logged in wallet not allowed" });
-    }
-    const enabled = Boolean(req.body?.enabled);
-    const out = engine.setEntryStrategy({ strategy: enabled ? "spot_poly_lag" : "momentum" });
-    if (!out.ok) return res.status(400).json(out);
-    return res.json({
-      ok: true,
-      spotPolyLagEnabled: out.entryStrategy.effective === "spot_poly_lag",
-      entryStrategy: out.entryStrategy
-    });
-  });
-
   router.post("/asset-auto-trade", (req, res) => {
     const token = getBearerToken(req.headers.authorization);
     const session = auth.getSession(token);
@@ -392,6 +402,7 @@ export function createApiRouter(
   /** Full engine trade queue (PAPER + LIVE); no server-side filtering. */
   router.get("/trades", (_req, res) => res.json(engine.getTrades()));
   router.get("/trade-log/query", async (req, res) => {
+    if (!requireDashboardAuth(req, res)) return;
     const q = req.query as Record<string, string | undefined>;
     const fromMs = q.from ? Date.parse(q.from) : undefined;
     const toMs = q.to ? Date.parse(q.to) : undefined;
@@ -405,6 +416,7 @@ export function createApiRouter(
     return res.json({ rows, stats: tradeLogger.summarize(rows) });
   });
   router.get("/trade-log/export.csv", async (req, res) => {
+    if (!requireDashboardAuth(req, res)) return;
     const q = req.query as Record<string, string | undefined>;
     const fromMs = q.from ? Date.parse(q.from) : undefined;
     const toMs = q.to ? Date.parse(q.to) : undefined;

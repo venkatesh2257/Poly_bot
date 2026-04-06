@@ -5,6 +5,8 @@ export type UpDownAsset = "BTC" | "ETH" | "SOL" | "XRP";
 export interface ResolvedUpDownMarket {
   tokenIdUp: string;
   tokenIdDown: string;
+  /** Polymarket condition id (hex) — used by Synthesis trades WS and some analytics. */
+  conditionId?: string;
   label: string;
   endDate: string;
   slug: string;
@@ -91,6 +93,7 @@ export async function resolveActiveUpDown5m(asset: string): Promise<ResolvedUpDo
           question?: string;
           outcomes?: unknown;
           clobTokenIds?: unknown;
+          conditionId?: string;
           endDate?: string;
           closed?: boolean;
           acceptingOrders?: boolean;
@@ -110,9 +113,14 @@ export async function resolveActiveUpDown5m(asset: string): Promise<ResolvedUpDo
     const downIdx = outcomes.findIndex((o) => /^down$/i.test(o.trim()));
     if (upIdx < 0 || downIdx < 0) continue;
 
+    const cond =
+      typeof market.conditionId === "string" && market.conditionId.startsWith("0x")
+        ? market.conditionId
+        : undefined;
     return {
       tokenIdUp: tokens[upIdx],
       tokenIdDown: tokens[downIdx],
+      conditionId: cond,
       label: String(market.question ?? ev.title ?? slug),
       endDate: String(market.endDate ?? ev.endDate ?? ""),
       slug: String(ev.slug ?? slug)

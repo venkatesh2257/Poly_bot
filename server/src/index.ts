@@ -9,7 +9,6 @@ import { TradingEngine } from "./services/engine.js";
 import { AuthService } from "./services/auth.js";
 import { TradeLogger } from "./services/tradeLogger.js";
 import { applyDefaultPaperTestEnv } from "./services/executionFlags.js";
-import spotPolyLag from "../../src/strategies/spotPolyLag.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -33,7 +32,7 @@ const engine = new TradingEngine();
 const auth = new AuthService();
 const tradeLogger = new TradeLogger();
 const seenSettled = new Set<string>();
-const strategyRegistry = ["momentum", "lag_snipe", "spot_poly_lag"];
+const strategyRegistry = ["momentum", "lag_snipe", "anchor"];
 
 app.use(cors());
 app.use(express.json());
@@ -48,7 +47,7 @@ app.get("/", (_req, res) => {
     JSON.stringify(
       {
         service: "PolyBot API",
-        dashboard: "http://localhost:5173",
+        dashboard: "http://localhost:5174",
         api: `http://localhost:${PORT}/api`,
         websocket: `ws://localhost:${WS_PORT}`,
         hint: "Open `dashboard` for the UI. Do not paste `websocket` into Chrome — the app connects to it automatically."
@@ -90,10 +89,7 @@ void (async () => {
     console.error("[BOOT] Chainlink boot error:", e);
   }
   await Promise.all([engine.init(), tradeLogger.init()]);
-  void spotPolyLag.connect_binance_ob?.().catch((e: unknown) => {
-    console.error("[SPL] Binance OB startup failed:", e);
-  });
-  console.log(`[SPL] Strategy registry: ${strategyRegistry.join(", ")}`);
+  console.log(`[BOOT] Strategy registry: ${strategyRegistry.join(", ")}`);
   setInterval(() => {
     const trades = engine.getTrades();
     for (const t of trades) {

@@ -142,8 +142,6 @@ export interface Status {
   balance: number;
   cooldownMs: number;
   stopLossTriggered: boolean;
-  /** OLA: net loss in rolling 1h exceeded 5% of balance — engine halted. */
-  olaKillTriggered?: boolean;
   phase: BotPhase;
   phaseReason?: string;
   /** Runtime session env (after Go LIVE / Switch to PAPER). */
@@ -156,27 +154,18 @@ export interface Status {
 /** Engine / .env entry strategy union. */
 export type EntryStrategyKind =
   | "momentum"
-  | "spot_poly_lag"
-  | "contrarian"
-  | "orderbook"
-  | "mean_revert"
-  | "chart"
-  | "whale_edge"
-  | "ensemble"
-  | "ola"
-  | "anchor";
+  | "anchor"
+  | "market_making"
+  | "fair_value_arb"
+  | "selective_momentum";
 
-/** Dashboard-selectable strategies (API); contrarian also via ENTRY_STRATEGY in .env. */
+/** Dashboard-selectable strategies (API). */
 export type DashboardEntryStrategyId =
   | "momentum"
-  | "spot_poly_lag"
-  | "orderbook"
-  | "mean_revert"
-  | "chart"
-  | "whale_edge"
-  | "ensemble"
-  | "ola"
-  | "anchor";
+  | "anchor"
+  | "market_making"
+  | "fair_value_arb"
+  | "selective_momentum";
 
 export interface EntryStrategyState {
   effective: EntryStrategyKind;

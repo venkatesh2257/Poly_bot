@@ -46,6 +46,7 @@ function localDateParts(ts: number) {
   return { yyyy, mm, dd };
 }
 
+/** Maps `decisionReason` prefixes to strategy labels for SQLite / CSV (includes legacy removed modes for old rows). */
 function strategyFromDecisionReason(reason?: string): string {
   const s = String(reason ?? "").trim().toUpperCase();
   if (!s) return "unknown";
@@ -59,6 +60,9 @@ function strategyFromDecisionReason(reason?: string): string {
   if (s.startsWith("MEAN_REVERT") || s.startsWith("MEANREVERT")) return "mean_revert";
   if (s.startsWith("CHART")) return "chart";
   if (s.startsWith("MOMENTUM")) return "momentum";
+  if (s.startsWith("MM:") || s.startsWith("MM ")) return "market_making";
+  if (s.startsWith("FVA:") || s.startsWith("FVA ")) return "fair_value_arb";
+  if (s.startsWith("SM:") || s.startsWith("SM ")) return "selective_momentum";
   return "unknown";
 }
 

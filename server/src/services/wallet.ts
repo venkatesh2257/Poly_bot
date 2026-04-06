@@ -67,6 +67,7 @@ export class WalletService {
     asset: string;
     tokenIdUp: string;
     tokenIdDown: string;
+    conditionId?: string;
     label: string;
     slug: string;
     endDateIso: string;
@@ -139,6 +140,7 @@ export class WalletService {
     label: string;
     tokenIdUp: string;
     tokenIdDown: string;
+    conditionId?: string;
     endDateIso: string;
     windowStartSec?: number;
   }> {
@@ -148,6 +150,7 @@ export class WalletService {
       label: s.label,
       tokenIdUp: s.tokenIdUp,
       tokenIdDown: s.tokenIdDown,
+      conditionId: s.conditionId,
       endDateIso: s.endDateIso,
       windowStartSec: s.windowStartSec
     }));
@@ -204,6 +207,7 @@ export class WalletService {
         windowStartSec?: number;
         tokenIdUp: string;
         tokenIdDown: string;
+        conditionId?: string;
       }
     | null {
     const d = this.activeSlot();
@@ -214,7 +218,8 @@ export class WalletService {
       endDateIso: d.endDateIso,
       windowStartSec: d.windowStartSec,
       tokenIdUp: d.tokenIdUp,
-      tokenIdDown: d.tokenIdDown
+      tokenIdDown: d.tokenIdDown,
+      conditionId: d.conditionId
     };
   }
 
@@ -283,6 +288,7 @@ export class WalletService {
         asset,
         tokenIdUp: resolved.tokenIdUp,
         tokenIdDown: resolved.tokenIdDown,
+        conditionId: resolved.conditionId,
         label: resolved.label,
         slug: resolved.slug,
         endDateIso: resolved.endDate,

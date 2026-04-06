@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import type { StrategyEvaluation } from "../strategy/strategyTypes.js";
 import type {
   BetLogEntry,
   DashboardEntryStrategyId,
@@ -55,8 +56,6 @@ import {
   updateOracleWindowStateFromChainlink,
   type OracleWindowState
 } from "./oracleWindowGate.js";
-import { computeEnsemble, type MidSample } from "./ensembleStrategy.js";
-import { evaluateWhaleEdgeGate, whalePaperTakeProfitMid } from "./whaleStrategy.js";
 import { runConnectivityPings } from "./apiPings.js";
 import { fetchBtcUsd } from "./btcPriceFeed.js";
 import { fetchUsdSpot } from "./cryptoPriceFeed.js";
@@ -78,23 +77,9 @@ import {
 } from "./executionFlags.js";
 import { BinanceAggTradeFeed } from "./binanceAggTradeFeed.js";
 import {
-  OLA_KILL_SWITCH_LOSS_FRAC,
-  OLA_KILL_WINDOW_MS,
-  olaBookSnipeAllowed,
-  olaDirectionFromOracle,
-  olaOracleVersusTarget,
-  olaSecondsToExpiryAbort,
-  olaSlippageExceeded,
-  olaSnipeAskCap,
-  olaThresholdUsd,
-  olaWindowSpendCap,
-  OLA_SLIPPAGE_FRAC
-} from "./olaStrategy.js";
-import {
   loadBotFiltersConfig,
   tradeAssetAllowedByConfig,
   bookMidSpread01,
-  slippageFracFromConfig,
   type BotFiltersConfig
 } from "./botFiltersConfig.js";
 import {
@@ -114,6 +99,19 @@ import {
   lagSnipePremiumDirectionFromOracleDiff,
   lagSnipeSrOk
 } from "./lagSnipeStrategy.js";
+import { isPolymarketCryptoUpDown5mWindow, polymarket5mWindowKey } from "../strategy/polymarket5mCrypto.js";
+import {
+  evaluatePolymarket5mFairValueArb,
+  loadPolymarket5mFairValueArbConfigFromEnv
+} from "./fairValueArbStrategy.js";
+import {
+  evaluatePolymarket5mMarketMaking,
+  loadPolymarket5mMarketMakingConfigFromEnv
+} from "./marketMakingStrategy.js";
+import {
+  evaluatePolymarket5mSelectiveMomentum,
+  loadPolymarket5mSelectiveMomentumConfigFromEnv
+} from "./selectiveMomentumStrategy.js";
 
 const START_BALANCE = Number(process.env.START_BALANCE ?? 1000);
 /** Default caps; effective values read inside trade() after dotenv (engine imports before index loads .env). */
@@ -253,35 +251,25 @@ function boneEnvTrue(key: string): boolean {
   return String(process.env[key] ?? "").toLowerCase() === "true";
 }
 
-/** When using ensemble, apply whale_edge liquidity/time/spread gates on the combined vote (default on). */
-function ensembleApplyWhaleFilter(): boolean {
-  const v = process.env.ENSEMBLE_APPLY_WHALE_FILTER;
-  if (v == null || v === "") return true;
-  return String(v).toLowerCase() !== "false" && String(v) !== "0";
-}
-
-function olaUseWhaleFilter(): boolean {
-  return String(process.env.OLA_USE_WHALE_FILTER ?? "").toLowerCase() === "true";
-}
-
 /** Exact high-conf scalping defaults (60% depth + 0.60 conf×mid floor + mid≥HIGH_CONF_MID_THRESHOLD OR). */
 const BONE_SCALP_MIN_CONF_PCT = 96;
 const BONE_SCALP_MIN_CONF_TIMES_MID = 0.6;
 const BONE_SCALP_WHALE_FRAC = 0.6;
 
-/** Parsed from `ENTRY_STRATEGY` only (contrarian is .env-only). Empty env defaults to ensemble (all legs). */
+/** Parsed from `ENTRY_STRATEGY`. Empty or legacy/removed values default to `momentum` (with optional warn). */
 function parseEnvEntryStrategy(): EntryStrategyKind {
   const raw = process.env.ENTRY_STRATEGY;
-  const s = String(raw == null || String(raw).trim() === "" ? "ensemble" : raw).toLowerCase().trim();
-  if (s === "spot_poly_lag" || s === "spot-poly-lag" || s === "spl") return "spot_poly_lag";
-  if (s === "contrarian" || s === "fade") return "contrarian";
-  if (s === "orderbook" || s === "book") return "orderbook";
-  if (s === "mean_revert" || s === "revert" || s === "fade_odds") return "mean_revert";
-  if (s === "chart" || s === "pseudo" || s === "synthetic") return "chart";
-  if (s === "whale_edge" || s === "whale" || s === "edge") return "whale_edge";
-  if (s === "ensemble" || s === "all" || s === "combined") return "ensemble";
-  if (s === "ola" || s === "latency" || s === "oracle_latency") return "ola";
+  const s = String(raw == null || String(raw).trim() === "" ? "momentum" : raw).toLowerCase().trim();
   if (s === "anchor" || s === "book_imbalance") return "anchor";
+  if (s === "momentum") return "momentum";
+  if (s === "market_making" || s === "mm") return "market_making";
+  if (s === "fair_value_arb" || s === "fva") return "fair_value_arb";
+  if (s === "selective_momentum" || s === "sm") return "selective_momentum";
+  if (raw != null && String(raw).trim() !== "") {
+    console.warn(
+      `[ENTRY_STRATEGY] Unknown value "${String(raw).trim()}" — using momentum. Valid: momentum, anchor, market_making, fair_value_arb, selective_momentum.`
+    );
+  }
   return "momentum";
 }
 
@@ -289,18 +277,14 @@ function parseDashboardEntryStrategyId(raw: unknown): DashboardEntryStrategyId |
   if (typeof raw !== "string") return null;
   const s = raw.trim().toLowerCase();
   if (s === "momentum") return "momentum";
-  if (s === "spot_poly_lag" || s === "spot-poly-lag" || s === "spl") return "spot_poly_lag";
-  if (s === "orderbook" || s === "book") return "orderbook";
-  if (s === "mean_revert" || s === "revert" || s === "fade_odds") return "mean_revert";
-  if (s === "chart") return "chart";
-  if (s === "whale_edge" || s === "whale" || s === "edge") return "whale_edge";
-  if (s === "ensemble" || s === "all" || s === "combined") return "ensemble";
-  if (s === "ola" || s === "latency" || s === "oracle_latency") return "ola";
   if (s === "anchor" || s === "book_imbalance") return "anchor";
+  if (s === "market_making" || s === "mm") return "market_making";
+  if (s === "fair_value_arb" || s === "fva") return "fair_value_arb";
+  if (s === "selective_momentum" || s === "sm") return "selective_momentum";
   return null;
 }
 
-/** How momentum is measured when ENTRY_STRATEGY=momentum (ignored for orderbook signal path). */
+/** How momentum is measured when ENTRY_STRATEGY=momentum (ignored when ENTRY_STRATEGY=anchor). */
 type MomentumModeKind = "ticks" | "weighted" | "from_open";
 
 function momentumMode(): MomentumModeKind {
@@ -422,8 +406,6 @@ export class TradingEngine {
     bestAsk: 0.51
   };
   private directionalContext: DirectionalContext | null = null;
-  /** Rolling UP/DOWN mids per Gamma slug — mid-flip / LSC / reversal legs (ensemble). */
-  private ensembleMidBySlug = new Map<string, MidSample[]>();
   /** Per-asset UP/DOWN book snapshot (all discovered slots), updated with the 4s refresh. */
   private multiSlotBooks: Record<
     string,
@@ -439,7 +421,7 @@ export class TradingEngine {
   private btcTargetUsd: number | null = null;
   /** Rate-limited runtime health logging (RTDS/oracle/cache + positions). */
   private lastRuntimeHealthLogMs: number | null = null;
-  /** Throttle `[EXECUTION] Mode=LIVE …` in `runAutoTradeOnce` (OLA fast lane is sub-second). */
+  /** Throttle `[EXECUTION] Mode=LIVE …` in `runAutoTradeOnce` (anchor fast-lane tick is sub-second). */
   private lastLiveExecEnvLogMs = 0;
   /** When Chainlink never yields a fresh tick, remind about RPC env vars. */
   private chainlinkMissingStreak = 0;
@@ -469,13 +451,8 @@ export class TradingEngine {
   >();
   private priceToBeatByAsset = new Map<string, number>();
   private oracleWindowTrackedByAsset = new Map<string, number>();
-  /** Binance spot @aggTrade — OLA signal vs Gamma price-to-beat. */
+  /** Binance spot @aggTrade — used by lag snipe / shared diagnostics. */
   private binanceAgg = new BinanceAggTradeFeed();
-  /** OLA: USDC spent this 5m window per slug (key slug|windowStartSec). */
-  private olaSpendByWindowKey = new Map<string, number>();
-  /** OLA: settled trade PnL samples for rolling 1h kill switch. */
-  private olaPnlHourly: Array<{ t: number; pnl: number }> = [];
-  private olaKillTriggered = false;
   /** Lag Snipe mode: BTC+ETH, last N seconds, 1m candles; disables GTC + live auto-flatten. */
   private lagSnipeEnabled = false;
   private lagSnipeKlinesCache:
@@ -539,6 +516,13 @@ export class TradingEngine {
   private lastAnchorSignal: AnchorSignal | null = null;
   private lastAnchorWindowKey: string | null = null;
   private anchorTradedThisWindow = false;
+  /** Samples for selective momentum persistence (newest at end). */
+  private selectiveMomentumRecent: number[] = [];
+  /** Virtual MM inventory notionals for logging (SIM). */
+  /** Simulated Polymarket YES-token notional (UP vs DOWN outcome) for MM[PM5m] inventory skew. */
+  private mmPm5mYesUpNotionalUsd = 0;
+  private mmPm5mYesDownNotionalUsd = 0;
+  private mmLastLogMs = 0;
   /** UI/API toggle; Anchor still requires ANCHOR_STRATEGY_ENABLED in .env. */
   private anchorRuntimeEnabled = true;
   /** Skip redundant WS `status` when phase copy is unchanged. */
@@ -675,7 +659,7 @@ export class TradingEngine {
 
   /**
    * Pick active slot from `UPDOWN_ROTATION_ASSETS` order × time bucket — not per-tick round-robin
-   * (so fast OLA polls don’t starve ETH/SOL/XRP when BTC has stronger books).
+   * (so fast anchor-lane ticks don’t starve ETH/SOL/XRP when BTC has stronger books).
    * When several markets are discovered, also advance every `ROTATION_FORCE_MS` so BTC slot 0 cannot monopolize.
    */
   private pickAutoTradeSlotIndex(slots: Array<{ asset: string }>, enabledIndices: number[]): number {
@@ -1164,24 +1148,14 @@ export class TradingEngine {
     switch (kind) {
       case "momentum":
         return "Momentum (chart trend)";
-      case "spot_poly_lag":
-        return "Spot-Poly Lag [SPL]";
-      case "orderbook":
-        return "Order book (mid tilt)";
-      case "mean_revert":
-        return "Mean reversion";
-      case "chart":
-        return "Chart tilt (synthetic)";
-      case "whale_edge":
-        return "Whale edge (time + spread + tilt + optional oracle)";
-      case "ensemble":
-        return "Ensemble (momentum+book+MR+chart+mid-flip+LSC+reversal)";
-      case "ola":
-        return "OLA — Binance vs price-to-beat + CLOB discount snipe";
       case "anchor":
         return "Anchor (book+Chainlink)";
-      case "contrarian":
-        return "Contrarian (.env)";
+      case "market_making":
+        return "Market making (maker sim / gated live)";
+      case "fair_value_arb":
+        return "Fair value arb (executable edge)";
+      case "selective_momentum":
+        return "Selective momentum (sparse)";
       default:
         return kind;
     }
@@ -1217,8 +1191,7 @@ export class TradingEngine {
       if (!id) {
         return {
           ok: false,
-          reason:
-            "strategy must be momentum, spot_poly_lag, orderbook, mean_revert, chart, whale_edge, ensemble, ola, or anchor"
+          reason: "strategy must be momentum, anchor, market_making, fair_value_arb, or selective_momentum"
         };
       }
       this.entryStrategyRuntime = id;
@@ -1451,48 +1424,22 @@ export class TradingEngine {
     return Math.min(2, Math.abs(trend) * scale);
   }
 
-  /** Fade synthetic chart UP% when it leans away from 50. */
-  private basePredictMeanRevert(): { prediction: Direction; confidence: number; ts: number } {
-    const lb = Math.max(3, Math.min(30, envNum("MEAN_REVERT_LOOKBACK", 8)));
-    const recent = this.marketData.slice(-lb);
-    const ts = Date.now();
-    if (recent.length === 0) {
-      return { prediction: "UP", confidence: 92, ts };
-    }
-    const avgUp = recent.reduce((s, p) => s + p.up, 0) / recent.length;
-    const thr = envNum("MEAN_REVERT_THRESHOLD", 2);
-    const direction: Direction = avgUp >= 50 ? "DOWN" : "UP";
-    const edge = Math.abs(avgUp - 50);
-    const strong = edge > thr;
-    const confidence = strong
-      ? Math.min(100, Number((92 + Math.min(6, (edge - thr) * 0.45) + Math.random() * 2).toFixed(2)))
-      : Math.min(93, Number((87 + Math.random() * 2).toFixed(2)));
-    return { prediction: direction, confidence, ts };
-  }
-
-  /** Follow latest chart bar synthetic UP/DOWN tilt. */
-  private basePredictChart(): { prediction: Direction; confidence: number; ts: number } {
-    const last = this.marketData[this.marketData.length - 1];
-    const ts = Date.now();
-    if (!last) return { prediction: "UP", confidence: 92, ts };
-    const direction: Direction = last.up >= 50 ? "UP" : "DOWN";
-    const tilt = Math.abs(last.up - 50);
-    const confidence = Math.min(
-      100,
-      Number((91 + Math.min(8, tilt * 0.35) + Math.random() * 3).toFixed(2))
-    );
-    return { prediction: direction, confidence, ts };
-  }
-
   private basePredict(): { prediction: Direction; confidence: number; ts: number } {
     if (this.lagSnipeEnabled) {
       const ev = this.evaluateLagSnipeDisplay();
       return { prediction: ev.prediction, confidence: ev.confidence, ts: Date.now() };
     }
     const strat = this.effectiveEntryStrategy();
-    if (strat === "ola") {
-      const c = this.getOlaSignalCore();
-      return { prediction: c.prediction, confidence: c.confidence, ts: Date.now() };
+    if (strat === "fair_value_arb") {
+      const ev = this.buildFairValueArbEvaluation();
+      return { prediction: ev.prediction, confidence: ev.confidence, ts: Date.now() };
+    }
+    if (strat === "selective_momentum") {
+      const ev = this.buildSelectiveMomentumEvaluation();
+      return { prediction: ev.prediction, confidence: ev.confidence, ts: Date.now() };
+    }
+    if (strat === "market_making") {
+      return { prediction: "UP", confidence: 50, ts: Date.now() };
     }
     if (strat === "anchor") {
       const side = this.lastAnchorSignal?.side;
@@ -1509,30 +1456,9 @@ export class TradingEngine {
       }
       return { prediction: "UP", confidence: 88, ts: Date.now() };
     }
-    if (strat === "ensemble") {
-      const r = this.buildEnsembleResult();
-      const conf = Math.min(99, 80 + Math.min(18, Math.abs(r.score) * 2.2));
-      return {
-        prediction: r.direction,
-        confidence: Number(conf.toFixed(2)),
-        ts: Date.now()
-      };
-    }
-    if ((strat === "orderbook" || strat === "whale_edge") && this.directionalContext) {
-      const { up, down } = this.directionalContext;
-      const direction: Direction = up.mid >= down.mid ? "UP" : "DOWN";
-      const edge = Math.abs(up.mid - down.mid);
-      const confidenceBase = 92 + Math.min(6, edge * 40);
-      const confidence = Math.min(100, Number((confidenceBase + Math.random() * 2).toFixed(2)));
-      return { prediction: direction, confidence, ts: Date.now() };
-    }
-    if (strat === "mean_revert") return this.basePredictMeanRevert();
-    if (strat === "chart") return this.basePredictChart();
-
     const predictLb = envNum("MOMENTUM_PREDICT_LOOKBACK", 10);
     const trend = this.momentumScalar(predictLb);
-    let direction: Direction = trend >= 0 ? "UP" : "DOWN";
-    if (strat === "contrarian") direction = direction === "UP" ? "DOWN" : "UP";
+    const direction: Direction = trend >= 0 ? "UP" : "DOWN";
     const confidenceBase = 92 + Math.random() * 8;
     const trendBoost = this.trendBoostFromScalar(trend);
     return {
@@ -1545,9 +1471,7 @@ export class TradingEngine {
   private momentumDirection(): Direction {
     const scoreLb = envNum("MOMENTUM_SCORE_LOOKBACK", 8);
     const momentum = this.momentumScalar(scoreLb);
-    const raw = momentum >= 0 ? "UP" : "DOWN";
-    if (this.effectiveEntryStrategy() === "contrarian") return raw === "UP" ? "DOWN" : "UP";
-    return raw;
+    return momentum >= 0 ? "UP" : "DOWN";
   }
 
   /** Raw chart momentum (no contrarian flip) — for BOT_FILTER momentum vs signal agreement. */
@@ -1734,7 +1658,7 @@ export class TradingEngine {
 
   /**
    * Optional `server/config.json`: TRADE_ASSETS, MIN_SIGNAL_CONF, MIN_EDGE, REQUIRE_MOMENTUM_SIGNAL_AGREE.
-   * OLA: only TRADE_ASSETS + MIN_SIGNAL_CONF; book-spread + momentum gates are non-OLA.
+   * Anchor bypasses spread/momentum filters (handled in anchor path).
    */
   private checkConfigTradeFilters(strat: EntryStrategyKind, cfg: BotFiltersConfig): { ok: true } | { ok: false; reason: string } {
     if (this.lagSnipeEnabled) return { ok: true };
@@ -1754,7 +1678,7 @@ export class TradingEngine {
       };
     }
 
-    if (strat === "ola" || strat === "anchor") {
+    if (strat === "anchor") {
       return { ok: true };
     }
 
@@ -1907,6 +1831,51 @@ export class TradingEngine {
     }
   }
 
+  /** Dashboard sync for MM / FVA / SM — overlays book tradability on strategy evaluation. */
+  private finalizeStrategyPrediction(ev: StrategyEvaluation, fromTimer: boolean): void {
+    let recommendation = ev.recommendation;
+    let reason = ev.reason;
+    const base = { prediction: ev.prediction, confidence: ev.confidence, ts: Date.now() };
+    if (this.wallet.hasLiveMarketData() && this.directionalContext) {
+      const upT = this.liveBookTradability(this.directionalContext.up);
+      const downT = this.liveBookTradability(this.directionalContext.down);
+      if (!upT.ok && !downT.ok) {
+        recommendation = "NO_TRADE";
+        reason = `Live books not tradable (both sides): UP — ${upT.detail}; DOWN — ${downT.detail}`;
+      }
+    }
+    const next: Prediction = { ...base, recommendation, reason };
+    let nextPhase: BotPhase;
+    let nextPhaseReason: string;
+    if (recommendation === "NO_TRADE" && reason.includes("Live books not tradable")) {
+      nextPhase = "MARKET_NOT_TRADABLE";
+      nextPhaseReason = reason;
+    } else if (recommendation === "TRADE") {
+      nextPhase = "SIGNAL_READY";
+      nextPhaseReason = `Signal: ${base.prediction} (${base.confidence.toFixed(0)}%)`;
+    } else {
+      nextPhase = "SIGNAL_READY";
+      nextPhaseReason = reason;
+    }
+    const predKey = `${next.prediction}|${next.recommendation}|${next.reason}|${Math.round(next.confidence)}`;
+    const phaseKey = `${nextPhase}|${nextPhaseReason}`;
+    const signalUnchanged = predKey === this.lastBroadcastPredKey && phaseKey === this.lastBroadcastPhaseKey;
+    this.prediction = next;
+    if (!signalUnchanged) {
+      this.lastBroadcastPredKey = predKey;
+      this.lastBroadcastPhaseKey = phaseKey;
+      this.setPhase(nextPhase, nextPhaseReason);
+      this.onPrediction?.(this.prediction);
+    }
+    if (recommendation === "NO_TRADE" && fromTimer) this.noTradeSignals += 1;
+    if (fromTimer && !signalUnchanged) {
+      this.log(
+        "SIGNAL",
+        `${this.prediction.prediction} ${this.prediction.confidence}% (${this.prediction.recommendation})`
+      );
+    }
+  }
+
   /**
    * One source of truth for prediction + phase from chart volatility, strategy, and live CLOB books.
    * Called on the 5s timer (`fromTimer`) and after each CLOB/Gamma book refresh (~4s) so status matches APIs.
@@ -1954,62 +1923,6 @@ export class TradingEngine {
     }
 
     const es = this.effectiveEntryStrategy();
-    if (es === "ola") {
-      const ev = this.getOlaEntryEvaluation();
-      const core = this.getOlaSignalCore();
-      const base = {
-        prediction: ev.skipReason ? core.prediction : ev.direction,
-        confidence: core.confidence,
-        ts: Date.now()
-      };
-      let recommendation: "TRADE" | "NO_TRADE" = ev.skipReason ? "NO_TRADE" : "TRADE";
-      let reason = ev.skipReason ?? ev.reasonLine;
-
-      if (this.wallet.hasLiveMarketData() && this.directionalContext) {
-        const upT = this.liveBookTradability(this.directionalContext.up);
-        const downT = this.liveBookTradability(this.directionalContext.down);
-        if (!upT.ok && !downT.ok) {
-          recommendation = "NO_TRADE";
-          reason = `Live books not tradable (both sides): UP — ${upT.detail}; DOWN — ${downT.detail}`;
-        }
-      }
-
-      const next: Prediction = { ...base, recommendation, reason };
-      let nextPhase: BotPhase;
-      let nextPhaseReason: string;
-      if (recommendation === "NO_TRADE" && reason.includes("Live books not tradable")) {
-        nextPhase = "MARKET_NOT_TRADABLE";
-        nextPhaseReason = reason;
-      } else if (recommendation === "TRADE") {
-        nextPhase = "SIGNAL_READY";
-        nextPhaseReason = `Signal: ${base.prediction} (${base.confidence.toFixed(0)}%)`;
-      } else {
-        nextPhase = "SIGNAL_READY";
-        nextPhaseReason = reason;
-      }
-
-      const predKey = `${next.prediction}|${next.recommendation}|${next.reason}|${Math.round(next.confidence)}`;
-      const phaseKey = `${nextPhase}|${nextPhaseReason}`;
-      const signalUnchanged = predKey === this.lastBroadcastPredKey && phaseKey === this.lastBroadcastPhaseKey;
-
-      this.prediction = next;
-      if (!signalUnchanged) {
-        this.lastBroadcastPredKey = predKey;
-        this.lastBroadcastPhaseKey = phaseKey;
-        this.setPhase(nextPhase, nextPhaseReason);
-        this.onPrediction?.(this.prediction);
-      }
-
-      if (recommendation === "NO_TRADE" && fromTimer) this.noTradeSignals += 1;
-      if (fromTimer && !signalUnchanged) {
-        this.log(
-          "SIGNAL",
-          `${this.prediction.prediction} ${this.prediction.confidence}% (${this.prediction.recommendation})`
-        );
-      }
-      return;
-    }
-
     if (es === "anchor") {
       const base = this.basePredict();
       let recommendation: "TRADE" | "NO_TRADE" = "TRADE";
@@ -2055,6 +1968,28 @@ export class TradingEngine {
       return;
     }
 
+    if (es === "market_making") {
+      const ev = this.buildMarketMakingEvaluation();
+      this.finalizeStrategyPrediction(ev, fromTimer);
+      return;
+    }
+    if (es === "fair_value_arb") {
+      const ev = this.buildFairValueArbEvaluation();
+      this.finalizeStrategyPrediction(ev, fromTimer);
+      return;
+    }
+    if (es === "selective_momentum") {
+      const ev = this.buildSelectiveMomentumEvaluation();
+      this.finalizeStrategyPrediction(ev, fromTimer);
+      if (fromTimer) {
+        const lb = envNum("MOMENTUM_SCORE_LOOKBACK", 8);
+        const sc = this.momentumScalar(lb);
+        this.selectiveMomentumRecent.push(sc);
+        if (this.selectiveMomentumRecent.length > 32) this.selectiveMomentumRecent.shift();
+      }
+      return;
+    }
+
     const base = this.basePredict();
     const volLb = Math.max(4, Math.min(50, envNum("MOMENTUM_VOLATILITY_LOOKBACK", 12)));
     const recent = this.marketData.slice(-volLb);
@@ -2068,19 +2003,9 @@ export class TradingEngine {
         ? base.confidence < 94
           ? "Signal confidence too low"
           : `Short-term volatility high (~$${volatility.toFixed(1)} tick stdev)`
-        : es === "mean_revert"
-          ? `Mean-revert: ${base.prediction} (${base.confidence.toFixed(0)}%)`
-          : es === "chart"
-            ? `Chart tilt: ${base.prediction} (${base.confidence.toFixed(0)}%)`
-            : es === "orderbook"
-              ? `Order book: ${base.prediction} (${base.confidence.toFixed(0)}%)`
-              : es === "whale_edge"
-                ? `Whale edge tilt: ${base.prediction} (${base.confidence.toFixed(0)}%)`
-                : es === "ensemble"
-                  ? `Ensemble: ${base.prediction} (${base.confidence.toFixed(0)}%)`
-              : avgMove >= 0
-                ? "Momentum supports UP bias"
-                : "Momentum supports DOWN bias";
+        : avgMove >= 0
+          ? "Momentum supports UP bias"
+          : "Momentum supports DOWN bias";
 
     if (this.wallet.hasLiveMarketData() && this.directionalContext) {
       const upT = this.liveBookTradability(this.directionalContext.up);
@@ -2275,16 +2200,198 @@ export class TradingEngine {
     };
   }
 
-  private chooseDirectionalEntry(): { direction: Direction; reason: string } {
-    /** OLA must never use book-only or momentum fallbacks — oracle + snipe only. */
-    if (this.effectiveEntryStrategy() === "ola") {
-      const ev = this.getOlaEntryEvaluation();
-      if (ev.skipReason) {
-        return { direction: ev.direction, reason: ev.skipReason };
-      }
-      return { direction: ev.direction, reason: ev.reasonLine };
-    }
+  /** Target mid for paper TP: entry × (1 + relative); capped below 1 (`WHALE_PAPER_TP_*` env). */
+  private paperTakeProfitTargetMid(entryVwap: number, relativeGain: number): number {
+    const r = Math.max(0, relativeGain);
+    return Math.min(0.985, entryVwap * (1 + r));
+  }
 
+  private buildFairValueArbEvaluation(): StrategyEvaluation {
+    const cfg = loadPolymarket5mFairValueArbConfigFromEnv();
+    const asset = this.wallet.getActiveDiscoveredAsset() ?? "BTC";
+    const spot = this.oracleSpotUsdForAsset(asset);
+    const strike = this.priceToBeatByAsset.get(asset) ?? null;
+    const ctx = this.directionalContext;
+    const meta = this.wallet.getDiscoveredMeta();
+    const secLeft =
+      meta?.endDateIso != null
+        ? Math.floor((new Date(meta.endDateIso).getTime() - Date.now()) / 1000)
+        : null;
+    const is5m = isPolymarketCryptoUpDown5mWindow(asset, meta ?? undefined);
+    if (!ctx) {
+      return {
+        prediction: "UP",
+        confidence: 50,
+        recommendation: "NO_TRADE",
+        reason: "FVA[PM5m]: no Polymarket CLOB books for UP/DOWN YES tokens"
+      };
+    }
+    return evaluatePolymarket5mFairValueArb(cfg, {
+      isPolymarketCryptoUpDown5m: is5m,
+      spotUsd: spot,
+      strikeUsd: strike,
+      yesUpTokenBestAsk: ctx.up.bestAsk,
+      yesUpTokenBestBid: ctx.up.bestBid,
+      yesDownTokenBestAsk: ctx.down.bestAsk,
+      yesDownTokenBestBid: ctx.down.bestBid,
+      secToGammaExpiry: secLeft
+    });
+  }
+
+  private buildSelectiveMomentumEvaluation(): StrategyEvaluation {
+    const cfg = loadPolymarket5mSelectiveMomentumConfigFromEnv();
+    const lb = envNum("MOMENTUM_SCORE_LOOKBACK", 8);
+    const momentumScalar = this.momentumScalar(lb);
+    const ctx = this.directionalContext;
+    const meta = this.wallet.getDiscoveredMeta();
+    const secLeft =
+      meta?.endDateIso != null
+        ? Math.floor((new Date(meta.endDateIso).getTime() - Date.now()) / 1000)
+        : null;
+    const asset = this.wallet.getActiveDiscoveredAsset();
+    const is5m = isPolymarketCryptoUpDown5mWindow(asset, meta ?? undefined);
+    if (!ctx) {
+      return {
+        prediction: "UP",
+        confidence: 50,
+        recommendation: "NO_TRADE",
+        reason: "SM[PM5m]: no Polymarket CLOB books for YES tokens"
+      };
+    }
+    const chosenYesTokenAsk = momentumScalar >= 0 ? ctx.up.bestAsk : ctx.down.bestAsk;
+    const chosenYesTokenBid = momentumScalar >= 0 ? ctx.up.bestBid : ctx.down.bestBid;
+    return evaluatePolymarket5mSelectiveMomentum(cfg, {
+      isPolymarketCryptoUpDown5m: is5m,
+      momentumScalar,
+      recentScalars: this.selectiveMomentumRecent,
+      yesUpOutcome: {
+        mid: ctx.up.mid,
+        spread: ctx.up.spread,
+        bestBid: ctx.up.bestBid,
+        bestAsk: ctx.up.bestAsk
+      },
+      yesDownOutcome: {
+        mid: ctx.down.mid,
+        spread: ctx.down.spread,
+        bestBid: ctx.down.bestBid,
+        bestAsk: ctx.down.bestAsk
+      },
+      chosenYesTokenAsk,
+      chosenYesTokenBid,
+      secToGammaExpiry: secLeft
+    });
+  }
+
+  /** Maker path: logs / SIM inventory only — no `trade()` taker entries. */
+  private async runMarketMakingAutoOnce(anchorFastLaneTick: boolean): Promise<void> {
+    if (anchorFastLaneTick) return;
+    const cfg = loadPolymarket5mMarketMakingConfigFromEnv();
+    const ctx = this.directionalContext;
+    const meta = this.wallet.getDiscoveredMeta();
+    const asset = this.wallet.getActiveDiscoveredAsset();
+    const secLeft =
+      meta?.endDateIso != null
+        ? Math.floor((new Date(meta.endDateIso).getTime() - Date.now()) / 1000)
+        : null;
+    const ws = meta?.windowStartSec;
+    const secSinceOpen = ws != null ? Math.max(0, Math.floor(Date.now() / 1000 - ws)) : null;
+    const wk = polymarket5mWindowKey(meta);
+    const is5m = isPolymarketCryptoUpDown5mWindow(asset, meta ?? undefined);
+    const isLive = this.wallet.getMode() === "LIVE";
+    if (!ctx || !this.wallet.hasLiveMarketData()) {
+      return;
+    }
+    const ev = evaluatePolymarket5mMarketMaking(cfg, {
+      isPolymarketCryptoUpDown5m: is5m,
+      gammaWindowKey: wk,
+      secToGammaExpiry: secLeft,
+      secSinceWindowOpen: secSinceOpen,
+      yesUpOutcome: {
+        bestBid: ctx.up.bestBid,
+        bestAsk: ctx.up.bestAsk,
+        spread: ctx.up.spread,
+        depthLiquidity: ctx.up.liquidity
+      },
+      yesDownOutcome: {
+        bestBid: ctx.down.bestBid,
+        bestAsk: ctx.down.bestAsk,
+        spread: ctx.down.spread,
+        depthLiquidity: ctx.down.liquidity
+      },
+      inventoryYesUpUsd: this.mmPm5mYesUpNotionalUsd,
+      inventoryYesDownUsd: this.mmPm5mYesDownNotionalUsd,
+      isLive
+    });
+    const now = Date.now();
+    if (now - this.mmLastLogMs >= cfg.repriceMinMs) {
+      this.mmLastLogMs = now;
+      this.log("SIGNAL", `[MM][PM5m][AUTO] ${ev.reason} quote=${ev.quoteNote}`);
+    }
+    if (!isLive && ev.recommendation === "TRADE" && ev.quoteNote === "quote_ok") {
+      const tiny = Math.max(0, Number(process.env.MM_SIM_INVENTORY_TICK_USD ?? 0.01));
+      if (Number.isFinite(tiny) && tiny > 0) {
+        this.mmPm5mYesUpNotionalUsd += tiny;
+        this.mmPm5mYesDownNotionalUsd += tiny;
+      }
+    }
+  }
+
+  private buildMarketMakingEvaluation(): StrategyEvaluation & { quoteNote: string } {
+    const cfg = loadPolymarket5mMarketMakingConfigFromEnv();
+    const ctx = this.directionalContext;
+    const meta = this.wallet.getDiscoveredMeta();
+    const asset = this.wallet.getActiveDiscoveredAsset();
+    const secLeft =
+      meta?.endDateIso != null
+        ? Math.floor((new Date(meta.endDateIso).getTime() - Date.now()) / 1000)
+        : null;
+    const ws = meta?.windowStartSec;
+    const secSinceOpen = ws != null ? Math.max(0, Math.floor(Date.now() / 1000 - ws)) : null;
+    const wk = polymarket5mWindowKey(meta);
+    const is5m = isPolymarketCryptoUpDown5mWindow(asset, meta ?? undefined);
+    const isLive = this.wallet.getMode() === "LIVE";
+    if (!ctx) {
+      return {
+        prediction: "UP",
+        confidence: 50,
+        recommendation: "NO_TRADE",
+        reason: "MM[PM5m]: no Polymarket CLOB books for YES tokens",
+        quoteNote: "none"
+      };
+    }
+    return evaluatePolymarket5mMarketMaking(cfg, {
+      isPolymarketCryptoUpDown5m: is5m,
+      gammaWindowKey: wk,
+      secToGammaExpiry: secLeft,
+      secSinceWindowOpen: secSinceOpen,
+      yesUpOutcome: {
+        bestBid: ctx.up.bestBid,
+        bestAsk: ctx.up.bestAsk,
+        spread: ctx.up.spread,
+        depthLiquidity: ctx.up.liquidity
+      },
+      yesDownOutcome: {
+        bestBid: ctx.down.bestBid,
+        bestAsk: ctx.down.bestAsk,
+        spread: ctx.down.spread,
+        depthLiquidity: ctx.down.liquidity
+      },
+      inventoryYesUpUsd: this.mmPm5mYesUpNotionalUsd,
+      inventoryYesDownUsd: this.mmPm5mYesDownNotionalUsd,
+      isLive
+    });
+  }
+
+  private chooseDirectionalEntry(): { direction: Direction; reason: string } {
+    const strat = this.effectiveEntryStrategy();
+    if (strat === "fair_value_arb") {
+      const ev = this.buildFairValueArbEvaluation();
+      return { direction: ev.prediction, reason: ev.reason };
+    }
+    if (strat === "selective_momentum") {
+      const ev = this.buildSelectiveMomentumEvaluation();
+      return { direction: ev.prediction, reason: ev.reason };
+    }
     if (this.wallet.hasLiveMarketData() && this.directionalContext) {
       const { up, down } = this.directionalContext;
       const upOk = this.liveBookTradability(up).ok;
@@ -2295,52 +2402,6 @@ export class TradingEngine {
       if (!upOk && downOk) {
         return { direction: "DOWN", reason: "Books: only DOWN passes filters (UP untradeable)" };
       }
-    }
-
-    if (this.effectiveEntryStrategy() === "ensemble") {
-      if (this.directionalContext && this.wallet.hasLiveMarketData()) {
-        const { up, down } = this.directionalContext;
-        const upOk = this.liveBookTradability(up).ok;
-        const downOk = this.liveBookTradability(down).ok;
-        if (upOk && downOk) {
-          const r = this.buildEnsembleResult();
-          return {
-            direction: r.direction,
-            reason: `ensemble score=${r.score.toFixed(3)} | ${r.parts.join(" · ")}`
-          };
-        }
-      }
-      const r = this.buildEnsembleResult();
-      return {
-        direction: r.direction,
-        reason: `ensemble(fallback) score=${r.score.toFixed(3)} | ${r.parts.join(" · ")}`
-      };
-    }
-
-    const esChoose = this.effectiveEntryStrategy();
-    if ((esChoose === "orderbook" || esChoose === "whale_edge") && this.directionalContext) {
-      const { up, down } = this.directionalContext;
-      const upOk = this.liveBookTradability(up).ok;
-      const downOk = this.liveBookTradability(down).ok;
-      if (upOk && downOk) {
-        const direction: Direction = up.mid >= down.mid ? "UP" : "DOWN";
-        const edge = Math.abs(up.mid - down.mid);
-        return {
-          direction,
-          reason:
-            esChoose === "whale_edge"
-              ? `whale_edge: UP=${up.mid.toFixed(4)} DN=${down.mid.toFixed(4)} edge=${edge.toFixed(4)}`
-              : `orderbook: mid UP=${up.mid.toFixed(4)} DOWN=${down.mid.toFixed(4)}`
-        };
-      }
-    }
-
-    const strat = this.effectiveEntryStrategy();
-    if (strat === "mean_revert" || strat === "chart") {
-      return {
-        direction: this.prediction.prediction,
-        reason: `${strat}: signal ${this.prediction.prediction} @ ${this.prediction.confidence.toFixed(1)}%`
-      };
     }
 
     let scoreUp = 0;
@@ -2361,238 +2422,6 @@ export class TradingEngine {
     }
     const direction = scoreUp >= 0 ? "UP" : "DOWN";
     return { direction, reason: reasons.join(" | ") };
-  }
-
-  private getEnsembleSamplesForActive(): MidSample[] {
-    const slug = this.wallet.getActiveDiscoveredSlug() ?? "_default";
-    return [...(this.ensembleMidBySlug.get(slug) ?? [])];
-  }
-
-  private pushEnsembleSampleForSlug(slug: string, upMid: number, downMid: number) {
-    const row: MidSample = { t: Date.now(), upMid, downMid };
-    let ring = this.ensembleMidBySlug.get(slug) ?? [];
-    ring = [...ring, row];
-    const maxR = Math.max(8, Math.min(80, envNum("ENSEMBLE_MID_RING_MAX", 40)));
-    while (ring.length > maxR) ring.shift();
-    this.ensembleMidBySlug.set(slug, ring);
-    while (this.ensembleMidBySlug.size > 36) {
-      const k = this.ensembleMidBySlug.keys().next().value;
-      if (k) this.ensembleMidBySlug.delete(k);
-      else break;
-    }
-  }
-
-  /** One sample per asset/slug each book refresh (multi-asset round-robin gets correct history). */
-  private recordEnsembleRingsForAllSlots(
-    slots: Array<{ asset: string; slug: string }>,
-    entries: Array<readonly [string, { up: { mid: number }; down: { mid: number } }]>
-  ) {
-    const byAsset = new Map<string, { up: { mid: number }; down: { mid: number } }>(entries);
-    for (const s of slots) {
-      const b = byAsset.get(s.asset);
-      if (!b) continue;
-      this.pushEnsembleSampleForSlug(s.slug, b.up.mid, b.down.mid);
-    }
-  }
-
-  private recordEnsembleMidSample() {
-    if (!this.directionalContext) return;
-    const slug = this.wallet.getActiveDiscoveredSlug() ?? "_default";
-    const { up, down } = this.directionalContext;
-    this.pushEnsembleSampleForSlug(slug, up.mid, down.mid);
-  }
-
-  /** OLA: Binance last trade vs engine price-to-beat (Gamma / RTDS anchor). */
-  private getOlaSignalCore(): {
-    prediction: Direction;
-    confidence: number;
-    oracle: ReturnType<typeof olaOracleVersusTarget>;
-    binance: number | null;
-    target: number | null;
-    asset: string | null;
-    binanceStale: boolean;
-  } {
-    const asset = this.wallet.getActiveDiscoveredAsset();
-    const staleMax = envNum("OLA_BINANCE_MAX_STALE_MS", 3000);
-    if (!asset) {
-      return {
-        prediction: "UP",
-        confidence: 55,
-        oracle: { kind: "flat", edgeUsd: 0 },
-        binance: null,
-        target: null,
-        asset: null,
-        binanceStale: true
-      };
-    }
-    const bin = this.binanceAgg.getPrice(asset);
-    const stale = bin == null || this.binanceAgg.ageMs(asset) > staleMax;
-    const targetN = this.priceToBeatByAsset.get(asset);
-    const target = targetN != null && Number.isFinite(targetN) && targetN > 0 ? targetN : null;
-    const th = olaThresholdUsd();
-    const oracle =
-      bin != null && target != null ? olaOracleVersusTarget(bin, target, th) : { kind: "flat" as const, edgeUsd: 0 };
-    const dir = olaDirectionFromOracle(oracle) ?? ("UP" as Direction);
-    const edgeUsd = oracle.edgeUsd;
-    const confBase = oracle.kind === "flat" ? 58 : 84;
-    const confidence = Math.min(
-      99,
-      Number((confBase + Math.min(14, edgeUsd / Math.max(1, (target ?? 1) * 0.00015))).toFixed(2))
-    );
-    return {
-      prediction: dir,
-      confidence,
-      oracle,
-      binance: bin,
-      target,
-      asset,
-      binanceStale: stale
-    };
-  }
-
-  /** OLA entry path: oracle direction + CLOB “discount” snipe on the winning side. */
-  private getOlaEntryEvaluation(): {
-    skipReason: string | null;
-    direction: Direction;
-    reasonLine: string;
-  } {
-    const core = this.getOlaSignalCore();
-    if (!this.wallet.hasLiveMarketData() || !this.directionalContext) {
-      return {
-        skipReason: "OLA_SKIP: live UP/DOWN books required",
-        direction: core.prediction,
-        reasonLine: ""
-      };
-    }
-    if (!core.asset) {
-      return { skipReason: "OLA_SKIP: no active asset", direction: "UP", reasonLine: "" };
-    }
-    if (core.binanceStale || core.binance == null) {
-      return {
-        skipReason: "OLA_SKIP: Binance aggTrade stale or missing",
-        direction: core.prediction,
-        reasonLine: ""
-      };
-    }
-    if (core.target == null) {
-      return {
-        skipReason: "OLA_SKIP: no price-to-beat",
-        direction: core.prediction,
-        reasonLine: ""
-      };
-    }
-    const oracleDir = olaDirectionFromOracle(core.oracle);
-    if (!oracleDir) {
-      return {
-        skipReason: `OLA_SKIP: oracle flat (within ±$${olaThresholdUsd()})`,
-        direction: core.prediction,
-        reasonLine: ""
-      };
-    }
-    const { up, down } = this.directionalContext;
-    const snipe = olaBookSnipeAllowed(oracleDir, up, down, olaSnipeAskCap());
-    if (!snipe.ok) {
-      return { skipReason: snipe.detail, direction: oracleDir, reasonLine: "" };
-    }
-    const reasonLine =
-      `OLA: ${oracleDir} Binance=${core.binance.toFixed(2)} target=${core.target.toFixed(2)} edge~${core.oracle.edgeUsd.toFixed(2)} USD | UPmid=${up.mid.toFixed(3)} DNmid=${down.mid.toFixed(3)}`;
-    return { skipReason: null, direction: oracleDir, reasonLine };
-  }
-
-  private maybeRecordOlaPnlAndCheckKill(trade: Trade, pnl: number) {
-    const dr = trade.decisionReason ?? "";
-    if (!dr.startsWith("OLA:") || dr.startsWith("OLA_SKIP")) return;
-    const now = Date.now();
-    const winStart = now - OLA_KILL_WINDOW_MS;
-    this.olaPnlHourly = this.olaPnlHourly.filter((e) => e.t > winStart);
-    this.olaPnlHourly.push({ t: now, pnl });
-    const net = this.olaPnlHourly.reduce((s, e) => s + e.pnl, 0);
-    const bal = Math.max(1, this.balance);
-    const thrLoss = bal * OLA_KILL_SWITCH_LOSS_FRAC;
-    if (net <= -thrLoss) {
-      this.olaKillTriggered = true;
-      this.running = false;
-      this.autoTrading = false;
-      this.log(
-        "ERROR",
-        `OLA_KILL_SWITCH: 1h net PnL $${net.toFixed(2)} (≤ -${(OLA_KILL_SWITCH_LOSS_FRAC * 100).toFixed(0)}% of balance ~$${thrLoss.toFixed(2)}) — engine stopped (admin alert)`
-      );
-      this.setPhase("ERROR", "OLA hourly loss kill switch");
-    }
-  }
-
-  private buildEnsembleResult() {
-    const samples = this.getEnsembleSamplesForActive();
-    const predictLb = envNum("MOMENTUM_PREDICT_LOOKBACK", 10);
-    const mt = this.momentumScalar(predictLb);
-    const div = momentumMode() === "from_open" ? 500 : 120;
-    const momNorm = Math.max(-1, Math.min(1, mt / div));
-    const last = this.marketData.at(-1);
-    const chartUp = last?.up ?? null;
-    const useCtr = String(process.env.ENSEMBLE_USE_CONTRARIAN_MOMENTUM ?? "false").toLowerCase() === "true";
-    const meta = this.wallet.getDiscoveredMeta();
-    let secondsToExpiry: number | null = null;
-    if (meta?.endDateIso) {
-      const end = new Date(meta.endDateIso).getTime();
-      if (!Number.isNaN(end)) secondsToExpiry = Math.floor((end - Date.now()) / 1000);
-    }
-    if (!this.directionalContext) {
-      const direction: Direction = momNorm >= 0 ? "UP" : "DOWN";
-      return { score: momNorm, direction, parts: [`mom_only:${momNorm.toFixed(2)}`] };
-    }
-    const { up, down } = this.directionalContext;
-    return computeEnsemble({
-      samples,
-      up,
-      down,
-      secondsToExpiry,
-      momentumTrend: momNorm,
-      chartUpPct: chartUp,
-      useContrarianMomentum: useCtr
-    });
-  }
-
-  /** Auto-trade: whale_edge gates, or ensemble + ENSEMBLE_APPLY_WHALE_FILTER. */
-  private whaleEdgeGateOrOk(direction: Direction): { ok: true } | { ok: false; reason: string } {
-    if (this.lagSnipeEnabled) return { ok: true };
-    const strat = this.effectiveEntryStrategy();
-    const useWhale =
-      strat === "whale_edge" ||
-      (strat === "ensemble" && ensembleApplyWhaleFilter()) ||
-      (strat === "ola" && olaUseWhaleFilter());
-    if (!useWhale) return { ok: true };
-    if (!this.directionalContext || !this.wallet.hasLiveMarketData()) {
-      return {
-        ok: false,
-        reason: strat === "ensemble" ? "ensemble_whale: need live UP/DOWN books" : "whale_edge: need live UP/DOWN books"
-      };
-    }
-    const timing = this.wallet.getTimingForBetLog();
-    const meta = this.wallet.getDiscoveredMeta();
-    let secondsToExpiry: number | null = null;
-    if (meta?.endDateIso) {
-      const end = new Date(meta.endDateIso).getTime();
-      if (!Number.isNaN(end)) secondsToExpiry = Math.floor((end - Date.now()) / 1000);
-    }
-    const asset = this.wallet.getActiveDiscoveredAsset();
-    let oracleDiffUsd: number | null = null;
-    if (asset) {
-      const spot = this.oracleSpotUsdForAsset(asset);
-      const ptb = this.priceToBeatByAsset.get(asset);
-      if (spot != null && ptb != null && Number.isFinite(spot) && Number.isFinite(ptb)) {
-        oracleDiffUsd = spot - ptb;
-      }
-    }
-    const { up, down } = this.directionalContext;
-    return evaluateWhaleEdgeGate({
-      direction,
-      up,
-      down,
-      secondsSinceWindowStart: timing.secondsSinceWindowStart,
-      secondsToExpiry,
-      warmupWindow: timing.warmupWindow,
-      oracleDiffUsd
-    });
   }
 
   /**
@@ -2619,7 +2448,7 @@ export class TradingEngine {
     maxWaitMs: number,
     tpRelative: number
   ) {
-    const target = whalePaperTakeProfitMid(entryVwap, tpRelative);
+    const target = this.paperTakeProfitTargetMid(entryVwap, tpRelative);
     const pollMs = Math.max(500, Number(process.env.WHALE_PAPER_TP_POLL_MS ?? 2000));
     const t0 = Date.now();
     while (Date.now() - t0 < maxWaitMs) {
@@ -2818,21 +2647,18 @@ export class TradingEngine {
   }
 
   /**
-   * Auto-trade tick. When `olaFastLane` is true, only runs if ENTRY_STRATEGY is OLA (fast poll, default 250ms).
-   * Otherwise runs on the 5s cadence for all non-OLA strategies.
+   * Auto-trade tick. Fast lane (~250ms) when anchor fast lane is enabled; otherwise 5s cadence for momentum.
    */
-  private async runAutoTradeOnce(olaFastLane: boolean) {
+  private async runAutoTradeOnce(anchorFastLaneTick: boolean) {
     if (!this.running || !this.autoTrading) return;
-    if (this.olaKillTriggered) return;
     const strategy = this.effectiveEntryStrategy();
-    const isOla = strategy === "ola";
     const isAnchor = strategy === "anchor";
     const allowAnchorFastLane = isAnchor && this.anchorFastLaneEnabled();
     if (this.lagSnipeEnabled) {
-      if (olaFastLane) return;
+      if (anchorFastLaneTick) return;
     } else {
-      if (olaFastLane && !isOla && !allowAnchorFastLane) return;
-      if (!olaFastLane && (isOla || allowAnchorFastLane)) return;
+      if (anchorFastLaneTick && !allowAnchorFastLane) return;
+      if (!anchorFastLaneTick && allowAnchorFastLane) return;
     }
     if (this.bookRefreshInFlight) return;
     this.maybeLogRuntimeHealth();
@@ -2886,8 +2712,7 @@ export class TradingEngine {
       if (
         this.wallet.getMode() === "SIMULATION" &&
         paperBinarySettleEnabled() &&
-        !this.lagSnipeEnabled &&
-        !isOla
+        !this.lagSnipeEnabled
       ) {
         const metaClose = this.wallet.getDiscoveredMeta();
         if (metaClose?.endDateIso) {
@@ -2921,7 +2746,7 @@ export class TradingEngine {
       if (isAnchor) {
         this.maybeRotateAnchorWindow();
         await this.recordAnchorBuffers();
-        if (!olaFastLane) {
+        if (!anchorFastLaneTick) {
           await this.monitorAnchorExits();
         }
         const asset = this.wallet.getActiveDiscoveredAsset() ?? "?";
@@ -2961,8 +2786,13 @@ export class TradingEngine {
         return;
       }
 
+      if (strategy === "market_making") {
+        await this.runMarketMakingAutoOnce(anchorFastLaneTick);
+        return;
+      }
+
       const assetGate = this.wallet.getActiveDiscoveredAsset() ?? "BTC";
-      if (!this.lagSnipeEnabled && !isOla) {
+      if (!this.lagSnipeEnabled) {
         const oEnv = loadOracleGateEnv();
         const gateAgeMs = this.oracleEntryAgeMsForGate(assetGate);
         const staleCls = classifyOracleStale(gateAgeMs, oEnv);
@@ -2989,7 +2819,7 @@ export class TradingEngine {
         }
       }
 
-      if (!this.lagSnipeEnabled && !isOla) {
+      if (!this.lagSnipeEnabled) {
         const metaLw = this.wallet.getDiscoveredMeta();
         if (metaLw?.endDateIso) {
           const endLw = new Date(metaLw.endDateIso).getTime();
@@ -3010,26 +2840,18 @@ export class TradingEngine {
 
       this.maybeRotateAnchorWindow();
       await this.recordAnchorBuffers();
-      if (!olaFastLane) {
+      if (!anchorFastLaneTick) {
         await this.monitorAnchorExits();
       }
 
       const choice = this.chooseDirectionalEntry();
-      if (choice.reason.startsWith("OLA_SKIP:") || choice.reason.startsWith("LAG_SNIPE_SKIP:")) {
-        const asset = this.wallet.getActiveDiscoveredAsset() ?? "?";
-        const r = choice.reason.startsWith("OLA_SKIP:") ? "ola_skip" : "lag_snipe_skip";
-        this.log("SIGNAL", `[AUTO][SKIP] asset=${asset} reason=${r} detail=${choice.reason}`);
-        return;
-      }
 
       this.log(
         "SIGNAL",
         `[AUTO] asset=${this.wallet.getActiveDiscoveredAsset() ?? "?"} dir=${choice.direction} ${choice.reason}`
       );
       const direction = choice.direction;
-      /** OLA ignores global NO_TRADE from chart/volatility — entries follow oracle+book snipe only. */
       if (
-        !isOla &&
         !this.lagSnipeEnabled &&
         this.prediction.recommendation === "NO_TRADE" &&
         !this.canIgnoreNoTradeForBookOnlyBlock("AUTO")
@@ -3038,7 +2860,7 @@ export class TradingEngine {
         await this.runAnchorFallbackNonPrimary();
         return;
       }
-      if (!isOla && !this.lagSnipeEnabled) {
+      if (!this.lagSnipeEnabled) {
         const oEnv = loadOracleGateEnv();
         const metaOg = this.wallet.getDiscoveredMeta();
         const wsSec = metaOg?.windowStartSec;
@@ -3102,12 +2924,6 @@ export class TradingEngine {
           "SIGNAL",
           `[AUTO][ORACLE_OK] asset=${assetGate} trend=${dirGate.trend} deltaBps=${dirGate.deltaBps.toFixed(0)} flips=${dirGate.flips} oppTicks=${dirGate.oppTicks}${okExtra}`
         );
-      }
-      const whaleGate = this.whaleEdgeGateOrOk(direction);
-      if (!whaleGate.ok) {
-        this.log("SIGNAL", whaleGate.reason);
-        await this.runAnchorFallbackNonPrimary();
-        return;
       }
       const { amount: riskAmount, budget } = await this.computeAutoTradeAmount();
       if (riskAmount < this.effMinTrade()) {
@@ -3540,9 +3356,7 @@ export class TradingEngine {
     const updAssets = process.env.UPDOWN_ASSETS ?? process.env.UPDOWN_ASSET ?? "BTC";
     const eff = parseEnvEntryStrategy();
     const stratNote =
-      eff === "ola"
-        ? "OLA=oracle+Binance only (MOMENTUM_MODE ignored)"
-        : `MOMENTUM_MODE=${momentumMode()}`;
+      eff === "anchor" ? "ANCHOR_STRATEGY (MOMENTUM_MODE ignored for signal path)" : `MOMENTUM_MODE=${momentumMode()}`;
     this.log(
       "SIGNAL",
       `Engine initialized in ${this.wallet.getMode()} mode (ENTRY_STRATEGY=${eff}${this.entryStrategyRuntime ? ` override=${this.entryStrategyRuntime}` : ""}, ${stratNote}, UPDOWN_5M=${updAssets})`
@@ -3586,16 +3400,7 @@ export class TradingEngine {
     if (autoStart) {
       this.log("TRADE", "Auto-trading enabled on startup");
     }
-    if (this.effectiveEntryStrategy() === "ola") {
-      const core = this.getOlaSignalCore();
-      this.prediction = {
-        prediction: core.prediction,
-        confidence: core.confidence,
-        ts: Date.now(),
-        recommendation: "TRADE",
-        reason: "OLA: Binance + price-to-beat (no momentum blend)"
-      };
-    } else if (this.effectiveEntryStrategy() === "anchor") {
+    if (this.effectiveEntryStrategy() === "anchor") {
       const b = this.basePredict();
       this.prediction = {
         ...b,
@@ -3836,7 +3641,6 @@ export class TradingEngine {
             }
 
             this.multiSlotBooks = Object.fromEntries(entries);
-            this.recordEnsembleRingsForAllSlots(slots, entries);
 
             for (const { s, g } of gammaResults) {
               const assetUpper = s.asset.trim().toUpperCase();
@@ -3939,7 +3743,6 @@ export class TradingEngine {
             this.chainlinkLastSuccessfulFetchMs.clear();
             this.lastChainlinkLiveLogKeyByAsset.clear();
             this.chainlinkInvalidAnswerTsWarned.clear();
-            this.recordEnsembleMidSample();
           }
           this.lastBookRefreshMs = Date.now();
           this.synchronizeLivePredictionAndPhase(false);
@@ -4019,7 +3822,6 @@ export class TradingEngine {
         ]);
         this.marketContext = mc2;
         this.directionalContext = dc2;
-        this.recordEnsembleMidSample();
       } finally {
         this.wallet.clearBookPrime();
       }
@@ -4042,7 +3844,6 @@ export class TradingEngine {
       balance: this.balance,
       cooldownMs: this.effCooldownMs(),
       stopLossTriggered: this.stopLossTriggered,
-      olaKillTriggered: this.olaKillTriggered,
       phase: this.phase,
       phaseReason: this.phaseReason,
       paperTrading: paperTradingEnv(),
@@ -4266,7 +4067,7 @@ export class TradingEngine {
     book: MarketContext
   ): { ok: true } | { ok: false; code: string; detail: string } {
     if (this.lagSnipeEnabled) return { ok: true };
-    if (this.effectiveEntryStrategy() === "ola" || this.effectiveEntryStrategy() === "anchor") {
+    if (this.effectiveEntryStrategy() === "anchor") {
       return { ok: true };
     }
     const c = this.prediction.confidence;
@@ -4549,10 +4350,6 @@ export class TradingEngine {
       this.setPhase("ERROR", "Stop loss triggered");
       return { accepted: false, reason: "Stop loss triggered" };
     }
-    if (this.olaKillTriggered) {
-      this.setPhase("ERROR", "OLA hourly kill switch");
-      return { accepted: false, reason: "OLA hourly kill switch triggered" };
-    }
     if (this.lagSnipeEnabled) {
       // User override: lock Lag Snipe to fixed $1 entries.
       amount = 1;
@@ -4570,16 +4367,6 @@ export class TradingEngine {
     if (Date.now() - lastCd < this.effCooldownMs()) {
       this.setPhase("RISK_BLOCKED", "Cooldown active");
       return { accepted: false, reason: "Cooldown active" };
-    }
-
-    if (strat === "ola") {
-      const meta = this.wallet.getDiscoveredMeta();
-      const endParsed = meta?.endDateIso ? new Date(meta.endDateIso).getTime() : NaN;
-      const secLeft = !Number.isNaN(endParsed) ? Math.floor((endParsed - Date.now()) / 1000) : null;
-      if (olaSecondsToExpiryAbort(secLeft)) {
-        this.setPhase("RISK_BLOCKED", "OLA: <10s to expiry");
-        return { accepted: false, reason: "OLA: <10s to window end — no new trades" };
-      }
     }
 
     if (this.lagSnipeEnabled) {
@@ -4611,7 +4398,6 @@ export class TradingEngine {
     }
 
     if (
-      strat !== "ola" &&
       !anchorAutoAnchorPath &&
       !this.lagSnipeEnabled &&
       this.prediction.recommendation === "NO_TRADE" &&
@@ -4628,7 +4414,7 @@ export class TradingEngine {
     }
 
     const book = this.liveBookForDirection(direction);
-    if (strat !== "ola" && strat !== "anchor" && !this.lagSnipeEnabled && signalModeHighConf()) {
+    if (strat !== "anchor" && !this.lagSnipeEnabled && signalModeHighConf()) {
       const thr = highConfMidThreshold();
       const mid = book.mid;
       const c = this.prediction.confidence;
@@ -4734,38 +4520,6 @@ export class TradingEngine {
       }
     }
 
-    if (strat === "ola") {
-      const slug = this.wallet.getActiveDiscoveredSlug();
-      const wk = this.wallet.getDiscoveredMeta()?.windowStartSec;
-      if (slug != null) {
-        const spendKey = `${slug}|${wk ?? "_"}`;
-        const cap = olaWindowSpendCap();
-        const cur = this.olaSpendByWindowKey.get(spendKey) ?? 0;
-        if (cur + effectiveAmount > cap + 1e-9) {
-          this.setPhase("RISK_BLOCKED", "OLA window cap");
-          return {
-            accepted: false,
-            reason: `OLA: per-window cap (${cur.toFixed(2)} + ${effectiveAmount.toFixed(2)} > $${cap} USDC)`
-          };
-        }
-      }
-      const olaAsset = this.wallet.getActiveDiscoveredAsset();
-      if (olaAsset) {
-        const p0 = this.binanceAgg.getPrice(olaAsset);
-        const txMs = Math.max(0, envNum("OLA_TRANSMIT_SIM_MS", 25));
-        if (txMs > 0) await new Promise((r) => setTimeout(r, txMs));
-        const p1 = this.binanceAgg.getPrice(olaAsset);
-        const slipFrac = slippageFracFromConfig(botCfg, OLA_SLIPPAGE_FRAC);
-        if (p0 != null && p1 != null && olaSlippageExceeded(p0, p1, slipFrac)) {
-          this.setPhase("RISK_BLOCKED", "OLA Binance slippage");
-          return {
-            accepted: false,
-            reason: `OLA: Binance moved >${(slipFrac * 100).toFixed(2)}% during transmit (aborted)`
-          };
-        }
-      }
-    }
-
     const entrySnap = this.tradeEntrySnapshot();
     const entryAsset = (entrySnap.asset ?? this.wallet.getActiveDiscoveredAsset() ?? "").toUpperCase();
     const targetAtEntry =
@@ -4814,17 +4568,6 @@ export class TradingEngine {
       }
       this.lastTradeAtBySlug.set(cdKey, Date.now());
       this.trades = [pendingRow, ...this.trades].slice(0, 250);
-      if (strat === "ola") {
-        const slug = this.wallet.getActiveDiscoveredSlug();
-        const wk = this.wallet.getDiscoveredMeta()?.windowStartSec;
-        if (slug != null) {
-          const spendKey = `${slug}|${wk ?? "_"}`;
-          this.olaSpendByWindowKey.set(
-            spendKey,
-            (this.olaSpendByWindowKey.get(spendKey) ?? 0) + effectiveAmount
-          );
-        }
-      }
       this.onTrades?.(this.trades);
       const metaPlaced = this.wallet.getDiscoveredMeta();
       const wsSuffix =
@@ -5337,7 +5080,6 @@ export class TradingEngine {
     });
     this.balance += settled.pnl;
     this.trades[idx] = settled;
-    this.maybeRecordOlaPnlAndCheckKill(settled, settled.pnl);
     this.finalizeBtc5mAutoAnalytics(t.id, settled, payoutPerShare, pnl);
     const drawdown = START_BALANCE - this.balance;
     if (drawdown >= this.effStopLossUsd()) {
@@ -5456,7 +5198,6 @@ export class TradingEngine {
       });
       this.balance += settled.pnl;
       this.trades[idx] = settled;
-      this.maybeRecordOlaPnlAndCheckKill(settled, settled.pnl);
       this.finalizeBtc5mAutoAnalytics(t.id, settled, fill.vwap, settled.pnl);
 
       const drawdown = START_BALANCE - this.balance;
@@ -5551,7 +5292,6 @@ export class TradingEngine {
     };
     this.balance += settled.pnl;
     this.trades[idx] = settled;
-    this.maybeRecordOlaPnlAndCheckKill(settled, settled.pnl);
     this.finalizeBtc5mAutoAnalytics(t.id, settled, payoutPerShare, pnl);
     const drawdown = START_BALANCE - this.balance;
     if (drawdown >= this.effStopLossUsd()) {
@@ -5832,7 +5572,6 @@ export class TradingEngine {
     };
     this.balance += settled.pnl;
     this.trades[idx] = settled;
-    this.maybeRecordOlaPnlAndCheckKill(settled, settled.pnl);
     this.finalizeBtc5mAutoAnalytics(t.id, settled, payoutPerShare, pnl);
 
     const drawdown = START_BALANCE - this.balance;
