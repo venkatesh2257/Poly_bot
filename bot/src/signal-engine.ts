@@ -9,7 +9,8 @@
  * Inspired by: @lunatik_corp's $1.5K→$33K playbook using BS for binary options.
  */
 
-import { binaryOptionFairValue, estimateVolatility } from "./black-scholes.js";
+import { binaryOptionFairValue } from "./black-scholes.js";
+import { BTC_UPDOWN_MARKET_WINDOW_SEC } from "./btcUpdownWindow.js";
 
 export type Direction = "UP" | "DOWN" | null;
 
@@ -96,7 +97,7 @@ export function generateSignal(
   currentPrice: number,
   marketUpPrice: number,
   marketDownPrice: number,
-  timeInWindow: number,       // seconds into 5-min window (0-300)
+  timeInWindow: number,       // seconds into the active market window (0 … BTC_UPDOWN_MARKET_WINDOW_SEC)
   config: SignalConfig = DEFAULT_CONFIG,
   bestAsks?: { up: number; down: number }
 ): Signal {
@@ -120,8 +121,11 @@ export function generateSignal(
 
   // ── Check minimum move (time-scaled) ──
   // Earlier in window = needs bigger move (more time for reversal)
-  // At 30s: 2x threshold, at 150s: ~1.3x, at 240s: 1x
-  const timeScale = 1 + (1 - timeInWindow / 240);  // 2.0 at 0s, 1.0 at 240s
+  // Scales to ~1.0 at 80% of the window length (same shape as legacy 5m tuning).
+  const windowSec = BTC_UPDOWN_MARKET_WINDOW_SEC;
+  const scaleRef = windowSec * 0.8;
+  const tw = Math.min(timeInWindow, scaleRef);
+  const timeScale = 1 + (1 - tw / scaleRef); // 2.0 at 0s, 1.0 at 80% of window
   const scaledMinPct = config.minDeltaPercent * timeScale;
   const scaledMinAbs = config.minDeltaAbsolute * timeScale;
 
@@ -130,9 +134,9 @@ export function generateSignal(
     return { direction: null, confidence: 0, reasons, priceDelta, marketPrices, timeInWindow, timestamp: Date.now() };
   }
 
-  // ── Time remaining ──
-  const timeRemainingSeconds = Math.max(300 - timeInWindow, 1);
-  const timeWeight = 0.5 + (timeInWindow / 300) * 0.5; // for logging
+  // ── Time remaining (binary Black–Scholes uses T = time left to expiry) ──
+  const timeRemainingSeconds = Math.max(windowSec - timeInWindow, 1);
+  const timeWeight = 0.5 + (timeInWindow / windowSec) * 0.5; // for logging
 
   // ── Black-Scholes Fair Value ──
   // Use annualized vol estimate. BTC ~50% annual vol baseline,

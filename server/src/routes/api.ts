@@ -355,6 +355,7 @@ export function createApiRouter(
   });
 
   router.post("/anchor-strategy", (req, res) => {
+    if (!requireDashboardAuth(req, res)) return;
     try {
       const enabled = Boolean((req.body as { enabled?: boolean })?.enabled);
       const r = engine.setAnchorStrategyEnabled(enabled);
@@ -533,6 +534,7 @@ export function createApiRouter(
   });
 
   router.post("/market/select", (req, res) => {
+    if (!requireDashboardAuth(req, res)) return;
     const { tokenID } = req.body;
     if (typeof tokenID !== "string") return res.status(400).json({ ok: false, reason: "Invalid tokenID" });
     const ok = engine.selectMarket(tokenID);

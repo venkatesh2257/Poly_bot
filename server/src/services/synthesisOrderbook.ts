@@ -37,11 +37,25 @@ function bestAsk(asks: Map<string, number>): number {
   return best === Infinity ? 1 : best;
 }
 
-function depthSum(m: Map<string, number>, take: number): number {
+/** Best bids first (highest price = near touch). */
+function bidDepthSumNearTouch(m: Map<string, number>, take: number): number {
   const entries = [...m.entries()]
     .map(([k, v]) => ({ p: Number(k), v }))
     .filter((x) => Number.isFinite(x.p) && Number.isFinite(x.v));
   entries.sort((a, b) => b.p - a.p);
+  let s = 0;
+  for (let i = 0; i < Math.min(take, entries.length); i++) {
+    s += entries[i]!.v;
+  }
+  return s;
+}
+
+/** Best asks first (lowest price = near touch). */
+function askDepthSumNearTouch(m: Map<string, number>, take: number): number {
+  const entries = [...m.entries()]
+    .map(([k, v]) => ({ p: Number(k), v }))
+    .filter((x) => Number.isFinite(x.p) && Number.isFinite(x.v));
+  entries.sort((a, b) => a.p - b.p);
   let s = 0;
   for (let i = 0; i < Math.min(take, entries.length); i++) {
     s += entries[i]!.v;
@@ -135,10 +149,18 @@ export class SynthesisPolymarketOrderbookStore {
       }
     }
 
-    if (delta.best_bid != null) {
-      const bb = String(delta.best_bid);
-      if (!cur.bids.has(bb) && numFromStr(delta.best_bid) != null) {
-        /* keep map consistent: trust best hint only if we lack levels */
+    const bbNum = numFromStr(delta.best_bid != null ? String(delta.best_bid) : undefined);
+    if (bbNum != null) {
+      for (const p of [...cur.bids.keys()]) {
+        const pk = Number(p);
+        if (Number.isFinite(pk) && pk > bbNum + 1e-9) cur.bids.delete(p);
+      }
+    }
+    const baNum = numFromStr(delta.best_ask != null ? String(delta.best_ask) : undefined);
+    if (baNum != null) {
+      for (const p of [...cur.asks.keys()]) {
+        const pk = Number(p);
+        if (Number.isFinite(pk) && pk < baNum - 1e-9) cur.asks.delete(p);
       }
     }
     cur.lastUpdateMs = Date.now();
@@ -163,7 +185,7 @@ export class SynthesisPolymarketOrderbookStore {
     }
     const mid = (bb + ba) / 2;
     const spread = ba - bb;
-    const liquidity = depthSum(st.bids, 6) + depthSum(st.asks, 6);
+    const liquidity = bidDepthSumNearTouch(st.bids, 6) + askDepthSumNearTouch(st.asks, 6);
     return {
       tokenID: tokenId,
       mid,

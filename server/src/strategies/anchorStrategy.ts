@@ -88,6 +88,14 @@ export interface AnchorSignal {
  * DOWN trade: require downBidDepthShare < downBidDepthShareMax (e.g. 0.30) — ask-heavy DOWN token book
  *   (weak bids), per original product spec; NOT the same as "high conviction to buy DOWN" in one number.
  */
+/** Parses numeric env without treating `0` as “unset” (unlike `Number(x) || default`). */
+export function parseEnvFiniteNumber(key: string, fallback: number): number {
+  const raw = process.env[key];
+  if (raw == null || String(raw).trim() === "") return fallback;
+  const n = Number(String(raw).trim());
+  return Number.isFinite(n) ? n : fallback;
+}
+
 export function bidDepthShare(bid: number, ask: number): number {
   const s = bid + ask;
   if (s <= 1e-12 || !Number.isFinite(s)) return NaN;
@@ -166,8 +174,10 @@ export function evaluateAnchorStrategy(
   imbalanceHistoryDown: number[],
   config: AnchorStrategyConfig,
   oracleLatestAgeMs?: number | null,
-  chainlinkTimestampsMs?: number[]
+  chainlinkTimestampsMs?: number[],
+  nowMs?: number
 ): AnchorSignal {
+  const clock = nowMs !== undefined && Number.isFinite(nowMs) ? nowMs : Date.now();
   const n = Math.max(1, Math.floor(config.stabilityTicks));
   const needMom = Math.max(4, config.momentumLookbackPrices);
 
@@ -241,7 +251,7 @@ export function evaluateAnchorStrategy(
   ) {
     const lastTs = chainlinkTimestampsMs[chainlinkTimestampsMs.length - 1];
     if (lastTs != null && Number.isFinite(lastTs)) {
-      const sampleAge = Math.max(0, Date.now() - lastTs);
+      const sampleAge = Math.max(0, clock - lastTs);
       if (sampleAge > config.maxOracleAgeMs) {
         return {
           shouldTrade: false,
@@ -491,19 +501,19 @@ export function resolveAnchorTradeSizeUsd(fallbackEntryUsd: number): number {
 export function loadAnchorConfigFromEnv(fallbackEntryUsd = 1): AnchorStrategyConfig {
   return {
     enabled: String(process.env.ANCHOR_STRATEGY_ENABLED ?? "").toLowerCase() === "true",
-    stabilityTicks: Number(process.env.ANCHOR_STABILITY_TICKS) || 3,
-    upBidDepthShareMin: Number(process.env.ANCHOR_IMBALANCE_THRESHOLD) || 0.7,
-    downBidDepthShareMax: Number(process.env.ANCHOR_IMBALANCE_DOWN_WEAK) || 0.3,
-    chainlinkMomThreshold: Number(process.env.ANCHOR_CHAINLINK_MOM_THRESHOLD) || 0.0003,
-    chainlinkMomReverseThreshold: Number(process.env.ANCHOR_MOM_REVERSE_THRESHOLD) || -0.0005,
-    anchorPriceMin: Number(process.env.ANCHOR_PRICE_MIN) || 0.4,
-    anchorPriceMax: Number(process.env.ANCHOR_PRICE_MAX) || 0.65,
+    stabilityTicks: parseEnvFiniteNumber("ANCHOR_STABILITY_TICKS", 3),
+    upBidDepthShareMin: parseEnvFiniteNumber("ANCHOR_IMBALANCE_THRESHOLD", 0.7),
+    downBidDepthShareMax: parseEnvFiniteNumber("ANCHOR_IMBALANCE_DOWN_WEAK", 0.3),
+    chainlinkMomThreshold: parseEnvFiniteNumber("ANCHOR_CHAINLINK_MOM_THRESHOLD", 0.0003),
+    chainlinkMomReverseThreshold: parseEnvFiniteNumber("ANCHOR_MOM_REVERSE_THRESHOLD", -0.0005),
+    anchorPriceMin: parseEnvFiniteNumber("ANCHOR_PRICE_MIN", 0.4),
+    anchorPriceMax: parseEnvFiniteNumber("ANCHOR_PRICE_MAX", 0.65),
     tradeSize: resolveAnchorTradeSizeUsd(fallbackEntryUsd),
-    exitBufferSeconds: Number(process.env.ANCHOR_EXIT_BUFFER_SECONDS) || 30,
-    maxYesMid: Number(process.env.ANCHOR_MAX_YES_MID) || 0.7,
-    minSecondsToExpiry: Number(process.env.ANCHOR_MIN_SECONDS_TO_EXPIRY) || 60,
-    maxOracleAgeMs: Number(process.env.ANCHOR_MAX_ORACLE_AGE_MS) || 15_000,
-    momentumLookbackPrices: Number(process.env.ANCHOR_MOMENTUM_LOOKBACK_PRICES) || 4,
+    exitBufferSeconds: parseEnvFiniteNumber("ANCHOR_EXIT_BUFFER_SECONDS", 30),
+    maxYesMid: parseEnvFiniteNumber("ANCHOR_MAX_YES_MID", 0.7),
+    minSecondsToExpiry: parseEnvFiniteNumber("ANCHOR_MIN_SECONDS_TO_EXPIRY", 60),
+    maxOracleAgeMs: parseEnvFiniteNumber("ANCHOR_MAX_ORACLE_AGE_MS", 15_000),
+    momentumLookbackPrices: parseEnvFiniteNumber("ANCHOR_MOMENTUM_LOOKBACK_PRICES", 4),
     anchorDebugLogs: String(process.env.ANCHOR_DEBUG_LOGS ?? "").toLowerCase() === "true"
   };
 }

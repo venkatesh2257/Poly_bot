@@ -3423,7 +3423,8 @@ export class TradingEngine {
       [...this.anchorImbalanceHistoryDown],
       cfg,
       oracleAgeMs,
-      tsMs
+      tsMs,
+      Date.now()
     );
     this.lastAnchorSignal = sig;
 

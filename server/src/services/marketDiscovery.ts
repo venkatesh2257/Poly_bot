@@ -62,7 +62,8 @@ export async function resolveActiveUpDown5m(asset: string): Promise<ResolvedUpDo
   const nowSec = Math.floor(Date.now() / 1000);
   const blockStart = Math.floor(nowSec / WINDOW_SEC) * WINDOW_SEC;
   const candidates: number[] = [];
-  const span = Math.max(10, Math.min(40, Number(process.env.GAMMA_5M_CANDIDATE_SPAN ?? 25)));
+  /** Half-width of 300s slot candidates around the current block (smaller = fewer Gamma calls). */
+  const span = Math.max(8, Math.min(40, Number(process.env.GAMMA_5M_CANDIDATE_SPAN ?? 14)));
   for (let k = -span; k <= span; k++) {
     candidates.push(blockStart + k * WINDOW_SEC);
   }
@@ -105,6 +106,7 @@ export async function resolveActiveUpDown5m(asset: string): Promise<ResolvedUpDo
     const endMs = endIso ? new Date(endIso).getTime() : 0;
     if (!endMs || endMs <= now) continue;
     if (market.closed === true) continue;
+    if (market.acceptingOrders === false) continue;
 
     const outcomes = parseJsonStringArray(market.outcomes);
     const tokens = parseJsonStringArray(market.clobTokenIds);

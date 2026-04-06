@@ -187,6 +187,7 @@ export class SynthesisMarketDataHub {
     if (!this.cfg.enabled) return;
     this.orderbooks.clear();
     this.trades.clear();
+    this.prices.clear();
     this.sendOrderbookSubscribe();
     this.sendTradesSubscribe();
     this.sendDataSubscribe();

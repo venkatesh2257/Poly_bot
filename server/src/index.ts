@@ -41,16 +41,30 @@ app.use(
   createApiRouter(engine, auth, tradeLogger, (payload) => send({ type: "inspection", payload }))
 );
 
-/** Avoid 404 confusion: API has no HTML; point users to the Vite app. */
-app.get("/", (_req, res) => {
+/** Avoid 404 confusion: API has no HTML; point clients at this host + optional dashboard URL. */
+app.get("/", (req, res) => {
+  const host = req.get("host") || `127.0.0.1:${PORT}`;
+  const xfProto = String(req.headers["x-forwarded-proto"] ?? "").split(",")[0]?.trim();
+  const proto =
+    xfProto === "https" || req.secure ? "https" : xfProto === "http" ? "http" : "http";
+  const base = `${proto}://${host}`;
+  const wsProto = proto === "https" ? "wss" : "ws";
+  const wsHost = host.includes(":") ? host.split(":")[0]! : host;
+  const dashboardPublic = process.env.DASHBOARD_PUBLIC_URL?.trim();
+  const dashboard =
+    dashboardPublic ||
+    (process.env.NODE_ENV === "production"
+      ? null
+      : `${proto}://127.0.0.1:${String(process.env.VITE_PORT ?? 5174)}`);
   res.type("application/json").send(
     JSON.stringify(
       {
         service: "PolyBot API",
-        dashboard: "http://localhost:5174",
-        api: `http://localhost:${PORT}/api`,
-        websocket: `ws://localhost:${WS_PORT}`,
-        hint: "Open `dashboard` for the UI. Do not paste `websocket` into Chrome — the app connects to it automatically."
+        dashboard,
+        api: `${base}/api`,
+        websocket: `${wsProto}://${wsHost}:${WS_PORT}`,
+        hint:
+          "Open the dashboard URL in a browser for the UI. Set DASHBOARD_PUBLIC_URL when the UI is not on localhost. The app connects to `websocket` automatically (do not paste it into the address bar)."
       },
       null,
       2
