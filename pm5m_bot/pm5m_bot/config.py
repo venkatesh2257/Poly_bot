@@ -53,7 +53,7 @@ class Settings:
     max_spread: float = field(default_factory=lambda: _f("PM5M_MAX_SPREAD", 0.12))
     min_liquidity_usd: float = field(default_factory=lambda: _f("PM5M_MIN_LIQUIDITY_USD", 0.0))
 
-    # Risk
+    # Risk (PM5M_ACCOUNT_USDC is dry-run-only; see trader.read_account_usdc / runner.run_cycle for live CLOB balance)
     risk_pct_low: float = field(default_factory=lambda: _f("PM5M_RISK_PCT_LOW", 0.005))
     risk_pct_high: float = field(default_factory=lambda: _f("PM5M_RISK_PCT_HIGH", 0.01))
     size_boost_mult_min: float = field(default_factory=lambda: _f("PM5M_SIZE_BOOST_MULT_MIN", 2.0))

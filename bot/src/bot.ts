@@ -406,6 +406,14 @@ async function onTick(price: number) {
     const market = await findCurrentMarket();
     if (!market) { checking = false; return; }
 
+    if (!market.acceptingOrders) {
+      if (tickCount % 300 === 1) {
+        console.log(`[skip] Market not accepting orders (${market.slug})`);
+      }
+      checking = false;
+      return;
+    }
+
     // Subscribe to Polymarket WS for this market's tokens (idempotent per window)
     priceEngine.subscribeMarket(market.upTokenId, market.downTokenId);
 
@@ -594,8 +602,16 @@ async function onTick(price: number) {
           trade.cost = matched * bidPrice;
           console.log(`[bot] ✅ Order filled: ${matched}/${requestedSize} tokens matched (status=${status})`);
         } catch (e: any) {
-          // If we can't verify, assume it went through but log warning
-          console.log(`[bot] ⚠️ Could not verify fill (${e.message}), proceeding with trade`);
+          console.error(
+            `[bot] ❌ Fill verification failed (${e?.message ?? e}) — trade NOT recorded. Canceling order ${orderId}.`
+          );
+          try {
+            await clobClient.cancelOrder({ orderID: orderId });
+          } catch {
+            /* best effort */
+          }
+          checking = false;
+          return;
         }
       } catch (e: any) {
         const errData = e?.response?.data?.error || e.message;

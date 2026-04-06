@@ -38,6 +38,10 @@ def size_position(
     Base risk: random between risk_pct_low and risk_pct_high of account (use midpoint).
     Boost 2–3× if prob >= boost threshold, asset BTC, liquidity in top quartile of current pool.
     Shares ≈ usdc / limit_price (conditional token units).
+
+    account_usdc: For dry-run, runner passes PM5M_ACCOUNT_USDC via read_account_usdc.
+    For live, runner must pass CLOB collateral from Trader.fetch_live_collateral_usdc only —
+    this module does not read PM5M_ACCOUNT_USDC.
     """
     base_pct = (settings.risk_pct_low + settings.risk_pct_high) / 2.0
     risk_frac = base_pct

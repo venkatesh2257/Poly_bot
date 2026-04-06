@@ -204,9 +204,10 @@ class AnchorFlowStateMachine:
     def _window_pnl_allows_entry(self, tick: UnifiedTick) -> bool:
         if not self.cfg.enable_window_pnl_limp:
             return True
-        self._sync_pnl_window(tick)
         if tick.window_start_unix is None:
-            return True
+            log.warning("WINDOW_RISK_LIMP: window_start_unix missing; blocking new entries")
+            return False
+        self._sync_pnl_window(tick)
         if self._window_cum_pnl_usdc < self.cfg.max_loss_per_window_usdc:
             log.warning(
                 "WINDOW_RISK_LIMP: windowSec=%s cumPnL=%.4f cap=%.4f",

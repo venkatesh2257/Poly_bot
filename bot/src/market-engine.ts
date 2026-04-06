@@ -149,8 +149,33 @@ export async function findCurrentMarket(): Promise<MarketInfo | null> {
 }
 
 /**
- * Check market outcome after resolution
- * outcomePrices: ["1","0"] = Up won, ["0","1"] = Down won
+ * Map resolved Gamma outcomePrices to Up/Down using the same Up/Down indices as `findCurrentMarket()`
+ * (`/up/i` and `/down/i` on `market.outcomes`). Resolves from labeled indices, not array position.
+ * Returns `pending` if not yet resolved; `null` if ambiguous or labels cannot be mapped.
+ */
+export function resolveBtcUpdownWinnerFromMarketData(
+  outcomes: string[],
+  outcomePrices: string[]
+): "Up" | "Down" | "pending" | null {
+  if (!outcomes.length || outcomes.length !== outcomePrices.length) return "pending";
+
+  const upIdx = outcomes.findIndex((o: string) => /up/i.test(o));
+  const downIdx = outcomes.findIndex((o: string) => /down/i.test(o));
+  if (upIdx < 0 || downIdx < 0 || upIdx === downIdx) return null;
+
+  const rawUp = String(outcomePrices[upIdx]).trim();
+  const rawDown = String(outcomePrices[downIdx]).trim();
+  const upWon = rawUp === "1" || parseFloat(rawUp) === 1;
+  const downWon = rawDown === "1" || parseFloat(rawDown) === 1;
+
+  if (upWon && !downWon) return "Up";
+  if (downWon && !upWon) return "Down";
+  if (!upWon && !downWon) return "pending";
+  return null;
+}
+
+/**
+ * Check market outcome after resolution (outcome order from Gamma may differ from [Up, Down]).
  */
 export async function checkMarketOutcome(windowStart: number): Promise<"Up" | "Down" | "pending" | null> {
   const slug = btcUpdown15mEventSlug(windowStart);
@@ -160,10 +185,9 @@ export async function checkMarketOutcome(windowStart: number): Promise<"Up" | "D
     const event = (await res.json()) as any;
     const market = event?.markets?.[0];
     if (!market) return null;
-    const prices = JSON.parse(market.outcomePrices || "[]");
-    if (prices[0] === "1") return "Up";
-    if (prices[1] === "1") return "Down";
-    return "pending";
+    const outcomes: string[] = JSON.parse(market.outcomes || "[]");
+    const prices: string[] = JSON.parse(market.outcomePrices || "[]");
+    return resolveBtcUpdownWinnerFromMarketData(outcomes, prices);
   } catch {
     return null;
   }

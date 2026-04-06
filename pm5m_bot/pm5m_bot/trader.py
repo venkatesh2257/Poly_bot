@@ -143,6 +143,32 @@ class Trader:
         )
         logger.info("ClobClient initialized host=%s chain=%s funder=%s", host, chain, funder[:10])
 
+    def fetch_live_collateral_usdc(self) -> float | None:
+        """
+        Live-only: USDC collateral from CLOB (L2). Used for sizing — not env PM5M_ACCOUNT_USDC.
+        Returns None if the balance cannot be fetched (caller should skip live entries).
+        """
+        if self._s.dry_run or self._clob is None:
+            return None
+        try:
+            from py_clob_client.clob_types import AssetType, BalanceAllowanceParams
+        except ImportError as e:
+            raise RuntimeError("py-clob-client missing") from e
+        try:
+            resp = self._clob.get_balance_allowance(
+                BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
+            )
+        except Exception as e:
+            logger.warning("LIVE: get_balance_allowance failed: %s", e)
+            return None
+        if not isinstance(resp, dict):
+            logger.warning("LIVE: unexpected balance response type: %s", type(resp).__name__)
+            return None
+        parsed = _collateral_usdc_from_balance_payload(resp)
+        if parsed is None:
+            logger.warning("LIVE: could not parse USDC balance from CLOB response keys=%s", list(resp.keys()))
+        return parsed
+
     def current_mid(self, token_id: str) -> float | None:
         book = self._gamma.fetch_book_json(token_id)
         return _mid_from_book(book)
@@ -269,7 +295,26 @@ class Trader:
         return False
 
 
+def _collateral_usdc_from_balance_payload(resp: dict[str, object]) -> float | None:
+    """Parse CLOB /balance-allowance JSON; balance is raw USDC with 6 decimals (Polymarket convention)."""
+    raw = resp.get("balance")
+    if raw is None:
+        raw = resp.get("availableBalance")
+    if raw is None:
+        return None
+    try:
+        x = float(raw)
+    except (TypeError, ValueError):
+        return None
+    if x < 0:
+        return None
+    if x >= 1_000.0:
+        return x / 1_000_000.0
+    return x
+
+
 def read_account_usdc(settings: Settings) -> float:
+    """Dry-run sizing: USDC from PM5M_ACCOUNT_USDC. Live sizing uses CLOB via Trader.fetch_live_collateral_usdc."""
     v = os.getenv("PM5M_ACCOUNT_USDC")
     if v:
         return float(v)

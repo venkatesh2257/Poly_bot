@@ -48,11 +48,18 @@ class ChainlinkAnchorFeed:
         self.feed_address = Web3.to_checksum_address(addr)
         self._w3 = Web3(Web3.HTTPProvider(self.rpc_url))
         self._contract = self._w3.eth.contract(address=self.feed_address, abi=AGGREGATOR_V3_ABI)
-        self._decimals = int(self._contract.functions.decimals().call())
+        # decimals() deferred to first read — __init__ does not hit the network.
+        self._decimals: int | None = None
+
+    def _decimals_value(self) -> int:
+        if self._decimals is None:
+            self._decimals = int(self._contract.functions.decimals().call())
+        return self._decimals
 
     def read_anchor(self) -> tuple[float, int]:
+        d = self._decimals_value()
         _rid, ans, _sa, updated_at, _air = self._contract.functions.latestRoundData().call()
-        price = float(ans) / (10**self._decimals)
+        price = float(ans) / (10**d)
         return price, int(updated_at) * 1000
 
 

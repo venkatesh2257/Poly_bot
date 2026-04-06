@@ -50,7 +50,7 @@ def run_loop(
     on_tick: Callable[[object, object], None] | None = None,
     js_edge_provider: Callable[[], JsEdgeContext | None] | None = None,
 ) -> None:
-    anchor_feed = ChainlinkAnchorFeed(asset=asset)
+    anchor_feed: ChainlinkAnchorFeed | None = None
     book_ingest = PolymarketClobIngestion(token_id=token_id)
     fsm = AnchorFlowStateMachine(cfg, asset=asset)
     exec_ = executor or DryRunExecutor()
@@ -65,6 +65,8 @@ def run_loop(
                 seq += 1
                 now = time.time()
                 snap, bids_levels, asks_levels = book_ingest.fetch_book_with_depth()
+                if anchor_feed is None:
+                    anchor_feed = ChainlinkAnchorFeed(asset=asset)
                 ap, _ = anchor_feed.read_anchor()
                 raw_trades = book_ingest.fetch_trades_slice(limit=max(50, cfg.flow_lookback_trades))
                 trades_since, prev_trade_keys = trades_new_since_prev(

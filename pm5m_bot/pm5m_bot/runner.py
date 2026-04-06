@@ -85,9 +85,19 @@ def run_cycle(
             logger.exception("trader init failed")
             return out
 
-        account = read_account_usdc(settings)
-        if account <= 0 and not settings.dry_run:
-            logger.warning("PM5M_ACCOUNT_USDC unset or zero; skipping live sizing")
+        if settings.dry_run:
+            account = read_account_usdc(settings)
+        else:
+            account = trader.fetch_live_collateral_usdc()
+            if account is None:
+                logger.warning(
+                    "LIVE: cannot fetch USDC collateral from CLOB for sizing; skipping entries "
+                    "(not using PM5M_ACCOUNT_USDC)"
+                )
+                return out
+            if account <= 0:
+                logger.warning("LIVE: CLOB USDC balance is zero; skipping entries")
+                return out
 
         ordered = sorted(candidates, key=lambda c: c.liquidity_usd, reverse=True)
         done = 0
