@@ -5,12 +5,13 @@
  * Env (override file): TRADE_ASSETS_JSON, MIN_EDGE, MIN_SIGNAL_CONF,
  * MAX_SLIPPAGE_PCT, REQUIRE_MOMENTUM_SIGNAL_AGREE (true/false)
  *
- * Window-end paper / oracle-binary guard (ORACLE_TOO_CLOSE) lives in `engine.ts`:
+ * Window-end paper / oracle-binary guard (ORACLE_TOO_CLOSE) lives in `engine.ts` + `oracleWindowGuards.ts`:
  * MIN_MS_TO_WINDOW_END (global), MIN_MS_TO_WINDOW_END_BTC (BTC 5m only), legacy PAPER_ENTRY_MIN_MS_TO_WINDOW_END.
- * BTC 5m uses the BTC override when set; logs `ORACLE_TOO_CLOSE_BTC_5M` / `ENTRY_TIME_BTC_5M` with `windowSec` for histograms.
+ * BTC 5m: if MIN_MS_TO_WINDOW_END_BTC is unset, default 500ms (not global 20s). Optional BTC_5M_POST_WINDOW_END_BUFFER_MS.
+ * Logs `ORACLE_TOO_CLOSE_BTC_5M` / `ENTRY_TIME_BTC_5M` with `windowSec` for histograms.
  * Example:
  *   MIN_MS_TO_WINDOW_END=20000
- *   MIN_MS_TO_WINDOW_END_BTC=8000
+ *   MIN_MS_TO_WINDOW_END_BTC=500
  *
  * BTC 5m entry/result analytics (SIGNAL only, `engine.ts`): ENTRY_TIME_BTC_5M, BTC_5M_TRADE_RESULT,
  * BTC_5M_ENTRY_BUCKETS every N results — `BTC_5M_ENTRY_BUCKET_ROLLUP_EVERY` (default 10).
@@ -84,6 +85,17 @@ export function loadBotFiltersConfig(): BotFiltersConfig {
   if (rms !== undefined) file.REQUIRE_MOMENTUM_SIGNAL_AGREE = rms;
 
   return file;
+}
+
+/**
+ * When `false`, anchor live-executor readiness reports `LIVE_EXECUTOR_DISABLED_BY_CONFIG` (default: true).
+ * Set to `false` only in dev to simulate a missing executor without changing trading code.
+ */
+export function anchorLiveExecutorEnvConfigured(): boolean {
+  const v = process.env.ANCHOR_LIVE_EXECUTOR_AVAILABLE;
+  if (v == null || String(v).trim() === "") return true;
+  const s = String(v).trim().toLowerCase();
+  return s === "true" || s === "1" || s === "yes";
 }
 
 /**

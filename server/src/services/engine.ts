@@ -10,6 +10,7 @@ import type {
   EntryStrategyState,
   GtcExitMetrics,
   Insights,
+  LogEntry,
   LogLevel,
   MarketContext,
   MarketOption,
@@ -53,15 +54,21 @@ import {
 import {
   classifyOracleStale,
   evaluateOracleDirectionFlipGate,
-  evaluateOracleWindowMinTrendGate,
   freshOracleWindowState,
   loadOracleGateEnv,
   updateOracleWindowStateFromChainlink,
   type OracleWindowState
 } from "./oracleWindowGate.js";
+import {
+  computeAnchorReadinessSnapshot,
+  computeLiveReadiness,
+  parseDryRunEnv,
+  tradingDiagnosticTokenToMessage
+} from "./anchorReadiness.js";
+import { computeExecutionEligibility } from "./executionEligibility.js";
 import { runConnectivityPings } from "./apiPings.js";
 import { fetchBtcUsd } from "./btcPriceFeed.js";
-import { fetchUsdSpot } from "./cryptoPriceFeed.js";
+import { fetchUsdSpot, getLastGoodUsd } from "./cryptoPriceFeed.js";
 import { fetchGammaDisplayStats } from "./gammaDisplayStats.js";
 import { ChainlinkFeedService, type ChainlinkUsdPriceTick } from "./chainlinkFeed.js";
 import { PolymarketRtdsFeed } from "./polymarketRtdsFeed.js";
@@ -80,11 +87,19 @@ import {
 } from "./executionFlags.js";
 import { BinanceAggTradeFeed } from "./binanceAggTradeFeed.js";
 import {
+  anchorLiveExecutorEnvConfigured,
   loadBotFiltersConfig,
   tradeAssetAllowedByConfig,
   bookMidSpread01,
   type BotFiltersConfig
 } from "./botFiltersConfig.js";
+import {
+  BTC_5M_ORACLE_CLOSE_MIN_MS_DEFAULT,
+  btc5mChainlinkWindowStateLabel,
+  btc5mOracleCloseMinEffectiveMs,
+  btc5mPostWindowEndBufferMs,
+  paperOracleTooCloseBtc5m
+} from "./oracleWindowGuards.js";
 import {
   fetchLastFiveClosed1mBtcUsdt,
   fetchLastFiveClosed1mEthUsdt,
@@ -210,12 +225,16 @@ function isBtcFiveMinuteWindow(
 }
 
 /**
- * Effective threshold for ORACLE_TOO_CLOSE: BTC 5m may use MIN_MS_TO_WINDOW_END_BTC when set; else global.
+ * Effective threshold for ORACLE_TOO_CLOSE: BTC 5m uses MIN_MS_TO_WINDOW_END_BTC when set; else BTC_DEFAULT (500ms), not global 20s.
  */
 function resolveMinMsToWindowEndForOracleClose(
   asset: string | null | undefined,
   meta: { endDateIso: string; windowStartSec?: number } | null | undefined
-): { minGlobal: number; minEffective: number; effectiveSource: "GLOBAL" | "BTC_OVERRIDE" } {
+): {
+  minGlobal: number;
+  minEffective: number;
+  effectiveSource: "GLOBAL" | "BTC_OVERRIDE" | "BTC_DEFAULT";
+} {
   const minGlobal = minMsToWindowEndGlobal();
   if (!isBtcFiveMinuteWindow(asset, meta)) {
     return { minGlobal, minEffective: minGlobal, effectiveSource: "GLOBAL" };
@@ -224,7 +243,11 @@ function resolveMinMsToWindowEndForOracleClose(
   if (Number.isFinite(btc) && btc >= 0) {
     return { minGlobal, minEffective: btc, effectiveSource: "BTC_OVERRIDE" };
   }
-  return { minGlobal, minEffective: minGlobal, effectiveSource: "GLOBAL" };
+  return {
+    minGlobal,
+    minEffective: BTC_5M_ORACLE_CLOSE_MIN_MS_DEFAULT,
+    effectiveSource: "BTC_DEFAULT"
+  };
 }
 
 /** Skip auto-entries when less than this many ms remain in the Gamma window (last-2m style guard). Default 120s. */
@@ -368,6 +391,7 @@ function btc5mFreshBucketStats(): Record<Btc5mEntryBucketKey, { trades: number; 
 }
 
 export class TradingEngine {
+  private readonly engineConstructedMs = Date.now();
   private wallet = new WalletService();
   private running = false;
   private autoTrading = false;
@@ -402,14 +426,14 @@ export class TradingEngine {
   private stopLossTriggered = false;
   private noTradeSignals = 0;
   private markets: MarketOption[] = [
-    { tokenID: "sim-btc-up", label: "BTC 5s UP", outcome: "UP" },
-    { tokenID: "sim-btc-down", label: "BTC 5s DOWN", outcome: "DOWN" },
-    { tokenID: "sim-eth-up", label: "ETH 5s UP", outcome: "UP" },
-    { tokenID: "sim-eth-down", label: "ETH 5s DOWN", outcome: "DOWN" },
-    { tokenID: "sim-sol-up", label: "SOL 5s UP", outcome: "UP" },
-    { tokenID: "sim-sol-down", label: "SOL 5s DOWN", outcome: "DOWN" },
-    { tokenID: "sim-xrp-up", label: "XRP 5s UP", outcome: "UP" },
-    { tokenID: "sim-xrp-down", label: "XRP 5s DOWN", outcome: "DOWN" }
+    { tokenID: "sim-btc-up", label: "[Sim] BTC 5m UP/DOWN (paper — enable discovery or CLOB)", outcome: "UP" },
+    { tokenID: "sim-btc-down", label: "[Sim] BTC 5m UP/DOWN (paper — enable discovery or CLOB)", outcome: "DOWN" },
+    { tokenID: "sim-eth-up", label: "[Sim] ETH 5m UP/DOWN (paper — enable discovery or CLOB)", outcome: "UP" },
+    { tokenID: "sim-eth-down", label: "[Sim] ETH 5m UP/DOWN (paper — enable discovery or CLOB)", outcome: "DOWN" },
+    { tokenID: "sim-sol-up", label: "[Sim] SOL 5m UP/DOWN (paper — enable discovery or CLOB)", outcome: "UP" },
+    { tokenID: "sim-sol-down", label: "[Sim] SOL 5m UP/DOWN (paper — enable discovery or CLOB)", outcome: "DOWN" },
+    { tokenID: "sim-xrp-up", label: "[Sim] XRP 5m UP/DOWN (paper — enable discovery or CLOB)", outcome: "UP" },
+    { tokenID: "sim-xrp-down", label: "[Sim] XRP 5m UP/DOWN (paper — enable discovery or CLOB)", outcome: "DOWN" }
   ];
   private selectedMarket: MarketOption = this.markets[0];
   private marketContext: MarketContext = {
@@ -431,6 +455,19 @@ export class TradingEngine {
   > | null = null;
   private betLogs: BetLogEntry[] = [];
   private lastBookRefreshMs: number | null = null;
+  /** Last time `getDiscoveredSlotsSnapshot()` was non-empty — used to grace chart/oracle maps when discovery briefly returns zero rows. */
+  private lastDiscoverySlotsNonEmptyMs = Date.now();
+  /** True when the 4s refresh skipped clearing per-asset maps because of `DISCOVERY_STATE_GRACE_MS`. */
+  private discoveryTransientStateActive = false;
+  private lastDiscoveryGraceLogMs = 0;
+  /** Last WS `market` broadcast (same cadence as `buildMarketWsPayload`). */
+  private lastMarketPayloadMs: number | null = null;
+  /** Last successful primary chart point append (`pushMarketPointFromLiveBtc`). */
+  private lastChartUpdateMs: number | null = null;
+  /** Chart-only: which layer last supplied spot for per-asset / primary resolution. */
+  private lastChartSpotSourceByAsset = new Map<string, string>();
+  /** Throttle "all sources exhausted" per asset per minute. */
+  private lastChartSpotFailMinute = new Map<string, number>();
   /** Tracks 5m window (Gamma slug time or local 5m bucket in SIM). */
   private lastTrackedWindowKey: string | null = null;
   private btcTargetUsd: number | null = null;
@@ -492,6 +529,13 @@ export class TradingEngine {
   private lagSnipeKlineTimer: ReturnType<typeof setInterval> | null = null;
   /** Per UPDOWN asset: allow auto-trader to rotate into this market (default true). */
   private assetAutoTradeEnabled = new Map<string, boolean>();
+  private readonly logHistoryLimit = 160;
+  private logHistory: LogEntry[] = [];
+  private lastAutoTradeTickMs: number | null = null;
+  private lastAutoTradeDecisionMs: number | null = null;
+  private lastAutoTradeSkipReason: string | null = null;
+  private lastAutoTradeHeartbeatLogMs = 0;
+  private lastAutoTradeSilentNoopLogMs = 0;
 
   /** Runtime overrides (API); unset fields fall back to process.env. */
   private riskOverrides: Partial<{
@@ -543,6 +587,13 @@ export class TradingEngine {
   private lastAnchorSignal: AnchorSignal | null = null;
   private lastAnchorWindowKey: string | null = null;
   private anchorTradedThisWindow = false;
+  /** Set when `[ANCHOR][PRIMARY]` is logged for the current window key; used for WINDOW_RESULT when no OPEN/CLOSE. */
+  private anchorPrimaryLoggedForWindowKey: string | null = null;
+  private anchorPrimaryWindowSec: number | null = null;
+  /** Asset for the window that logged `[ANCHOR][PRIMARY]` (stable WINDOW_RESULT / *_5M_TRADE_RESULT on rotate). */
+  private anchorPrimaryWindowAsset: string | null = null;
+  /** True only after `[ANCHOR][PRIMARY]` in anchor mode (avoids WINDOW_RESULT when anchor was never primary this window). */
+  private anchorPrimaryWindowHadAnchorStrategy = false;
   /** Samples for selective momentum persistence (newest at end). */
   private selectiveMomentumRecent: number[] = [];
   /** Virtual MM inventory notionals for logging (SIM). */
@@ -931,19 +982,79 @@ export class TradingEngine {
     }
   }
 
-  /** Poll Coinbase/Binance for each configured UPDOWN symbol (parallel); anchors BONE_LATENCY per asset. */
+  /**
+   * Chart-only spot (does not change trading/oracle math): Coinbase/Binance REST → Binance agg → RTDS
+   * → engine last spot → crypto last-good cache → optional primary-series chart reuse.
+   */
+  private async resolveChartSpotUsd(
+    asset: string,
+    opts?: { allowPrimaryChartReuse?: boolean }
+  ): Promise<number | null> {
+    const a = asset.trim().toUpperCase();
+    const setSource = (src: string) => {
+      const prev = this.lastChartSpotSourceByAsset.get(a);
+      this.lastChartSpotSourceByAsset.set(a, src);
+      if (prev !== src) {
+        this.log("SIGNAL", `[CHART][SPOT] ${a} source=${src}${prev ? ` (was ${prev})` : ""}`);
+      }
+    };
+    try {
+      const p = a === "BTC" ? await fetchBtcUsd() : await fetchUsdSpot(a);
+      if (p != null && Number.isFinite(p) && p > 0) {
+        setSource("rest_coinbase_binance");
+        return p;
+      }
+    } catch {
+      /* next */
+    }
+    const agg = this.binanceAgg.getPrice(a);
+    if (agg != null && Number.isFinite(agg) && agg > 0) {
+      setSource("binance_agg");
+      return agg;
+    }
+    const rtds = this.polymarketRtds.getUsdForAsset(a);
+    if (rtds != null && Number.isFinite(rtds) && rtds > 0) {
+      setSource("rtds");
+      return rtds;
+    }
+    const prev = this.lastSpotUsdByAsset.get(a);
+    if (prev != null && Number.isFinite(prev) && prev > 0) {
+      setSource("engine_last_spot");
+      return prev;
+    }
+    const g = getLastGoodUsd(a);
+    if (g != null && g > 0) {
+      setSource("crypto_last_good");
+      return g;
+    }
+    if (opts?.allowPrimaryChartReuse) {
+      const cfg = this.wallet.getUpdownAssetsConfigured();
+      if (cfg[0]?.trim().toUpperCase() === a) {
+        const lastPt = this.marketData[this.marketData.length - 1];
+        const reuse = lastPt?.btcUsd;
+        if (reuse != null && Number.isFinite(reuse) && reuse > 0) {
+          setSource("primary_chart_reuse");
+          return reuse;
+        }
+      }
+    }
+    const minute = Math.floor(Date.now() / 60_000);
+    if (this.lastChartSpotFailMinute.get(a) !== minute) {
+      this.lastChartSpotFailMinute.set(a, minute);
+      this.log("ERROR", `[CHART][SPOT] ${a} all sources exhausted (REST/agg/RTDS/cache/reuse)`);
+    }
+    return null;
+  }
+
+  /** Poll spot for each configured UPDOWN symbol (parallel); anchors BONE_LATENCY per asset. */
   private async refreshSpotAnchorsForConfiguredAssets() {
     const assets = this.wallet.getUpdownAssetsConfigured();
     if (assets.length === 0) return;
     const wk = this.currentWindowKey();
     const results = await Promise.all(
       assets.map(async (a) => {
-        try {
-          const p = await fetchUsdSpot(a);
-          return [a, p] as const;
-        } catch {
-          return [a, null] as const;
-        }
+        const p = await this.resolveChartSpotUsd(a);
+        return [a, p] as const;
       })
     );
     for (const [a, p] of results) {
@@ -1509,6 +1620,7 @@ export class TradingEngine {
     this.synthesisRuntimeConfig = loadSynthesisConfigFromEnv();
     const hub = this.synthesisHub;
     if (!hub || !this.synthesisRuntimeConfig.enabled) {
+      this.lastMarketPayloadMs = Date.now();
       return base;
     }
     const snap = hub.getSnapshot();
@@ -1570,6 +1682,7 @@ export class TradingEngine {
         ? { ...health, history: this.synthesisMarketDataHistory.getWirePayload() }
         : undefined
     };
+    this.lastMarketPayloadMs = Date.now();
     return base;
   }
 
@@ -1935,6 +2048,130 @@ export class TradingEngine {
     return { amount: Number(capped.toFixed(2)), budget };
   }
 
+  private getExecutionEligibilitySnapshot() {
+    return computeExecutionEligibility({
+      entryStrategyEffective: this.effectiveEntryStrategy(),
+      mode: this.wallet.getMode(),
+      dryRunEnv: parseDryRunEnv(),
+      anchorReadiness: this.buildAnchorReadinessSnapshot(),
+      smEnabled: loadPolymarket5mSelectiveMomentumConfigFromEnv().enabled,
+      canExecuteLiveOrders: this.canExecuteLiveOrders(),
+      anchorLiveExecutorEnvOk: anchorLiveExecutorEnvConfigured()
+    });
+  }
+
+  /** When SIGNAL shows TRADE but config blocks order placement, append an explicit execution=blocked tail. */
+  private appendExecutionBlockedToPredictionLine(
+    line: string,
+    recommendation: "TRADE" | "NO_TRADE"
+  ): string {
+    if (recommendation !== "TRADE") return line;
+    const ex = this.getExecutionEligibilitySnapshot();
+    if (ex.selectedEligible) return line;
+    const br = ex.blockedReasons;
+    if (br.some((b) => b.includes("SM_ENABLED=false") || b.includes("PM5M disabled"))) {
+      return `${line} | execution=blocked (SM_ENABLED=false)`;
+    }
+    if (br.some((b) => b.includes("DRY_RUN"))) {
+      return `${line} | execution=blocked (DRY_RUN=true)`;
+    }
+    if (br.some((b) => b.includes("Anchor disabled by config"))) {
+      return `${line} | execution=blocked (ANCHOR_STRATEGY_ENABLED=false)`;
+    }
+    if (br.some((b) => b.includes("Anchor live executor"))) {
+      return `${line} | execution=blocked (anchor live executor unavailable)`;
+    }
+    return `${line} | execution=blocked (${br[0] ?? "config"})`;
+  }
+
+  /** Appended to `[AUTO][SKIP]` lines when execution is blocked by SM / dry-run / live executor config. */
+  private autoExecSkipNoteSuffix(): string {
+    const strat = this.effectiveEntryStrategy();
+    const smCfg = loadPolymarket5mSelectiveMomentumConfigFromEnv();
+    if (strat === "selective_momentum" && !smCfg.enabled) {
+      return " | exec_skip: PM5M disabled by config (SM_ENABLED=false)";
+    }
+    if (strat === "anchor" && parseDryRunEnv()) {
+      return " | exec_skip: Anchor trading disabled (DRY_RUN=true)";
+    }
+    if (
+      this.wallet.getMode() === "LIVE" &&
+      !this.canExecuteLiveOrders() &&
+      (strat === "selective_momentum" || strat === "anchor")
+    ) {
+      return " | exec_skip: Auto-trade skipped due to missing live executor";
+    }
+    return "";
+  }
+
+  /** Human-readable code for WINDOW_RESULT when anchor primary completed with no fills. */
+  private anchorWindowResultReason(): string {
+    const strat = this.effectiveEntryStrategy();
+    const anchorEnv = String(process.env.ANCHOR_STRATEGY_ENABLED ?? "").toLowerCase() === "true";
+    const smCfg = loadPolymarket5mSelectiveMomentumConfigFromEnv();
+
+    if (strat === "anchor") {
+      if (!anchorEnv) return "ANCHOR_DISABLED_BY_ENV";
+      if (parseDryRunEnv()) return "DRY_RUN";
+      if (this.wallet.getMode() === "LIVE") {
+        if (!anchorLiveExecutorEnvConfigured()) return "LIVE_EXECUTOR_DISABLED_BY_CONFIG";
+        if (!this.canExecuteLiveOrders()) return "LIVE_EXECUTOR_MISSING";
+      }
+    } else if (strat === "selective_momentum" && !smCfg.enabled) {
+      return "SM_DISABLED";
+    }
+
+    const mapped = this.mapAutoTradeSkipToWindowResult(this.lastAutoTradeSkipReason);
+    if (mapped) return mapped;
+
+    const md = this.computeMarketDataBlockReason();
+    if (md) return `HEALTH_DEGRADED:${md}`;
+
+    return "OTHER";
+  }
+
+  private mapAutoTradeSkipToWindowResult(skip: string | null): string | null {
+    if (skip == null || skip === "") return null;
+    if (skip === "waiting_anchor_fast_lane_tick" || skip === "book_refresh_in_flight") return null;
+    const table: Record<string, string> = {
+      oracle_too_close_btc_5m: "ORACLE_TOO_CLOSE_BTC_5M",
+      oracle_too_close: "ORACLE_TOO_CLOSE",
+      oracle_stale_soft: "ORACLE_STALE_SOFT",
+      oracle_stale_hard: "ORACLE_STALE_HARD",
+      window_oracle_flat: "WINDOW_ORACLE_FLAT",
+      late_window: "LATE_WINDOW",
+      prediction_no_trade: "NO_TRADE_SIGNAL",
+      oracle_strike_pending: "ORACLE_STRIKE_PENDING",
+      window_delta_below_min: "WINDOW_DELTA_BELOW_MIN",
+      oracle_trend_mismatch: "ORACLE_TREND_MISMATCH",
+      available_collateral_below_min_trade: "INSUFFICIENT_COLLATERAL",
+      live_trade_above_1_usd_blocked: "LIVE_MAX_ENTRY_USD_1",
+      sm_pm5m_disabled: "SM_DISABLED",
+      no_enabled_auto_trade_assets: "NO_TRADE_ASSETS",
+      no_discovered_slots: "NO_DISCOVERED_SLOTS",
+      discovery_temporarily_unavailable: "DISCOVERY_UNAVAILABLE",
+      auto_trading_off: "AUTO_TRADING_OFF",
+      engine_stopped: "ENGINE_STOPPED"
+    };
+    if (table[skip]) return table[skip];
+    if (skip.startsWith("trade_blocked:")) return `TRADE_BLOCKED:${skip.slice("trade_blocked:".length)}`;
+    return `SKIP:${skip}`;
+  }
+
+  private compute5mWindowStateLabelForAsset(asset: string, windowSec: number | null): string {
+    if (windowSec == null) return "unknown";
+    const msToEnd = (windowSec + 300) * 1000 - Date.now();
+    const a = asset.trim().toUpperCase();
+    if (a === "BTC") {
+      return btc5mChainlinkWindowStateLabel(
+        msToEnd,
+        btc5mOracleCloseMinEffectiveMs(),
+        btc5mPostWindowEndBufferMs()
+      );
+    }
+    return btc5mChainlinkWindowStateLabel(msToEnd, minMsToWindowEndGlobal(), 0);
+  }
+
   /** Why live CLOB posts are blocked (null = allowed). */
   private liveOrdersDisabledReason(): string | null {
     if (this.wallet.getMode() !== "LIVE") return "MODE!=LIVE";
@@ -2071,10 +2308,13 @@ export class TradingEngine {
     }
     if (recommendation === "NO_TRADE" && fromTimer) this.noTradeSignals += 1;
     if (fromTimer && !signalUnchanged) {
-      this.log(
-        "SIGNAL",
-        `${this.prediction.prediction} ${this.prediction.confidence}% (${this.prediction.recommendation})`
-      );
+      const smCfg = loadPolymarket5mSelectiveMomentumConfigFromEnv();
+      let line = `${this.prediction.prediction} ${this.prediction.confidence}% (${this.prediction.recommendation})`;
+      if (this.effectiveEntryStrategy() === "selective_momentum" && !smCfg.enabled) {
+        line += ` | sm[PM5m]: disabled (SM_ENABLED=false)`;
+      }
+      line = this.appendExecutionBlockedToPredictionLine(line, recommendation);
+      this.log("SIGNAL", line);
     }
   }
 
@@ -2118,7 +2358,10 @@ export class TradingEngine {
       if (fromTimer && !signalUnchanged) {
         this.log(
           "SIGNAL",
-          `${this.prediction.prediction} ${this.prediction.confidence}% (${this.prediction.recommendation})`
+          this.appendExecutionBlockedToPredictionLine(
+            `${this.prediction.prediction} ${this.prediction.confidence}% (${this.prediction.recommendation})`,
+            recommendation
+          )
         );
       }
       return;
@@ -2164,7 +2407,10 @@ export class TradingEngine {
       if (fromTimer && !signalUnchanged) {
         this.log(
           "SIGNAL",
-          `${this.prediction.prediction} ${this.prediction.confidence}% (${this.prediction.recommendation})`
+          this.appendExecutionBlockedToPredictionLine(
+            `${this.prediction.prediction} ${this.prediction.confidence}% (${this.prediction.recommendation})`,
+            recommendation
+          )
         );
       }
       return;
@@ -2248,7 +2494,10 @@ export class TradingEngine {
     if (fromTimer && !signalUnchanged) {
       this.log(
         "SIGNAL",
-        `${this.prediction.prediction} ${this.prediction.confidence}% (${this.prediction.recommendation})`
+        this.appendExecutionBlockedToPredictionLine(
+          `${this.prediction.prediction} ${this.prediction.confidence}% (${this.prediction.recommendation})`,
+          recommendation
+        )
       );
     }
   }
@@ -2319,6 +2568,59 @@ export class TradingEngine {
     return { badge, detail: t.detail, spread: book.spread };
   }
 
+  /** Observability: why market/chart payloads may be degraded (does not change trading decisions). */
+  private computeMarketDataBlockReason(): string | null {
+    const now = Date.now();
+    const maxAge = Math.max(45_000, envNum("MARKET_DATA_STALE_MS", 90_000));
+    const warmMs = Math.max(15_000, envNum("MARKET_DATA_WARMUP_MS", 35_000));
+    if (now - this.engineConstructedMs < warmMs && this.lastChartUpdateMs == null && this.lastMarketPayloadMs == null) {
+      return null;
+    }
+    if (this.lastChartUpdateMs == null || now - this.lastChartUpdateMs > maxAge) return "spot_sources_unavailable";
+    if (this.lastMarketPayloadMs == null || now - this.lastMarketPayloadMs > maxAge) return "spot_sources_unavailable";
+    if (this.discoveryTransientStateActive) return "discovery_temporarily_unavailable";
+    if (this.wallet.getDiscoveredSlotCount() === 0) return "no_discovered_slots";
+    const skip = this.autoTradeSkipReasonForActiveAsset();
+    if (skip === "missing_oracle_spot") return "missing_oracle_spot";
+    if (skip === "missing_price_to_beat") return "missing_price_to_beat";
+    if (skip === "oracle_stale_no_fallback") return "oracle_stale_no_fallback";
+    return null;
+  }
+
+  /** Config/auth/discovery hints when the bot is idle or blocked (observability only). */
+  private buildTradingDiagnostics(): string[] {
+    const out: string[] = [];
+    const autoStart = String(process.env.AUTO_START_BOT ?? "true").toLowerCase() === "true";
+    if (!autoStart && !this.running) out.push("auto_start_disabled");
+    if (!this.wallet.isAutoDiscoverEnabled()) out.push("discovery_disabled");
+    if (this.wallet.getMode() === "LIVE" && !this.wallet.isClobAuthenticated()) out.push("live_auth_not_ready");
+    const rawE = process.env.ENTRY_STRATEGY;
+    if (rawE != null && String(rawE).trim() !== "" && parseDashboardEntryStrategyId(String(rawE)) == null) {
+      out.push("entry_strategy_not_enabled");
+    }
+    const eff = this.effectiveEntryStrategy();
+    if (eff === "anchor" && !this.anchorRuntimeEnabled) {
+      out.push("anchor_runtime_disabled");
+    }
+    if (this.running && !this.autoTrading) out.push("auto_trading_off");
+    return out;
+  }
+
+  /** Shared by `getTradingState` and `/api/start` readiness logging. */
+  private buildAnchorReadinessSnapshot() {
+    const anchorEnvEnabled = String(process.env.ANCHOR_STRATEGY_ENABLED ?? "").toLowerCase() === "true";
+    return computeAnchorReadinessSnapshot({
+      entryStrategyEffective: this.effectiveEntryStrategy(),
+      anchorEnvEnabled,
+      anchorRuntimeEnabled: this.anchorRuntimeEnabled,
+      anchorFastLaneEnv: this.anchorFastLaneEnabled(),
+      dryRunEnv: parseDryRunEnv(),
+      walletMode: this.wallet.getMode(),
+      canExecuteLiveOrders: this.canExecuteLiveOrders(),
+      anchorLiveExecutorEnvOk: anchorLiveExecutorEnvConfigured()
+    });
+  }
+
   getTradingState(): TradingState {
     this.synthesisRuntimeConfig = loadSynthesisConfigFromEnv();
     const mode = this.wallet.getMode();
@@ -2336,6 +2638,26 @@ export class TradingEngine {
     const down = this.directionalContext?.down ?? null;
     const qu = this.bookQuality(up);
     const qd = this.bookQuality(down);
+    const marketDataBlockReason = this.computeMarketDataBlockReason();
+    const effStrategy = this.effectiveEntryStrategy();
+    const anchorReadiness = this.buildAnchorReadinessSnapshot();
+    const executionEligibility = computeExecutionEligibility({
+      entryStrategyEffective: effStrategy,
+      mode,
+      dryRunEnv: parseDryRunEnv(),
+      anchorReadiness,
+      smEnabled: loadPolymarket5mSelectiveMomentumConfigFromEnv().enabled,
+      canExecuteLiveOrders: this.canExecuteLiveOrders(),
+      anchorLiveExecutorEnvOk: anchorLiveExecutorEnvConfigured()
+    });
+    const liveReadiness = computeLiveReadiness({
+      entryStrategyEffective: effStrategy,
+      anchor: anchorReadiness,
+      marketDataBlockReason,
+      executionEligible: executionEligibility.selectedEligible,
+      executionBlockedReasons: executionEligibility.blockedReasons
+    });
+    const tradingDiagnosticsHuman = this.buildTradingDiagnostics().map(tradingDiagnosticTokenToMessage);
 
     return {
       executionMode: mode,
@@ -2377,6 +2699,9 @@ export class TradingEngine {
       entryStrategy: this.getEntryStrategyState(),
       lagSnipeEnabled: this.lagSnipeEnabled,
       lagSnipeBanner: this.lagSnipeEnabled ? "Lag Snipe: HOLD Manual Exit" : undefined,
+      anchorReadiness,
+      executionEligibility,
+      liveReadiness,
       liveEngine: {
         phase: this.phase,
         phaseReason: this.phaseReason,
@@ -2390,7 +2715,22 @@ export class TradingEngine {
         discoveredSlotCount: this.wallet.getDiscoveredSlotCount(),
         hasLiveMarketData: this.wallet.hasLiveMarketData(),
         rtdsConnected: this.polymarketRtds.isSocketOpen(),
-        lagSnipeEnabled: this.lagSnipeEnabled
+        lagSnipeEnabled: this.lagSnipeEnabled,
+        lastAutoTradeTickMs: this.lastAutoTradeTickMs,
+        lastAutoTradeDecisionMs: this.lastAutoTradeDecisionMs,
+        lastAutoTradeSkipReason: this.lastAutoTradeSkipReason,
+        discoveryGraceActive: this.discoveryTransientStateActive,
+        lastMarketPayloadMs: this.lastMarketPayloadMs,
+        lastChartUpdateMs: this.lastChartUpdateMs,
+        lastChartSourceByAsset: Object.fromEntries(this.lastChartSpotSourceByAsset.entries()),
+        marketDataHealthy: marketDataBlockReason == null,
+        marketDataBlockReason,
+        tradingDiagnostics: tradingDiagnosticsHuman,
+        anchorLastSkipCategory: this.lastAnchorSignal?.skipCategory ?? null,
+        anchorLastSkipReason: this.lastAnchorSignal?.reason ?? null,
+        anchorFastLaneEnabled: this.anchorFastLaneEnabled(),
+        anchorUsingNormalCadence:
+          this.effectiveEntryStrategy() === "anchor" && !this.anchorFastLaneEnabled()
       },
       predictionLive: {
         prediction: this.prediction.prediction,
@@ -2798,6 +3138,31 @@ export class TradingEngine {
     this.cleanupStaleBtc5mAutoEntryContexts(now);
   }
 
+  private noteAutoTradeSkip(reason: string): void {
+    this.lastAutoTradeSkipReason = reason;
+  }
+
+  private noteAutoTradeDecision(): void {
+    this.lastAutoTradeDecisionMs = Date.now();
+    this.lastAutoTradeSkipReason = null;
+  }
+
+  private maybeLogAutoTradeIdle(reason: string): void {
+    const now = Date.now();
+    const minMs = Math.max(5_000, envNum("AUTO_IDLE_LOG_MS", 20_000));
+    if (now - this.lastAutoTradeHeartbeatLogMs < minMs) return;
+    this.lastAutoTradeHeartbeatLogMs = now;
+    const asset = this.wallet.getActiveDiscoveredAsset() ?? "?";
+    const strat = this.effectiveEntryStrategy();
+    const phase = this.phase;
+    const mode = this.wallet.getMode();
+    const slots = this.wallet.getDiscoveredSlotCount();
+    this.log(
+      "SIGNAL",
+      `[AUTO][IDLE] mode=${mode} strategy=${strat} phase=${phase} asset=${asset} slots=${slots} reason=${reason}`
+    );
+  }
+
   /** Drop orphaned BTC 5m analytics contexts (no settlement); measurement logs unchanged for live paths. */
   private cleanupStaleBtc5mAutoEntryContexts(nowMs: number): void {
     const ttl = btc5mEntryContextTtlMs();
@@ -2899,17 +3264,34 @@ export class TradingEngine {
    * Auto-trade tick. Fast lane (~250ms) when anchor fast lane is enabled; otherwise 5s cadence for momentum.
    */
   private async runAutoTradeOnce(anchorFastLaneTick: boolean) {
-    if (!this.running || !this.autoTrading) return;
+    if (!this.running || !this.autoTrading) {
+      this.noteAutoTradeSkip(!this.running ? "engine_stopped" : "auto_trading_off");
+      return;
+    }
+    this.lastAutoTradeTickMs = Date.now();
     const strategy = this.effectiveEntryStrategy();
     const isAnchor = strategy === "anchor";
     const allowAnchorFastLane = isAnchor && this.anchorFastLaneEnabled();
     if (this.lagSnipeEnabled) {
-      if (anchorFastLaneTick) return;
+      if (anchorFastLaneTick) {
+        // Optional 250ms tick only; lag snipe uses the 5s cadence — do not overwrite lastAutoTradeSkipReason.
+        return;
+      }
     } else {
-      if (anchorFastLaneTick && !allowAnchorFastLane) return;
-      if (!anchorFastLaneTick && allowAnchorFastLane) return;
+      if (anchorFastLaneTick && !allowAnchorFastLane) {
+        // Fast lane is optional; anchor still runs on the normal 5s tick — do not record as a skip/blocker.
+        return;
+      }
+      if (!anchorFastLaneTick && allowAnchorFastLane) {
+        this.noteAutoTradeSkip("waiting_anchor_fast_lane_tick");
+        return;
+      }
     }
-    if (this.bookRefreshInFlight) return;
+    if (this.bookRefreshInFlight) {
+      this.noteAutoTradeSkip("book_refresh_in_flight");
+      this.maybeLogAutoTradeIdle("book_refresh_in_flight");
+      return;
+    }
     this.maybeLogRuntimeHealth();
     if (this.wallet.getMode() === "LIVE") {
       const now = Date.now();
@@ -2940,6 +3322,8 @@ export class TradingEngine {
         const slots = this.wallet.getDiscoveredSlotsSnapshot();
         const enabledIndices = this.buildEnabledAutoTradeIndices(slots);
         if (enabledIndices.length === 0) {
+          this.noteAutoTradeSkip("no_enabled_auto_trade_assets");
+          this.maybeLogAutoTradeIdle("no_enabled_auto_trade_assets");
           return;
         }
         const pick = this.pickAutoTradeSlotIndex(slots, enabledIndices);
@@ -2951,10 +3335,36 @@ export class TradingEngine {
         }
       }
 
+      if (n === 0) {
+        if (this.discoveryTransientStateActive) {
+          this.noteAutoTradeSkip("discovery_temporarily_unavailable");
+          this.maybeLogAutoTradeIdle("discovery_temporarily_unavailable");
+        } else {
+          this.noteAutoTradeSkip("no_discovered_slots");
+          this.maybeLogAutoTradeIdle("no_discovered_slots");
+        }
+        return;
+      }
+
       const skipReason = this.autoTradeSkipReasonForActiveAsset();
       if (skipReason) {
+        this.noteAutoTradeSkip(skipReason);
         const asset = this.wallet.getActiveDiscoveredAsset() ?? "?";
-        this.log("SIGNAL", `[AUTO][SKIP] asset=${asset} reason=${skipReason}`);
+        this.log(
+          "SIGNAL",
+          `[AUTO][SKIP] asset=${asset} reason=${skipReason}` + this.autoExecSkipNoteSuffix()
+        );
+        return;
+      }
+
+      const smCfg = loadPolymarket5mSelectiveMomentumConfigFromEnv();
+      if (strategy === "selective_momentum" && !smCfg.enabled) {
+        this.noteAutoTradeSkip("sm_pm5m_disabled");
+        const assetSm = this.wallet.getActiveDiscoveredAsset() ?? "?";
+        this.log(
+          "SIGNAL",
+          `[AUTO][SKIP] asset=${assetSm} reason=sm_pm5m_disabled: PM5M disabled by config (SM_ENABLED=false)`
+        );
         return;
       }
 
@@ -2973,19 +3383,24 @@ export class TradingEngine {
               asset,
               metaClose
             );
-            if (msLeftClose < minEffective && msLeftClose > -60_000) {
-              const ws = metaClose.windowStartSec;
-              if (isBtcFiveMinuteWindow(asset, metaClose)) {
+            const ws = metaClose.windowStartSec;
+            const postEndBtc = btc5mPostWindowEndBufferMs();
+            if (isBtcFiveMinuteWindow(asset, metaClose)) {
+              if (paperOracleTooCloseBtc5m(msLeftClose, minEffective, postEndBtc)) {
+                this.noteAutoTradeSkip("oracle_too_close_btc_5m");
                 this.log(
                   "SIGNAL",
-                  `[ORACLE_TOO_CLOSE_BTC_5M] windowSec=${ws ?? "?"} ms_to_window_end=${Math.round(msLeftClose)} min_required_ms=${minGlobal} min_required_ms_effective=${minEffective} effective_source=${effectiveSource} btc_5m_end_buffer_ms=${minEffective}`
+                  `[ORACLE_TOO_CLOSE_BTC_5M] windowSec=${ws ?? "?"} ms_to_window_end=${Math.round(msLeftClose)} min_required_ms=${minEffective} min_global_ms=${minGlobal} min_required_ms_effective=${minEffective} effective_source=${effectiveSource} btc_5m_post_end_buffer_ms=${postEndBtc}`
                 );
-              } else {
-                this.log(
-                  "SIGNAL",
-                  `[AUTO][SKIP] ORACLE_TOO_CLOSE asset=${asset} ms_to_window_end=${Math.round(msLeftClose)} min_required_ms=${minGlobal} min_required_ms_effective=${minEffective} effective_source=${effectiveSource}`
-                );
+                return;
               }
+            } else if (msLeftClose < minEffective && msLeftClose > -60_000) {
+              this.noteAutoTradeSkip("oracle_too_close");
+              this.log(
+                "SIGNAL",
+                `[AUTO][SKIP] ORACLE_TOO_CLOSE asset=${asset} ms_to_window_end=${Math.round(msLeftClose)} min_required_ms=${minEffective} min_global_ms=${minGlobal} min_required_ms_effective=${minEffective} effective_source=${effectiveSource}` +
+                  this.autoExecSkipNoteSuffix()
+              );
               return;
             }
           }
@@ -2999,43 +3414,29 @@ export class TradingEngine {
           await this.monitorAnchorExits();
         }
         const asset = this.wallet.getActiveDiscoveredAsset() ?? "?";
-        const oEnvA = loadOracleGateEnv();
-        const metaA = this.wallet.getDiscoveredMeta();
-        const wsA = metaA?.windowStartSec;
-        let owA =
-          this.oracleWindowStateByAsset.get(asset) ??
-          freshOracleWindowState(wsA ?? 0, this.priceToBeatByAsset.get(asset) ?? null, Date.now());
-        if (this.chainlinkAsset(asset) && (owA.strikePrice == null || owA.strikePrice <= 0)) {
-          const skA = this.priceToBeatByAsset.get(asset);
-          if (skA != null && Number.isFinite(skA) && skA > 0 && wsA != null) {
-            owA = freshOracleWindowState(wsA, skA, Date.now());
-          }
+        // Anchor primary: do not apply the generic oracle-window min-trend pre-gate (WINDOW_ORACLE_FLAT /
+        // WINDOW_DELTA_BELOW_MIN). Momentum and other strategies still use it below; anchor decisions live in
+        // anchorStrategy.ts via maybeRunAnchorStrategy().
+        const wkFull = this.getAnchorWindowKey();
+        const wk = wkFull ?? "?";
+        const metaAp = this.wallet.getDiscoveredMeta();
+        if (wkFull != null) {
+          this.anchorPrimaryLoggedForWindowKey = wkFull;
+          this.anchorPrimaryWindowSec = metaAp?.windowStartSec ?? null;
+          this.anchorPrimaryWindowAsset = asset.trim().toUpperCase();
+          this.anchorPrimaryWindowHadAnchorStrategy = true;
         }
-        const wMin = evaluateOracleWindowMinTrendGate(asset.trim().toUpperCase(), owA, oEnvA);
-        if (!wMin.ok) {
-          if (wMin.code === "WINDOW_ORACLE_FLAT") {
-            this.log(
-              "SIGNAL",
-              `[AUTO][SKIP] WINDOW_ORACLE_FLAT asset=${asset} trend=${owA.trend} deltaBps=${owA.trendDeltaBps.toFixed(2)} min_bps=${oEnvA.minWindowDeltaBps}`
-            );
-          } else {
-            this.log(
-              "SIGNAL",
-              `[AUTO][SKIP] WINDOW_DELTA_BELOW_MIN asset=${asset} absDeltaBps=${Math.abs(owA.trendDeltaBps).toFixed(2)} min=${oEnvA.minWindowDeltaBps} trend=${owA.trend}`
-            );
-          }
-          return;
-        }
-        const wk = this.getAnchorWindowKey() ?? "?";
         this.log(
           "SIGNAL",
           `[ANCHOR][PRIMARY] asset=${asset} window=${wk} runtimeEnabled=${this.anchorRuntimeEnabled} selected=true`
         );
+        this.noteAutoTradeDecision();
         await this.maybeRunAnchorStrategy();
         return;
       }
 
       if (strategy === "market_making") {
+        this.noteAutoTradeDecision();
         await this.runMarketMakingAutoOnce(anchorFastLaneTick);
         return;
       }
@@ -3057,12 +3458,20 @@ export class TradingEngine {
           return `gateAgeMs=${g} answerAgeMs=${a} fetchAgeMs=${f}`;
         };
         if (staleCls === "hard") {
-          this.log("SIGNAL", `[AUTO][SKIP] ORACLE_STALE_HARD asset=${assetGate} ${clStaleLog()}`);
+          this.noteAutoTradeSkip("oracle_stale_hard");
+          this.log(
+            "SIGNAL",
+            `[AUTO][SKIP] ORACLE_STALE_HARD asset=${assetGate} ${clStaleLog()}` + this.autoExecSkipNoteSuffix()
+          );
           await this.runAnchorFallbackNonPrimary();
           return;
         }
         if (staleCls === "soft") {
-          this.log("SIGNAL", `[AUTO][SKIP] ORACLE_STALE_SOFT asset=${assetGate} ${clStaleLog()}`);
+          this.noteAutoTradeSkip("oracle_stale_soft");
+          this.log(
+            "SIGNAL",
+            `[AUTO][SKIP] ORACLE_STALE_SOFT asset=${assetGate} ${clStaleLog()}` + this.autoExecSkipNoteSuffix()
+          );
           await this.runAnchorFallbackNonPrimary();
           return;
         }
@@ -3076,9 +3485,11 @@ export class TradingEngine {
             const msLeftLw = endLw - Date.now();
             const minRemMs = lateEntryMinMsToWindowEnd();
             if (msLeftLw < minRemMs && msLeftLw > -60_000) {
+              this.noteAutoTradeSkip("late_window");
               this.log(
                 "SIGNAL",
-                `[AUTO][SKIP] LATE_WINDOW asset=${assetGate} ms_to_window_end=${Math.round(msLeftLw)} min_remaining_ms=${minRemMs}`
+                `[AUTO][SKIP] LATE_WINDOW asset=${assetGate} ms_to_window_end=${Math.round(msLeftLw)} min_remaining_ms=${minRemMs}` +
+                  this.autoExecSkipNoteSuffix()
               );
               await this.runAnchorFallbackNonPrimary();
               return;
@@ -3094,10 +3505,12 @@ export class TradingEngine {
       }
 
       const choice = this.chooseDirectionalEntry();
+      this.noteAutoTradeDecision();
 
       this.log(
         "SIGNAL",
-        `[AUTO] asset=${this.wallet.getActiveDiscoveredAsset() ?? "?"} dir=${choice.direction} ${choice.reason}`
+        `[AUTO] asset=${this.wallet.getActiveDiscoveredAsset() ?? "?"} dir=${choice.direction} ${choice.reason}` +
+          this.autoExecSkipNoteSuffix()
       );
       const direction = choice.direction;
       if (
@@ -3105,7 +3518,12 @@ export class TradingEngine {
         this.prediction.recommendation === "NO_TRADE" &&
         !this.canIgnoreNoTradeForBookOnlyBlock("AUTO")
       ) {
-        this.log("SIGNAL", `Auto-trade skipped (${this.prediction.reason ?? "direction mismatch"})`);
+        this.noteAutoTradeSkip("prediction_no_trade");
+        this.log(
+          "SIGNAL",
+          `[AUTO][SKIP] asset=${assetGate} reason=prediction_no_trade: ${this.prediction.reason ?? "direction mismatch"}` +
+            this.autoExecSkipNoteSuffix()
+        );
         await this.runAnchorFallbackNonPrimary();
         return;
       }
@@ -3133,32 +3551,40 @@ export class TradingEngine {
         });
         if (!dirGate.ok) {
           if (dirGate.code === "STRIKE_PENDING") {
+            this.noteAutoTradeSkip("oracle_strike_pending");
             this.log(
               "SIGNAL",
-              `[AUTO][SKIP] ORACLE_TREND_INSUFFICIENT asset=${assetGate} samples=0 min_samples=1 (strike/window pending)`
+              `[AUTO][SKIP] ORACLE_TREND_INSUFFICIENT asset=${assetGate} samples=0 min_samples=1 (strike/window pending)` +
+                this.autoExecSkipNoteSuffix()
             );
             await this.runAnchorFallbackNonPrimary();
             return;
           }
           if (dirGate.code === "WINDOW_ORACLE_FLAT") {
+            this.noteAutoTradeSkip("window_oracle_flat");
             this.log(
               "SIGNAL",
-              `[AUTO][SKIP] WINDOW_ORACLE_FLAT asset=${assetGate} trend=${owState.trend} deltaBps=${owState.trendDeltaBps.toFixed(2)} min_bps=${oEnv.minWindowDeltaBps}`
+              `[AUTO][SKIP] WINDOW_ORACLE_FLAT asset=${assetGate} trend=${owState.trend} deltaBps=${owState.trendDeltaBps.toFixed(2)} min_bps=${oEnv.minWindowDeltaBps}` +
+                this.autoExecSkipNoteSuffix()
             );
             await this.runAnchorFallbackNonPrimary();
             return;
           }
           if (dirGate.code === "WINDOW_DELTA_BELOW_MIN") {
+            this.noteAutoTradeSkip("window_delta_below_min");
             this.log(
               "SIGNAL",
-              `[AUTO][SKIP] WINDOW_DELTA_BELOW_MIN asset=${assetGate} absDeltaBps=${Math.abs(owState.trendDeltaBps).toFixed(2)} min=${oEnv.minWindowDeltaBps} trend=${owState.trend}`
+              `[AUTO][SKIP] WINDOW_DELTA_BELOW_MIN asset=${assetGate} absDeltaBps=${Math.abs(owState.trendDeltaBps).toFixed(2)} min=${oEnv.minWindowDeltaBps} trend=${owState.trend}` +
+                this.autoExecSkipNoteSuffix()
             );
             await this.runAnchorFallbackNonPrimary();
             return;
           }
+          this.noteAutoTradeSkip("oracle_trend_mismatch");
           this.log(
             "SIGNAL",
-            `[AUTO][SKIP] ORACLE_TREND_MISMATCH_CONFIRMED asset=${assetGate} momentum=${this.rawMomentumSide()} oracle_trend=${owState.trend} deltaBps=${owState.trendDeltaBps.toFixed(0)} flips=${owState.flipCountInWindow} oppTicks=${owState.consecutiveOppositeTicks}`
+            `[AUTO][SKIP] ORACLE_TREND_MISMATCH_CONFIRMED asset=${assetGate} momentum=${this.rawMomentumSide()} oracle_trend=${owState.trend} deltaBps=${owState.trendDeltaBps.toFixed(0)} flips=${owState.flipCountInWindow} oppTicks=${owState.consecutiveOppositeTicks}` +
+              this.autoExecSkipNoteSuffix()
           );
           await this.runAnchorFallbackNonPrimary();
           return;
@@ -3176,6 +3602,7 @@ export class TradingEngine {
       }
       const { amount: riskAmount, budget } = await this.computeAutoTradeAmount();
       if (riskAmount < this.effMinTrade()) {
+        this.noteAutoTradeSkip("available_collateral_below_min_trade");
         if (!budget) {
           this.log(
             "SIGNAL",
@@ -3202,9 +3629,11 @@ export class TradingEngine {
           String(rawCap).trim() !== "" &&
           ["0", "false", "no", "off"].includes(String(rawCap).trim().toLowerCase());
         if (blockLargeLive) {
+          this.noteAutoTradeSkip("live_trade_above_1_usd_blocked");
           this.log(
             "SIGNAL",
-            `[AUTO][SKIP] LIVE_MAX_ENTRY_USD_1 size_usd=${riskAmount.toFixed(2)} (unset LIVE_TRADE_ABOVE_1_USD_OK or set true to allow; set false to block entries > $1)`
+            `[AUTO][SKIP] LIVE_MAX_ENTRY_USD_1 size_usd=${riskAmount.toFixed(2)} (unset LIVE_TRADE_ABOVE_1_USD_OK or set true to allow; set false to block entries > $1)` +
+              this.autoExecSkipNoteSuffix()
           );
           await this.runAnchorFallbackNonPrimary();
           return;
@@ -3212,13 +3641,16 @@ export class TradingEngine {
       }
       const result = await this.trade(direction, riskAmount, "AUTO", choice.reason);
       if (!result.accepted) {
+        this.noteAutoTradeSkip(`trade_blocked:${result.reason ?? "unknown"}`);
         this.log("ERROR", `Auto-trade blocked: ${result.reason ?? "unknown"}`);
         await this.runAnchorFallbackNonPrimary();
       } else {
+        this.noteAutoTradeDecision();
         this.anchorTradedThisWindow = true;
         return;
       }
     } catch (e) {
+      this.noteAutoTradeSkip("auto_trade_exception");
       this.log("ERROR", `Auto-trade tick: ${e instanceof Error ? e.message : String(e)}`);
     } finally {
       if (this.wallet.getMode() === "SIMULATION" && this.syncPaperOpenMarksFromDirectionalBooks()) {
@@ -3237,8 +3669,39 @@ export class TradingEngine {
   private maybeRotateAnchorWindow() {
     const key = this.getAnchorWindowKey();
     if (key !== this.lastAnchorWindowKey) {
+      const prevKey = this.lastAnchorWindowKey;
+      if (prevKey != null && this.anchorPrimaryWindowHadAnchorStrategy && this.anchorPrimaryLoggedForWindowKey === prevKey) {
+        const ws = this.anchorPrimaryWindowSec;
+        const asset = (this.anchorPrimaryWindowAsset ?? "?").trim().toUpperCase();
+        const wsLabel = this.compute5mWindowStateLabelForAsset(asset, ws);
+        const trades = this.anchorTradedThisWindow ? 1 : 0;
+        const anchorEnv = String(process.env.ANCHOR_STRATEGY_ENABLED ?? "").toLowerCase() === "true";
+        if (!this.anchorTradedThisWindow) {
+          const reason = this.anchorWindowResultReason();
+          const detail =
+            anchorEnv && this.effectiveEntryStrategy() === "anchor" && this.lastAutoTradeSkipReason
+              ? ` last_skip=${this.lastAutoTradeSkipReason}`
+              : "";
+          const wrTag = asset === "BTC" ? "WINDOW_RESULT_BTC_5M" : `WINDOW_RESULT_${asset}_5M`;
+          this.log(
+            "SIGNAL",
+            `${wrTag} windowSec=${ws ?? "?"} no trades executed: reason=${reason}${detail}`
+          );
+        }
+        if (asset === "BTC" || asset === "ETH") {
+          const trTag = asset === "BTC" ? "BTC_5M_TRADE_RESULT" : "ETH_5M_TRADE_RESULT";
+          this.log(
+            "SIGNAL",
+            `${trTag} asset=${asset} windowSec=${ws ?? "?"} window_state=${wsLabel} trades=${trades}`
+          );
+        }
+      }
       this.lastAnchorWindowKey = key;
       this.anchorTradedThisWindow = false;
+      this.anchorPrimaryLoggedForWindowKey = null;
+      this.anchorPrimaryWindowSec = null;
+      this.anchorPrimaryWindowAsset = null;
+      this.anchorPrimaryWindowHadAnchorStrategy = false;
       void this.primeOracleTrendBuffersForCoreAssets();
     }
   }
@@ -3446,6 +3909,13 @@ export class TradingEngine {
     }
 
     if (!sig.shouldTrade) {
+      const predTrade = this.prediction?.recommendation === "TRADE";
+      if (predTrade) {
+        this.log(
+          "SIGNAL",
+          `[ANCHOR] Prediction TRADE but anchor did not enter: ${sig.reason}${sig.skipCategory ? ` [${sig.skipCategory}]` : ""}`
+        );
+      }
       if (sig.skipCategory) {
         this.anchorLogStructured("ANCHOR_SKIP", {
           category: sig.skipCategory,
@@ -3454,7 +3924,7 @@ export class TradingEngine {
           downBidDepthShare: sig.downBidDepthShare,
           chainlinkMom: sig.chainlinkMom
         });
-      } else {
+      } else if (!predTrade) {
         this.log("SIGNAL", sig.reason);
       }
       return;
@@ -3654,6 +4124,20 @@ export class TradingEngine {
     this.binanceAgg.start(this.wallet.getUpdownAssetsConfigured());
     this.running = autoStart;
     this.autoTrading = autoStart;
+    const anchorEnv = String(process.env.ANCHOR_STRATEGY_ENABLED ?? "").toLowerCase() === "true";
+    if (!anchorEnv) {
+      this.log("SIGNAL", "[ENV] ANCHOR_STRATEGY_ENABLED is not true → anchor trading disabled");
+    }
+    if (eff === "anchor" && !this.anchorFastLaneEnabled()) {
+      this.log(
+        "SIGNAL",
+        "[ENV] ANCHOR_FAST_LANE is not true → fast lane disabled, normal cadence only"
+      );
+    }
+    this.log(
+      "SIGNAL",
+      `[BOOT][DIAG] AUTO_START_BOT=${autoStart} running=${this.running} ENTRY_STRATEGY=${eff} ANCHOR_STRATEGY_ENABLED=${anchorEnv} anchorRuntime=${this.anchorRuntimeEnabled} AUTO_DISCOVER_UPDOWN=${this.wallet.isAutoDiscoverEnabled()} publicBooksOk=${this.wallet.hasLiveMarketData()}`
+    );
     this.setPhase(autoStart ? "STARTING" : "STOPPED", autoStart ? "AutoStart enabled" : undefined);
     if (autoStart) {
       this.log("TRADE", "Auto-trading enabled on startup");
@@ -3688,19 +4172,19 @@ export class TradingEngine {
         const primarySym = cfgs[0] ?? "BTC";
         let primarySpot = this.lastSpotUsdByAsset.get(primarySym);
         if (primarySpot == null || !Number.isFinite(primarySpot) || primarySpot <= 0) {
-          try {
-            primarySpot = primarySym === "BTC" ? await fetchBtcUsd() : await fetchUsdSpot(primarySym);
+          const resolved = await this.resolveChartSpotUsd(primarySym, { allowPrimaryChartReuse: true });
+          if (resolved != null && Number.isFinite(resolved) && resolved > 0) {
+            primarySpot = resolved;
             this.lastSpotUsdByAsset.set(primarySym, primarySpot);
-          } catch (e) {
-            this.log(
-              "ERROR",
-              `Chart primary feed (${primarySym}): ${e instanceof Error ? e.message : String(e)}`
-            );
-            this.onMarket?.(this.buildMarketWsPayload());
-            return;
           }
         }
+        if (primarySpot == null || !Number.isFinite(primarySpot) || primarySpot <= 0) {
+          this.log("ERROR", `Chart primary feed (${primarySym}): all spot sources exhausted`);
+          this.onMarket?.(this.buildMarketWsPayload());
+          return;
+        }
         this.pushMarketPointFromLiveBtc(primarySpot);
+        this.lastChartUpdateMs = Date.now();
         this.onMarket?.(this.buildMarketWsPayload());
       } catch (e) {
         this.log("ERROR", `Chart feed: ${e instanceof Error ? e.message : String(e)}`);
@@ -3731,6 +4215,10 @@ export class TradingEngine {
           }
         }
         const slots = this.wallet.getDiscoveredSlotsSnapshot();
+        if (slots.length > 0) {
+          this.lastDiscoverySlotsNonEmptyMs = Date.now();
+          this.discoveryTransientStateActive = false;
+        }
         this.syncAssetAutoTradeKeysFromConfigured();
         this.syncAutoTradeRotationActiveSlot(slots);
         const sel0 = this.wallet.getDiscoveredSelection();
@@ -3891,12 +4379,22 @@ export class TradingEngine {
                 }
                 const next = updateOracleWindowStateFromChainlink(st, tick.price, nowOr, gateEnv);
                 this.oracleWindowStateByAsset.set(a, next);
-                const winKey = `${next.windowSec}|${next.trend}|${next.trendDeltaBps.toFixed(1)}|${strike.toFixed(1)}`;
+                let btcWinState = "";
+                let winStateSuffix = "";
+                if (a === "BTC") {
+                  const endMs = (next.windowSec + 300) * 1000;
+                  const msToEnd = endMs - nowOr;
+                  const minBtc = btc5mOracleCloseMinEffectiveMs();
+                  const postB = btc5mPostWindowEndBufferMs();
+                  btcWinState = btc5mChainlinkWindowStateLabel(msToEnd, minBtc, postB);
+                  winStateSuffix = ` window_state=${btcWinState} ms_to_window_end=${Math.round(msToEnd)}`;
+                }
+                const winKey = `${next.windowSec}|${next.trend}|${next.trendDeltaBps.toFixed(1)}|${strike.toFixed(1)}|${btcWinState}`;
                 if (this.lastOracleWindowLogKeyByAsset.get(a) !== winKey) {
                   this.lastOracleWindowLogKeyByAsset.set(a, winKey);
                   this.log(
                     "SIGNAL",
-                    `[CHAINLINK][WINDOW] asset=${a} windowSec=${next.windowSec} strike=${strike.toFixed(2)} trend=${next.trend} deltaBps=${next.trendDeltaBps.toFixed(1)}`
+                    `[CHAINLINK][WINDOW] asset=${a} windowSec=${next.windowSec} strike=${strike.toFixed(2)} trend=${next.trend} deltaBps=${next.trendDeltaBps.toFixed(1)}${winStateSuffix}`
                   );
                 }
                 if (next.flipCountInWindow > prevFlips) {
@@ -4001,16 +4499,31 @@ export class TradingEngine {
               }
             }
           } else {
-            this.multiSlotBooks = null;
-            this.gammaDisplayByAsset.clear();
-            this.priceToBeatByAsset.clear();
-            this.oracleWindowTrackedByAsset.clear();
-            this.chainlinkUsdByAsset.clear();
-            this.oracleWindowStateByAsset.clear();
-            this.lastOracleWindowLogKeyByAsset.clear();
-            this.chainlinkLastSuccessfulFetchMs.clear();
-            this.lastChainlinkLiveLogKeyByAsset.clear();
-            this.chainlinkInvalidAnswerTsWarned.clear();
+            const graceMs = Math.max(30_000, envNum("DISCOVERY_STATE_GRACE_MS", 120_000));
+            const nowMs = Date.now();
+            const withinGrace = nowMs - this.lastDiscoverySlotsNonEmptyMs < graceMs;
+            if (withinGrace) {
+              this.discoveryTransientStateActive = true;
+              if (nowMs - this.lastDiscoveryGraceLogMs > 30_000) {
+                this.lastDiscoveryGraceLogMs = nowMs;
+                this.log(
+                  "SIGNAL",
+                  `[DISCOVERY] no slots this refresh — retaining oracle/chart state (${graceMs}ms grace, transient gap)`
+                );
+              }
+            } else {
+              this.discoveryTransientStateActive = false;
+              this.multiSlotBooks = null;
+              this.gammaDisplayByAsset.clear();
+              this.priceToBeatByAsset.clear();
+              this.oracleWindowTrackedByAsset.clear();
+              this.chainlinkUsdByAsset.clear();
+              this.oracleWindowStateByAsset.clear();
+              this.lastOracleWindowLogKeyByAsset.clear();
+              this.chainlinkLastSuccessfulFetchMs.clear();
+              this.lastChainlinkLiveLogKeyByAsset.clear();
+              this.chainlinkInvalidAnswerTsWarned.clear();
+            }
           }
           this.lastBookRefreshMs = Date.now();
           this.synchronizeLivePredictionAndPhase(false);
@@ -4028,7 +4541,7 @@ export class TradingEngine {
   start() {
     this.running = true;
     this.autoTrading = false; // enable only after auth/health gates
-    this.log("TRADE", "Bot started (directional momentum auto-trading enabled)");
+    this.lastAutoTradeSkipReason = null;
     this.setPhase("STARTING", "User pressed Start Bot");
 
     // Auth gate is evaluated synchronously. Wallet already initialized on server boot.
@@ -4036,16 +4549,41 @@ export class TradingEngine {
     if (mode === "LIVE" && !this.wallet.isClobAuthenticated()) {
       this.setPhase("AUTH_CHECK", "LIVE selected but CLOB auth is not ready; refusing execution");
       this.autoTrading = false;
+      this.log("SIGNAL", "[START][BLOCK] live_auth_not_ready — CLOB L2 not authenticated; paper/sim charts still work");
       return;
     }
     this.setPhase("INFRA_HEALTHY", "Wallet ready");
     this.autoTrading = true;
+    const exec = this.getExecutionEligibilitySnapshot();
+    const sel = this.effectiveEntryStrategy();
+    this.log(
+      "SIGNAL",
+      `[START][EXECUTION] selectedStrategy=${sel} autoTrading=${this.autoTrading} eligibleStrategies=${exec.eligibleStrategies.join(",") || "none"} blockedReasons=${exec.blockedReasons.join("|") || "none"}`
+    );
+    if (!exec.selectedEligible) {
+      const detail =
+        exec.blockedReasons.length > 0
+          ? exec.blockedReasons.join("; ")
+          : "no matching path for current mode";
+      this.log(
+        "SIGNAL",
+        `WARNING: Bot started, but no execution-eligible auto-trading strategy is enabled — ${detail}`
+      );
+    } else {
+      this.log("TRADE", "Bot started (directional momentum auto-trading enabled)");
+    }
+    const md = this.computeMarketDataBlockReason();
+    this.log(
+      "SIGNAL",
+      `[START][DIAG] autoTrading=true marketDataBlock=${md ?? "none"} hints=${this.buildTradingDiagnostics().join(",") || "ok"}`
+    );
     this.pushStatus();
   }
 
   stop() {
     this.running = false;
     this.autoTrading = false;
+    this.lastAutoTradeSkipReason = "engine_stopped";
     this.externalExecution = false;
     this.stopGtcMonitor?.();
     this.stopGtcMonitor = null;
@@ -4116,7 +4654,10 @@ export class TradingEngine {
       phaseReason: this.phaseReason,
       paperTrading: paperTradingEnv(),
       paperOnly: paperOnlyEnv(),
-      executeTrades: executeTradesEnv()
+      executeTrades: executeTradesEnv(),
+      lastAutoTradeTickMs: this.lastAutoTradeTickMs,
+      lastAutoTradeDecisionMs: this.lastAutoTradeDecisionMs,
+      lastAutoTradeSkipReason: this.lastAutoTradeSkipReason
     };
   }
 
@@ -4214,7 +4755,19 @@ export class TradingEngine {
     this.selectedMarket = selected;
     this.marketContext = { tokenID, mid: 0.5, spread: 0.02, liquidity: 1500, bestBid: 0.49, bestAsk: 0.51 };
     this.log("SIGNAL", `Selected market: ${selected.label}`);
+    void this.hydrateMarketContextAfterSelect(tokenID);
     return true;
+  }
+
+  /** Replace placeholder mid/spread with public CLOB book when token ids are real (discovered or manual). */
+  private async hydrateMarketContextAfterSelect(tokenID: string) {
+    try {
+      const mc = await this.wallet.getMarketContext(tokenID);
+      this.marketContext = mc;
+      this.onMarket?.(this.buildMarketWsPayload());
+    } catch {
+      /* keep placeholder until next book refresh */
+    }
   }
 
   getInsights(): Insights {
@@ -4254,7 +4807,13 @@ export class TradingEngine {
   }
 
   private log(level: LogLevel, message: string) {
-    this.onLog?.({ ts: Date.now(), level, message });
+    const entry: LogEntry = { ts: Date.now(), level, message };
+    this.logHistory = [entry, ...this.logHistory].slice(0, this.logHistoryLimit);
+    this.onLog?.(entry);
+  }
+
+  getLogs(): LogEntry[] {
+    return [...this.logHistory];
   }
 
   getBetLogs(): BetLogEntry[] {

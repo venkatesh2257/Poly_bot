@@ -164,7 +164,12 @@ export function createApiRouter(
     if (session.authType === "wallet" && !isWalletAuthorized(session.address)) {
       return res.status(403).json({ ok: false, reason: "Logged in wallet not allowed" });
     }
-    engine.start();
+    try {
+      engine.start();
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      return res.status(500).json({ ok: false, reason: msg });
+    }
     return res.json({ ok: true });
   });
 
@@ -277,6 +282,8 @@ export function createApiRouter(
 
   router.get("/status", (_req, res) => res.json(engine.status()));
   router.get("/trading-state", (_req, res) => res.json(engine.getTradingState()));
+  /** Same payload shape as WebSocket `market` — for dashboard when WS is blocked (poll fallback). */
+  router.get("/market-data", (_req, res) => res.json(engine.getMarketData()));
 
   router.post("/risk-settings", (req, res) => {
     const token = getBearerToken(req.headers.authorization);

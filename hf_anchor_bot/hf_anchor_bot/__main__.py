@@ -7,22 +7,28 @@ import os
 import sys
 
 from hf_anchor_bot.config import BotConfig
-from hf_anchor_bot.execution import DryRunExecutor, OrderExecutor
+from hf_anchor_bot.execution import DryRunExecutor, LiveOrderExecutor, OrderExecutor
 from hf_anchor_bot.runner import run_loop
+
+# Set True in a deployment that wires a real CLOB `OrderExecutor` (see `_make_executor`).
+LIVE_EXECUTOR_AVAILABLE: bool = False
+
+
+def _live_executor_available() -> bool:
+    v = os.environ.get("HF_ANCHOR_LIVE_EXECUTOR_AVAILABLE", "").strip().lower()
+    if v in ("1", "true", "yes"):
+        return True
+    return LIVE_EXECUTOR_AVAILABLE
 
 
 def _make_executor(dry_run: bool) -> OrderExecutor:
     if dry_run:
         return DryRunExecutor()
-    print(
-        "[hf_anchor_bot] DRY_RUN=false but this package does not ship a live CLOB executor yet.",
-        file=sys.stderr,
-    )
-    print(
-        "[hf_anchor_bot] Run with DRY_RUN=true (default), or inject a custom OrderExecutor from your deployment code.",
-        file=sys.stderr,
-    )
-    sys.exit(2)
+    if not _live_executor_available():
+        raise RuntimeError(
+            "DRY_RUN=false but no live executor configured; cannot run live anchor trading"
+        )
+    return LiveOrderExecutor()
 
 
 def main() -> None:
@@ -39,7 +45,11 @@ def main() -> None:
     dry = os.environ.get("DRY_RUN", "true").lower() in ("1", "true", "yes")
 
     cfg = BotConfig(dry_run=dry)
-    ex = _make_executor(dry)
+    try:
+        ex = _make_executor(dry)
+    except (RuntimeError, NotImplementedError) as e:
+        print(str(e), file=sys.stderr)
+        sys.exit(2)
     print(f"[runner] asset={asset} token_id={token_id[:16]}… dry_run={dry} interval={interval}s")
     run_loop(cfg, token_id=token_id, asset=asset, poll_interval_s=interval, executor=ex)
 

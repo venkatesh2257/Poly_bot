@@ -64,7 +64,10 @@ export async function resolveActiveUpDown5m(asset: string): Promise<ResolvedUpDo
   const candidates: number[] = [];
   /** Half-width of 300s slot candidates around the current block (smaller = fewer Gamma calls). */
   const span = Math.max(8, Math.min(40, Number(process.env.GAMMA_5M_CANDIDATE_SPAN ?? 14)));
-  for (let k = -span; k <= span; k++) {
+  /** Prefer current window, then past/next in order 0, -1, +1, -2, +2, … (closest active market first). */
+  candidates.push(blockStart);
+  for (let k = 1; k <= span; k++) {
+    candidates.push(blockStart - k * WINDOW_SEC);
     candidates.push(blockStart + k * WINDOW_SEC);
   }
 

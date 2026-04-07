@@ -65,6 +65,8 @@ class Settings:
 
     dry_run: bool = field(default_factory=lambda: _b("PM5M_DRY_RUN", True))
     log_level: str = field(default_factory=lambda: os.getenv("PM5M_LOG_LEVEL", "INFO"))
+    # When false, execute_entry is a no-op (no CLOB posting); mirrors server SM_ENABLED.
+    sm_enabled: bool = field(default_factory=lambda: _b("SM_ENABLED", False))
 
 
 def load_settings() -> Settings:

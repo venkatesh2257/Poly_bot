@@ -2,6 +2,7 @@ import express from "express";
 import cors from "cors";
 import { config } from "dotenv";
 import { WebSocketServer } from "ws";
+import http from "node:http";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { createApiRouter } from "./routes/api.js";
@@ -25,7 +26,6 @@ applyDefaultPaperTestEnv();
 }
 
 const PORT = Number(process.env.PORT ?? 4000);
-const WS_PORT = Number(process.env.WS_PORT ?? 4001);
 
 const app = express();
 const engine = new TradingEngine();
@@ -49,7 +49,6 @@ app.get("/", (req, res) => {
     xfProto === "https" || req.secure ? "https" : xfProto === "http" ? "http" : "http";
   const base = `${proto}://${host}`;
   const wsProto = proto === "https" ? "wss" : "ws";
-  const wsHost = host.includes(":") ? host.split(":")[0]! : host;
   const dashboardPublic = process.env.DASHBOARD_PUBLIC_URL?.trim();
   const dashboard =
     dashboardPublic ||
@@ -62,9 +61,9 @@ app.get("/", (req, res) => {
         service: "PolyBot API",
         dashboard,
         api: `${base}/api`,
-        websocket: `${wsProto}://${wsHost}:${WS_PORT}`,
+        websocket: `${wsProto}://${host}`,
         hint:
-          "Open the dashboard URL in a browser for the UI. Set DASHBOARD_PUBLIC_URL when the UI is not on localhost. The app connects to `websocket` automatically (do not paste it into the address bar)."
+          "Open the dashboard URL in a browser for the UI. Set DASHBOARD_PUBLIC_URL when the UI is not on localhost. WebSocket shares the same port as the HTTP API (do not paste `websocket` into the address bar)."
       },
       null,
       2
@@ -72,7 +71,8 @@ app.get("/", (req, res) => {
   );
 });
 
-const wsServer = new WebSocketServer({ port: WS_PORT });
+const server = http.createServer(app);
+const wsServer = new WebSocketServer({ server });
 const send = (payload: unknown) => {
   const msg = JSON.stringify(payload);
   wsServer.clients.forEach((client) => {
@@ -85,6 +85,7 @@ wsServer.on("connection", (socket) => {
   socket.send(JSON.stringify({ type: "trade", payload: engine.getTrades() }));
   socket.send(JSON.stringify({ type: "market", payload: engine.getMarketData() }));
   socket.send(JSON.stringify({ type: "prediction", payload: engine.getPrediction() }));
+  socket.send(JSON.stringify({ type: "logs", payload: engine.getLogs() }));
   socket.send(JSON.stringify({ type: "betLogs", payload: engine.getBetLogs() }));
 });
 
@@ -116,9 +117,8 @@ void (async () => {
       });
     }
   }, 2500);
-  app.listen(PORT, () => {
-    console.log(`API running on :${PORT}`);
-    console.log(`WS running on :${WS_PORT}`);
+  server.listen(PORT, () => {
+    console.log(`API + WebSocket on :${PORT}`);
   });
 })().catch((e) => {
   console.error("Fatal server startup:", e);

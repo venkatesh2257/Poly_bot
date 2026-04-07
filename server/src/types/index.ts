@@ -22,6 +22,12 @@ export type NullableNumber = number | null;
 export type TradeStatus = "PENDING" | "WIN" | "LOSS" | "OPEN" | "CLOSED";
 export type LogLevel = "WIN" | "ERROR" | "SIGNAL" | "TRADE";
 
+export interface LogEntry {
+  ts: number;
+  level: LogLevel;
+  message: string;
+}
+
 export type BotPhase =
   | "STOPPED"
   | "STARTING"
@@ -285,6 +291,10 @@ export interface Status {
   paperTrading: boolean;
   paperOnly: boolean;
   executeTrades: boolean;
+  /** Auto-trade loop observability (mirrors `liveEngine` in `getTradingState`). */
+  lastAutoTradeTickMs?: number | null;
+  lastAutoTradeDecisionMs?: number | null;
+  lastAutoTradeSkipReason?: string | null;
 }
 
 /** Effective + env defaults for auto size, limits, cooldown, paper stop (runtime overrides via API). */
@@ -325,6 +335,49 @@ export interface RiskSettingsSnapshot {
     cooldownMs: number;
   };
   overridesActive: boolean;
+}
+
+export type AnchorCadence = "normal" | "fast" | "off";
+
+export type LiveReadinessLevel = "full" | "partial" | "degraded";
+
+/** Machine codes for why real-chain anchor execution is unavailable. */
+export type AnchorLiveExecutionReason =
+  | "DRY_RUN_MODE"
+  | "SIMULATION_MODE"
+  | "LIVE_EXECUTOR_MISSING"
+  | "LIVE_EXECUTOR_DISABLED_BY_CONFIG";
+
+/** Normalized anchor readiness for dashboards (observability only). */
+export interface AnchorReadinessSnapshot {
+  /** `ANCHOR_STRATEGY_ENABLED=true` in environment. */
+  anchorConfigured: boolean;
+  anchorTradingEnabled: boolean;
+  anchorFastLaneEnabled: boolean;
+  anchorCadence: AnchorCadence;
+  anchorBlockReason: string | null;
+  anchorDiagnostics: string[];
+  anchorStatusSummary: string;
+  /** True when anchor could send real CLOB orders (LIVE + gates + not dry-run). */
+  liveExecutionAvailable: boolean;
+  /** Why `liveExecutionAvailable` is false when anchor is otherwise enabled. */
+  liveExecutionReason: AnchorLiveExecutionReason | null;
+  /** Single-line banner for the anchor card (indicator + copy). */
+  liveExecutionBanner: { indicator: "green" | "yellow"; text: string };
+}
+
+export interface LiveReadinessSnapshot {
+  level: LiveReadinessLevel;
+  summary: string;
+}
+
+/** Whether the selected entry strategy can place auto-trade orders in the current mode (SIM paper vs LIVE CLOB). */
+export interface ExecutionEligibilityWire {
+  eligibleStrategies: EntryStrategyKind[];
+  blockedReasons: string[];
+  selectedEligible: boolean;
+  /** First entry in `blockedReasons` when non-empty; for dashboard copy. */
+  primaryBlockedReason?: string;
 }
 
 /** Rich dashboard payload: market window, book quality, auth hints. */
@@ -391,6 +444,12 @@ export interface TradingState {
   /** Dashboard toggle: isolated BTC 5m last-30s snipe; disables auto-exit (GTC + LIVE flatten). */
   lagSnipeEnabled: boolean;
   lagSnipeBanner?: string;
+  /** Anchor env/runtime/cadence — use instead of raw `tradingDiagnostics` tokens for anchor. */
+  anchorReadiness: AnchorReadinessSnapshot;
+  /** Overall live-trading readiness vs connectivity (anchor may be partial when env disables it). */
+  liveReadiness: LiveReadinessSnapshot;
+  /** True when the selected strategy can execute; blockedReasons explain startup/signal gaps. */
+  executionEligibility: ExecutionEligibilityWire;
   /**
    * Compact engine snapshot aligned with CLOB book refresh + signal logic.
    * Lets `/trading-state` polling stay in sync with live APIs when WebSocket is quiet.
@@ -447,6 +506,26 @@ export interface LiveEngineSnapshot {
   hasLiveMarketData: boolean;
   rtdsConnected: boolean;
   lagSnipeEnabled: boolean;
+  lastAutoTradeTickMs?: number | null;
+  lastAutoTradeDecisionMs?: number | null;
+  lastAutoTradeSkipReason?: string | null;
+  discoveryGraceActive?: boolean;
+  /** Wall-clock ms of last WS `market` / `buildMarketWsPayload` broadcast. */
+  lastMarketPayloadMs?: number | null;
+  /** Wall-clock ms of last primary chart point append. */
+  lastChartUpdateMs?: number | null;
+  /** Chart-only: last resolved layer per asset (e.g. `rest_coinbase_binance`, `rtds`). */
+  lastChartSourceByAsset?: Record<string, string>;
+  marketDataHealthy?: boolean;
+  marketDataBlockReason?: string | null;
+  /** General engine diagnostics (human-readable; not anchor-specific). */
+  tradingDiagnostics?: string[];
+  /** From `lastAnchorSignal` after anchor evaluation (best signal for why anchor did not enter). */
+  anchorLastSkipCategory?: string | null;
+  anchorLastSkipReason?: string | null;
+  anchorFastLaneEnabled?: boolean;
+  /** True when anchor is selected and optional ~250ms fast lane is off (5s auto-trade cadence only). */
+  anchorUsingNormalCadence?: boolean;
 }
 
 export interface MarketOption {

@@ -246,6 +246,9 @@ export interface BotStatus {
   paperTrading?: boolean;
   paperOnly?: boolean;
   executeTrades?: boolean;
+  lastAutoTradeTickMs?: number | null;
+  lastAutoTradeDecisionMs?: number | null;
+  lastAutoTradeSkipReason?: string | null;
 }
 
 export interface RiskSettingsSnapshot {
@@ -283,6 +286,40 @@ export interface EntryStrategyState {
   runtimeOverride: DashboardEntryStrategyId | null;
   fromEnv: EntryStrategyKind;
   label: string;
+}
+
+export type AnchorCadence = "normal" | "fast" | "off";
+export type LiveReadinessLevel = "full" | "partial" | "degraded";
+
+export type AnchorLiveExecutionReason =
+  | "DRY_RUN_MODE"
+  | "SIMULATION_MODE"
+  | "LIVE_EXECUTOR_MISSING"
+  | "LIVE_EXECUTOR_DISABLED_BY_CONFIG";
+
+export interface AnchorReadinessSnapshot {
+  anchorConfigured: boolean;
+  anchorTradingEnabled: boolean;
+  anchorFastLaneEnabled: boolean;
+  anchorCadence: AnchorCadence;
+  anchorBlockReason: string | null;
+  anchorDiagnostics: string[];
+  anchorStatusSummary: string;
+  liveExecutionAvailable: boolean;
+  liveExecutionReason: AnchorLiveExecutionReason | null;
+  liveExecutionBanner: { indicator: "green" | "yellow"; text: string };
+}
+
+export interface LiveReadinessSnapshot {
+  level: LiveReadinessLevel;
+  summary: string;
+}
+
+export interface ExecutionEligibilityWire {
+  eligibleStrategies: EntryStrategyKind[];
+  blockedReasons: string[];
+  selectedEligible: boolean;
+  primaryBlockedReason?: string;
 }
 
 export interface TradingState {
@@ -338,6 +375,9 @@ export interface TradingState {
   entryStrategy?: EntryStrategyState;
   lagSnipeEnabled?: boolean;
   lagSnipeBanner?: string;
+  anchorReadiness?: AnchorReadinessSnapshot;
+  liveReadiness?: LiveReadinessSnapshot;
+  executionEligibility?: ExecutionEligibilityWire;
   /** CLOB/Gamma/RTDS-aligned snapshot (matches `/api/status` phase when polling). */
   liveEngine?: LiveEngineSnapshot;
   /** Mirrors WS `prediction` for REST clients (newer servers). */
@@ -382,6 +422,20 @@ export interface LiveEngineSnapshot {
   hasLiveMarketData: boolean;
   rtdsConnected: boolean;
   lagSnipeEnabled?: boolean;
+  lastAutoTradeTickMs?: number | null;
+  lastAutoTradeDecisionMs?: number | null;
+  lastAutoTradeSkipReason?: string | null;
+  discoveryGraceActive?: boolean;
+  lastMarketPayloadMs?: number | null;
+  lastChartUpdateMs?: number | null;
+  lastChartSourceByAsset?: Record<string, string>;
+  marketDataHealthy?: boolean;
+  marketDataBlockReason?: string | null;
+  tradingDiagnostics?: string[];
+  anchorLastSkipCategory?: string | null;
+  anchorLastSkipReason?: string | null;
+  anchorFastLaneEnabled?: boolean;
+  anchorUsingNormalCadence?: boolean;
 }
 
 export interface WalletSummary {

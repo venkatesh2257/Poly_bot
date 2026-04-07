@@ -10,6 +10,7 @@ import type {
   TradingState,
   Insights,
   MarketOption,
+  MarketWsPayload,
   Mode,
   SetModeResponse,
   PingResponse,
@@ -57,6 +58,8 @@ export const api = {
   status: () => request<BotStatus>("/status"),
   ping: () => request<PingResponse>("/ping"),
   tradingState: () => request<TradingState>("/trading-state"),
+  /** Same shape as WebSocket `market` — use when WS is unavailable. */
+  marketData: () => request<MarketWsPayload>("/market-data"),
   setRiskSettings: (body: {
     reset?: boolean;
     entryUsd?: number;

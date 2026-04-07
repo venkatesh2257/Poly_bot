@@ -26,25 +26,61 @@ export function resolveApiBase(): string {
   return `${window.location.origin}/api`;
 }
 
-/** WebSocket URL for dashboard live updates (server `WS_PORT`, default 4001). */
+/**
+ * WebSocket URL for dashboard live updates.
+ * Defaults to the same host:port as the REST API (server shares WS with HTTP on `PORT`).
+ * Override with `VITE_WS_URL`, or `VITE_WS_PORT` only when a legacy split-port WS is still in use.
+ */
 export function resolveWsUrl(): string {
   const env = String(import.meta.env.VITE_WS_URL ?? "").trim();
   if (env) return env;
 
+  const legacyWsPort = String(import.meta.env.VITE_WS_PORT ?? "").trim();
+
   if (typeof window === "undefined") {
-    return "ws://localhost:4001";
+    const apiBase = trimSlash(resolveApiBase());
+    let apiOriginStr = apiBase.replace(/\/api$/i, "");
+    if (!/^https?:\/\//i.test(apiOriginStr)) {
+      apiOriginStr = `http://${apiOriginStr}`;
+    }
+    try {
+      const u = new URL(apiOriginStr);
+      const wsProto = u.protocol === "https:" ? "wss:" : "ws:";
+      if (legacyWsPort) return `${wsProto}//${u.hostname}:${legacyWsPort}`;
+      return `${wsProto}//${u.host}`;
+    } catch {
+      return `ws://localhost:${legacyWsPort || "4000"}`;
+    }
   }
 
-  const { protocol, hostname, port } = window.location;
-  const isLocal = hostname === "localhost" || hostname === "127.0.0.1";
-  const wsPort = String(import.meta.env.VITE_WS_PORT ?? "").trim() || "4001";
-  const wsProto = protocol === "https:" ? "wss:" : "ws:";
-
-  if (isLocal) {
-    return `${wsProto}//${hostname}:${wsPort}`;
+  const apiBase = trimSlash(resolveApiBase());
+  let apiOriginStr = apiBase.replace(/\/api$/i, "");
+  if (!/^https?:\/\//i.test(apiOriginStr)) {
+    apiOriginStr = `http://${apiOriginStr}`;
   }
 
-  // Same host: assume reverse-proxy maps `/` WS or use explicit VITE_WS_URL in deployment.
-  const sameOriginWs = `${wsProto}//${hostname}${port ? `:${port}` : ""}`;
-  return sameOriginWs;
+  let apiOriginUrl: URL;
+  try {
+    apiOriginUrl = new URL(apiOriginStr);
+  } catch {
+    const { protocol, hostname } = window.location;
+    const wsProto = protocol === "https:" ? "wss:" : "ws:";
+    return `${wsProto}//${hostname}:${legacyWsPort || "4000"}`;
+  }
+
+  const wsProto = apiOriginUrl.protocol === "https:" ? "wss:" : "ws:";
+  const pageOrigin = window.location.origin;
+  const apiOrigin = apiOriginUrl.origin;
+
+  // SPA and API share origin (e.g. nginx terminates TLS and proxies `/api` + WebSocket).
+  if (pageOrigin === apiOrigin) {
+    const wsProtoPage = window.location.protocol === "https:" ? "wss:" : "ws:";
+    return `${wsProtoPage}//${window.location.host}`;
+  }
+
+  // Same hostname as REST API; default = same port as API (WS attached to HTTP server).
+  let host = apiOriginUrl.hostname;
+  if (host === "localhost") host = "127.0.0.1";
+  const port = legacyWsPort || apiOriginUrl.port || (apiOriginUrl.protocol === "https:" ? "443" : "80");
+  return `${wsProto}//${host}:${port}`;
 }

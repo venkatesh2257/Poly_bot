@@ -62,6 +62,9 @@ export class WalletService {
     return Math.trunc(n);
   }
 
+  /** First wall-clock ms when Gamma returned zero rows while cached slots still looked open (transient miss). */
+  private discoveryEmptySinceMs: number | null = null;
+
   /** One resolved 5m Up/Down window from Gamma (AUTO_DISCOVER_UPDOWN). */
   private discoveredSlots: Array<{
     asset: string;
@@ -297,11 +300,31 @@ export class WalletService {
     }
     const prev = this.discoveredSlots;
     if (next.length === 0) {
+      const now = Date.now();
+      const graceMs = Math.max(30_000, Number(process.env.DISCOVERY_EMPTY_GRACE_MS ?? 120_000));
+      const stillValidPrev = prev.filter((s) => {
+        const end = new Date(s.endDateIso).getTime();
+        return Number.isFinite(end) && end > now + 2_000;
+      });
+      if (stillValidPrev.length > 0) {
+        if (this.discoveryEmptySinceMs == null) this.discoveryEmptySinceMs = now;
+        if (now - this.discoveryEmptySinceMs <= graceMs) {
+          this.discoveredSlots = stillValidPrev;
+          if (this.activeSlotIndex >= this.discoveredSlots.length) this.activeSlotIndex = 0;
+          console.warn(
+            `[WalletService] Gamma discovery returned no new markets; retaining ${stillValidPrev.length} cached slot(s) (grace ${graceMs}ms, windows still open)`
+          );
+          return false;
+        }
+      }
+      this.discoveryEmptySinceMs = null;
       const cleared = prev.length > 0;
       this.discoveredSlots = [];
       this.activeSlotIndex = 0;
       return cleared;
     }
+
+    this.discoveryEmptySinceMs = null;
 
     let changed = prev.length !== next.length;
     if (!changed) {
@@ -425,6 +448,7 @@ export class WalletService {
     this.client = undefined;
     this.wallet = undefined;
     this.clobApiKeyReady = false;
+    this.discoveryEmptySinceMs = null;
     this.discoveredSlots = [];
     this.activeSlotIndex = 0;
   }
@@ -583,14 +607,31 @@ export class WalletService {
   }
 
   async getMarkets(limit = 20): Promise<MarketOption[]> {
+    const fromDiscovered = (): MarketOption[] => {
+      const out: MarketOption[] = [];
+      for (let i = this.discoveredSlots.length - 1; i >= 0; i--) {
+        const d = this.discoveredSlots[i]!;
+        out.unshift({
+          tokenID: d.tokenIdUp,
+          label: `[${d.asset}] ${d.label}`,
+          outcome: "AUTO"
+        });
+      }
+      return out;
+    };
+
     if (!this.client) {
-      // Simulation fallback (no CLOB keys / no live client):
-      // expose the same 4 majors so UI + manual selection are not BTC-only.
+      const discoveredFirst = fromDiscovered();
+      if (discoveredFirst.length > 0) {
+        return discoveredFirst.slice(0, limit);
+      }
+      // No Gamma discovery yet — explicit simulated labels (not Polymarket 5m; not 5s).
       const assets: Array<"BTC" | "ETH" | "SOL" | "XRP"> = ["BTC", "ETH", "SOL", "XRP"];
       const out: MarketOption[] = [];
       for (const a of assets) {
-        out.push({ tokenID: `sim-${a.toLowerCase()}-up`, label: `${a} 5s UP`, outcome: "UP" });
-        out.push({ tokenID: `sim-${a.toLowerCase()}-down`, label: `${a} 5s DOWN`, outcome: "DOWN" });
+        const lab = `[Sim] ${a} 5m UP/DOWN (paper — enable discovery or CLOB)`;
+        out.push({ tokenID: `sim-${a.toLowerCase()}-up`, label: lab, outcome: "UP" });
+        out.push({ tokenID: `sim-${a.toLowerCase()}-down`, label: lab, outcome: "DOWN" });
       }
       return out.slice(0, limit);
     }

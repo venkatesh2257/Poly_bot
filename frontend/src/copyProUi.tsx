@@ -16,6 +16,8 @@ const MAIN_TABS: { id: SnipeRoute; label: string }[] = [
 
 export function CopyProTopBar(props: {
   wsConnected: boolean;
+  /** True when GET /trading-state succeeds even if WebSocket is down. */
+  restApiReachable?: boolean;
   running: boolean;
   isLoggedIn: boolean;
   isAuthenticating: boolean;
@@ -36,6 +38,7 @@ export function CopyProTopBar(props: {
 }) {
   const {
     wsConnected,
+    restApiReachable = false,
     running,
     isLoggedIn,
     isAuthenticating,
@@ -97,10 +100,34 @@ export function CopyProTopBar(props: {
           <span
             className={
               "rounded px-2 py-1 text-[10px] font-semibold uppercase " +
-              (wsConnected ? "bg-copy-green/15 text-copy-green" : "bg-rose-950/50 text-rose-300")
+              (restApiReachable ? "bg-sky-950/50 text-sky-200" : "bg-rose-950/50 text-rose-300")
+            }
+            title={
+              restApiReachable
+                ? "HTTP API reachable (GET /api/trading-state and other REST endpoints)"
+                : "REST API unreachable — check server PORT and VITE_API_BASE"
             }
           >
-            {wsConnected ? "API" : "Offline"}
+            {restApiReachable ? "REST OK" : "REST offline"}
+          </span>
+          <span
+            className={
+              "rounded px-2 py-1 text-[10px] font-semibold uppercase " +
+              (wsConnected
+                ? "bg-copy-green/15 text-copy-green"
+                : restApiReachable
+                  ? "border border-amber-600/40 bg-amber-950/40 text-amber-200"
+                  : "bg-slate-800/80 text-slate-500")
+            }
+            title={
+              wsConnected
+                ? "WebSocket live stream connected (trades, logs, push updates)"
+                : restApiReachable
+                  ? "WebSocket not connected — UI falls back to REST polling for charts/state"
+                  : "Live stream unavailable while REST is offline"
+            }
+          >
+            {wsConnected ? "Stream live" : restApiReachable ? "Stream offline" : "Stream —"}
           </span>
           {executionEnvBadge ? (
             <span

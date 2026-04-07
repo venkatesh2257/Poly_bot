@@ -1,4 +1,14 @@
-import { useEffect, useMemo, useRef, useState, type CSSProperties, type ReactElement } from "react";
+import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type CSSProperties,
+  type Dispatch,
+  type ReactElement,
+  type SetStateAction
+} from "react";
 import siteBackgroundUrl from "./assets/site-background.png";
 import {
   CartesianGrid,
@@ -11,7 +21,7 @@ import {
   YAxis
 } from "recharts";
 import { api } from "./api";
-import { resolveWsUrl } from "./apiConfig";
+import { resolveApiBase, resolveWsUrl } from "./apiConfig";
 import {
   getCollateralUsdcFromMetaMask,
   approveCollateralAllowanceFromMetaMask,
@@ -94,9 +104,57 @@ function dayStartLocal(d = new Date()): Date {
   return new Date(d.getFullYear(), d.getMonth(), d.getDate(), 0, 0, 0, 0);
 }
 
-type PortfolioRange = "1m" | "1h" | "day" | "month" | "year";
+/** Shared WS `market` + GET `/market-data` hydration (primary + per-asset charts). */
+function applyMarketPayloadToDashboard(
+  p: unknown,
+  s: {
+    setChartData: Dispatch<SetStateAction<MarketPoint[]>>;
+    setAssetCharts: Dispatch<SetStateAction<Record<string, MarketPoint[]>>>;
+    setSynthesisPriceOverlay: Dispatch<SetStateAction<Array<{ t: number; priceUsd: number }>>>;
+    setSynthesisChartMode: Dispatch<SetStateAction<SynthesisChartMode | null>>;
+    setSynthesisTelemetryWs: Dispatch<SetStateAction<SynthesisTelemetryPayload | null>>;
+    setSynthesisHealthWs: Dispatch<SetStateAction<SynthesisMarketDataHealthPayload | null>>;
+  }
+): void {
+  if (Array.isArray(p)) {
+    s.setChartData(p);
+    s.setAssetCharts({});
+    s.setSynthesisPriceOverlay([]);
+    s.setSynthesisChartMode(null);
+    s.setSynthesisTelemetryWs(null);
+    s.setSynthesisHealthWs(null);
+    return;
+  }
+  if (p && typeof p === "object") {
+    const pack = p as {
+      primary?: MarketPoint[];
+      byAsset?: Record<string, MarketPoint[]>;
+      synthesis?: {
+        priceOverlayUsd: Array<{ t: number; priceUsd: number }>;
+        chartMode: SynthesisChartMode;
+        telemetry: SynthesisTelemetryPayload;
+        health?: SynthesisMarketDataHealthPayload;
+      };
+    };
+    s.setChartData(Array.isArray(pack.primary) ? pack.primary : []);
+    s.setAssetCharts(pack.byAsset && typeof pack.byAsset === "object" ? pack.byAsset : {});
+    if (pack.synthesis) {
+      s.setSynthesisPriceOverlay(
+        Array.isArray(pack.synthesis.priceOverlayUsd) ? pack.synthesis.priceOverlayUsd : []
+      );
+      s.setSynthesisChartMode(pack.synthesis.chartMode ?? null);
+      s.setSynthesisTelemetryWs(pack.synthesis.telemetry ?? null);
+      s.setSynthesisHealthWs(pack.synthesis.health ?? null);
+    } else {
+      s.setSynthesisPriceOverlay([]);
+      s.setSynthesisChartMode(null);
+      s.setSynthesisTelemetryWs(null);
+      s.setSynthesisHealthWs(null);
+    }
+  }
+}
 
-const WS_URL = resolveWsUrl();
+type PortfolioRange = "1m" | "1h" | "day" | "month" | "year";
 
 /**
  * MetaMask: always market-SELL entry shares before dashboard confirm (aligns with Polymarket inventory).
@@ -423,6 +481,14 @@ function buildXTickTimes(points: MarketPoint[], maxLabels = 12): string[] {
   return out;
 }
 
+/** Prefer auto-discovered / live rows; keep `[Sim]` paper placeholders last. */
+function sortMarketsPreferReal(m: MarketOption[]): MarketOption[] {
+  const isSim = (x: MarketOption) => x.label.includes("[Sim]");
+  const real = m.filter((x) => !isSim(x));
+  const sim = m.filter(isSim);
+  return [...real, ...sim];
+}
+
 export function App() {
   const [chartData, setChartData] = useState<MarketPoint[]>([]);
   const [assetCharts, setAssetCharts] = useState<Record<string, MarketPoint[]>>({});
@@ -440,6 +506,12 @@ export function App() {
   const [amount, setAmount] = useState(1);
   const [loadingTrade, setLoadingTrade] = useState(false);
   const [wsConnected, setWsConnected] = useState(false);
+  /** Set when GET /trading-state succeeds (REST); WebSocket can still fail independently. */
+  const [lastApiOkMs, setLastApiOkMs] = useState<number | null>(null);
+  const lastWsMarketAtRef = useRef<number>(Date.now());
+  const [marketStreamHint, setMarketStreamHint] = useState<
+    "ws_market_healthy" | "ws_market_stale_using_rest_fallback"
+  >("ws_market_healthy");
   const [walletAddress, setWalletAddress] = useState<string | null>(null);
   const [isAuthenticating, setIsAuthenticating] = useState(false);
   const [isLoggedIn, setIsLoggedIn] = useState(false);
@@ -458,6 +530,13 @@ export function App() {
   const [inspectionLogs, setInspectionLogs] = useState<InspectionLine[]>([]);
   const [modeToggleLoading, setModeToggleLoading] = useState(false);
   const [tradingState, setTradingState] = useState<TradingState | null>(null);
+  const tradingStateRef = useRef<TradingState | null>(null);
+  tradingStateRef.current = tradingState;
+  const marketsRef = useRef<MarketOption[]>([]);
+  marketsRef.current = markets;
+  const wsConnectedRef = useRef(false);
+  wsConnectedRef.current = wsConnected;
+  const wsOffMarketsPollRef = useRef(0);
   const [assetAutoTradeBusy, setAssetAutoTradeBusy] = useState<string | null>(null);
   const [anchorBusy, setAnchorBusy] = useState(false);
   const [metaMaskOrderBusy, setMetaMaskOrderBusy] = useState(false);
@@ -680,6 +759,23 @@ export function App() {
     setInspectionLogs((prev) => [{ ts: Date.now(), kind: "ui" as const, text }, ...prev].slice(0, 400));
   };
 
+  const refreshMarketsList = useCallback(async () => {
+    try {
+      const raw = await api.markets();
+      const m = sortMarketsPreferReal(Array.isArray(raw) ? raw : []);
+      setMarkets(m);
+      setSelectedTokenID((prev) => {
+        const up = tradingStateRef.current?.market?.tokenIdUp?.trim();
+        if (up && m.some((x) => x.tokenID === up)) return up;
+        if (prev && m.some((x) => x.tokenID === prev)) return prev;
+        const firstReal = m.find((x) => !x.label.includes("[Sim]"));
+        return firstReal?.tokenID ?? m[0]?.tokenID ?? "";
+      });
+    } catch {
+      /* keep existing list */
+    }
+  }, []);
+
   const runConnectivityPings = async () => {
     setPingBusy(true);
     try {
@@ -887,10 +983,13 @@ export function App() {
     }
     return `Synthesis ${st}${srcL ? ` · ${srcL}` : ""}${guard}`;
   }, [tradingState?.synthesis, synthesisTelemetryWs, synthesisHealthWs]);
-  const selectedMarketLabel = useMemo(
-    () => markets.find((m) => m.tokenID === selectedTokenID)?.label ?? "BTC 5s Market",
-    [markets, selectedTokenID]
-  );
+  const selectedMarketLabel = useMemo(() => {
+    const fromState = tradingState?.market?.label?.trim();
+    if (fromState) return fromState;
+    const fromMarkets = markets.find((m) => m.tokenID === selectedTokenID)?.label?.trim();
+    if (fromMarkets) return fromMarkets;
+    return "Polymarket 5m market";
+  }, [tradingState?.market?.label, markets, selectedTokenID]);
   const portfolioData = useMemo(() => {
     if (!status) return [];
     const ordered = [...trades].reverse();
@@ -953,8 +1052,9 @@ export function App() {
       if (s) setStatus(s);
       setTrades(Array.isArray(t) ? t : []);
       if (w) setWallet(w);
-      setMarkets(Array.isArray(m) ? m : []);
-      setSelectedTokenID(Array.isArray(m) && m[0]?.tokenID ? m[0].tokenID : "");
+      const sortedM = sortMarketsPreferReal(Array.isArray(m) ? m : []);
+      setMarkets(sortedM);
+      setSelectedTokenID(sortedM[0]?.tokenID ? sortedM[0].tokenID : "");
       if (i) setInsights(i);
 
       if (errors.length > 0) {
@@ -993,11 +1093,19 @@ export function App() {
   }, []);
 
   useEffect(() => {
-    const tick = () =>
-      api
+    const run = () => {
+      const wsOff = !wsConnectedRef.current;
+      wsOffMarketsPollRef.current = wsOff ? wsOffMarketsPollRef.current + 1 : 0;
+      void api
         .tradingState()
         .then((ts) => {
+          setLastApiOkMs(Date.now());
           setTradingState(ts);
+          const mr = marketsRef.current;
+          const up = ts.market?.tokenIdUp?.trim();
+          if (up && mr.length > 0 && !mr.some((x) => x.tokenID === up)) {
+            void refreshMarketsList();
+          }
           if (!didBootstrapAmountFromServerRef.current && amountSource === "MANUAL") {
             const se = ts.riskSettings?.entryUsd;
             if (se != null && Number.isFinite(se) && se > 0) {
@@ -1042,12 +1150,21 @@ export function App() {
           if (ts.executionMode === "LIVE") {
             void api.wallet().then(setWallet).catch(() => undefined);
           }
+          if (wsOff) {
+            void api.status().then(setStatus).catch(() => undefined);
+            if (wsOffMarketsPollRef.current % 3 === 0) {
+              void refreshMarketsList();
+            }
+          }
         })
-        .catch(() => undefined);
-    tick();
-    const id = setInterval(tick, 4000);
+        .catch(() => {
+          setLastApiOkMs(null);
+        });
+    };
+    run();
+    const id = setInterval(run, 4000);
     return () => clearInterval(id);
-  }, []);
+  }, [amountSource, refreshMarketsList]);
 
   useEffect(() => {
     return () => {
@@ -1059,48 +1176,22 @@ export function App() {
   }, []);
 
   useEffect(() => {
-    const ws = new WebSocket(WS_URL);
-    ws.onopen = () => setWsConnected(true);
-    ws.onclose = () => setWsConnected(false);
-    ws.onerror = () => setWsConnected(false);
-    ws.onmessage = (ev) => {
-      const msg = JSON.parse(ev.data);
+    let cancelled = false;
+    let ws: WebSocket | null = null;
+    let retryTimer: ReturnType<typeof setTimeout> | null = null;
+
+    const onMessage = (ev: MessageEvent) => {
+      const msg = JSON.parse(ev.data as string);
       if (msg.type === "market") {
-        const p = msg.payload;
-        if (Array.isArray(p)) {
-          setChartData(p);
-          setAssetCharts({});
-          setSynthesisPriceOverlay([]);
-          setSynthesisChartMode(null);
-          setSynthesisTelemetryWs(null);
-          setSynthesisHealthWs(null);
-        } else if (p && typeof p === "object") {
-          const pack = p as {
-            primary?: MarketPoint[];
-            byAsset?: Record<string, MarketPoint[]>;
-            synthesis?: {
-              priceOverlayUsd: Array<{ t: number; priceUsd: number }>;
-              chartMode: SynthesisChartMode;
-              telemetry: SynthesisTelemetryPayload;
-              health?: SynthesisMarketDataHealthPayload;
-            };
-          };
-          setChartData(Array.isArray(pack.primary) ? pack.primary : []);
-          setAssetCharts(pack.byAsset && typeof pack.byAsset === "object" ? pack.byAsset : {});
-          if (pack.synthesis) {
-            setSynthesisPriceOverlay(
-              Array.isArray(pack.synthesis.priceOverlayUsd) ? pack.synthesis.priceOverlayUsd : []
-            );
-            setSynthesisChartMode(pack.synthesis.chartMode ?? null);
-            setSynthesisTelemetryWs(pack.synthesis.telemetry ?? null);
-            setSynthesisHealthWs(pack.synthesis.health ?? null);
-          } else {
-            setSynthesisPriceOverlay([]);
-            setSynthesisChartMode(null);
-            setSynthesisTelemetryWs(null);
-            setSynthesisHealthWs(null);
-          }
-        }
+        lastWsMarketAtRef.current = Date.now();
+        applyMarketPayloadToDashboard(msg.payload, {
+          setChartData,
+          setAssetCharts,
+          setSynthesisPriceOverlay,
+          setSynthesisChartMode,
+          setSynthesisTelemetryWs,
+          setSynthesisHealthWs
+        });
       }
       if (msg.type === "prediction") setPrediction(msg.payload);
       if (msg.type === "trade") {
@@ -1117,6 +1208,9 @@ export function App() {
           api.wallet().then(setWallet).catch(() => undefined);
         }
       }
+      if (msg.type === "logs") {
+        setLogs(Array.isArray(msg.payload) ? msg.payload.slice(0, 120) : []);
+      }
       if (msg.type === "log") {
         setLogs((prev) => [msg.payload, ...prev].slice(0, 120));
       }
@@ -1131,8 +1225,92 @@ export function App() {
         setInspectionLogs((prev) => [{ ts: p.ts, kind: "api" as const, text: line }, ...prev].slice(0, 400));
       }
     };
-    return () => ws.close();
+
+    const connect = () => {
+      if (cancelled) return;
+      const url = resolveWsUrl();
+      ws = new WebSocket(url);
+      ws.onopen = () => setWsConnected(true);
+      ws.onerror = () => setWsConnected(false);
+      ws.onclose = () => {
+        setWsConnected(false);
+        if (!cancelled) {
+          retryTimer = setTimeout(connect, 2500);
+        }
+      };
+      ws.onmessage = onMessage;
+    };
+
+    connect();
+    return () => {
+      cancelled = true;
+      if (retryTimer != null) clearTimeout(retryTimer);
+      ws?.close();
+    };
   }, []);
+
+  /** Poll `/market-data` when WS is down *or* `market` events are stale (socket open but quiet). */
+  useEffect(() => {
+    const marketSetters = {
+      setChartData,
+      setAssetCharts,
+      setSynthesisPriceOverlay,
+      setSynthesisChartMode,
+      setSynthesisTelemetryWs,
+      setSynthesisHealthWs
+    };
+    const staleMs = Math.max(6000, Number(import.meta.env.VITE_WS_MARKET_STALE_MS ?? 8000));
+    const tick = () => {
+      const stale = wsConnected && Date.now() - lastWsMarketAtRef.current > staleMs;
+      setMarketStreamHint(stale ? "ws_market_stale_using_rest_fallback" : "ws_market_healthy");
+      if (!wsConnected || stale) {
+        void api
+          .marketData()
+          .then((payload) => applyMarketPayloadToDashboard(payload, marketSetters))
+          .catch(() => undefined);
+      }
+    };
+    tick();
+    const id = setInterval(tick, 3500);
+    return () => clearInterval(id);
+  }, [wsConnected]);
+
+  /** Seed one point per asset from REST trading-state when WS has not yet populated `byAsset`. */
+  useEffect(() => {
+    const windows = tradingState?.updownWindows;
+    if (!windows?.length) return;
+    setAssetCharts((prev) => {
+      let changed = false;
+      const next = { ...prev };
+      for (const w of windows) {
+        const asset = w.asset?.trim().toUpperCase();
+        if (!asset) continue;
+        if (next[asset]?.length) continue;
+        const spot = w.oracleSpotUsd;
+        if (spot == null || !Number.isFinite(spot) || spot <= 0) continue;
+        const tsMs = Date.now();
+        const time = new Date(tsMs).toLocaleTimeString("en-US", {
+          hour: "numeric",
+          minute: "2-digit",
+          second: "2-digit",
+          hour12: true
+        });
+        const ptb = w.priceToBeatUsd;
+        const point: MarketPoint = {
+          time,
+          ts: tsMs,
+          up: 50,
+          down: 50,
+          movement: 0,
+          btcUsd: spot,
+          btcTargetUsd: ptb != null && Number.isFinite(ptb) && ptb > 0 ? ptb : spot
+        };
+        next[asset] = [point];
+        changed = true;
+      }
+      return changed ? next : prev;
+    });
+  }, [tradingState?.updownWindows]);
 
   const MIN_TRADE_USD = 1;
 
@@ -1545,6 +1723,7 @@ export function App() {
       const [s, ts] = await Promise.all([api.status(), api.tradingState()]);
       setStatus(s);
       setTradingState(ts);
+      void refreshMarketsList();
       const se = ts.riskSettings?.entryUsd;
       if (se != null && Number.isFinite(se) && se > 0 && amountSource === "MANUAL") {
         setAmount(se);
@@ -1575,8 +1754,19 @@ export function App() {
           setMetaMaskUsdcLoading(false);
         }
       }
-      pushLog("TRADE", "Bot started: auto-trading active.");
-      setLoginHint("Bot is running. Auto-invest uses the entry strategy shown under Execution & size.");
+      const execElig = ts.executionEligibility;
+      if (execElig === undefined || execElig.selectedEligible) {
+        pushLog("TRADE", "Bot started: auto-trading active.");
+        setLoginHint("Bot is running. Auto-invest uses the entry strategy shown under Execution & size.");
+      } else {
+        pushLog(
+          "SIGNAL",
+          "Bot started — WARNING: no execution-eligible strategy; orders will not be placed until configuration allows execution."
+        );
+        setLoginHint(
+          "Bot is running and receiving market data, but current strategy configuration cannot place orders."
+        );
+      }
     } catch (error) {
       pushLog("ERROR", error instanceof Error ? error.message : "Failed to start bot.");
     }
@@ -1939,10 +2129,17 @@ export function App() {
         paperOnly: typeof r.paperOnly === "boolean" ? r.paperOnly : s.paperOnly,
         executeTrades: typeof r.executeTrades === "boolean" ? r.executeTrades : s.executeTrades
       });
-      setMarkets(m);
+      setMarkets(sortMarketsPreferReal(Array.isArray(m) ? m : []));
       setWallet(w);
       setTradingState(ts);
-      setSelectedTokenID((prev) => (m.some((x) => x.tokenID === prev) ? prev : m[0]?.tokenID ?? ""));
+      setSelectedTokenID((prev) => {
+        const list = sortMarketsPreferReal(Array.isArray(m) ? m : []);
+        const up = ts.market?.tokenIdUp?.trim();
+        if (up && list.some((x) => x.tokenID === up)) return up;
+        if (prev && list.some((x) => x.tokenID === prev)) return prev;
+        const firstReal = list.find((x) => !x.label.includes("[Sim]"));
+        return firstReal?.tokenID ?? list[0]?.tokenID ?? "";
+      });
       if (r.ok) {
         pushLog("SIGNAL", `Trading mode: ${r.mode} (${r.mode === "LIVE" ? "real orders" : "paper balance"})`);
         setLoginHint(
@@ -2086,6 +2283,78 @@ export function App() {
     };
   }, [chartData, tradingState, status, prediction]);
 
+  const restApiReachable = lastApiOkMs != null && Date.now() - lastApiOkMs < 15000;
+
+  const apiPortHint = useMemo(() => {
+    try {
+      const base = resolveApiBase().replace(/\/api$/i, "");
+      const u = new URL(/^https?:\/\//i.test(base) ? base : `http://${base}`);
+      return u.port || (u.protocol === "https:" ? "443" : "80");
+    } catch {
+      return String(import.meta.env.VITE_API_PORT ?? "4000");
+    }
+  }, []);
+
+  const wsUrlHint = useMemo(() => {
+    try {
+      return resolveWsUrl();
+    } catch {
+      return "";
+    }
+  }, []);
+
+  const botIdleReadiness = useMemo(() => {
+    const running = Boolean(status?.running);
+    const le = tradingState?.liveEngine;
+    const skip = le?.lastAutoTradeSkipReason ?? status?.lastAutoTradeSkipReason ?? null;
+    const block = le?.marketDataBlockReason ?? null;
+    const diags = le?.tradingDiagnostics ?? null;
+    const entryEff = tradingState?.entryStrategy?.effective;
+    const isAnchor = entryEff === "anchor";
+    const ancCat = le?.anchorLastSkipCategory ?? null;
+    const ancReason = le?.anchorLastSkipReason ?? null;
+    const ancNorm = le?.anchorUsingNormalCadence === true;
+
+    const informationalSkip = (s: string) =>
+      s === "anchor_fast_lane_disabled" || s === "lag_snipe_ignores_anchor_fast_lane";
+
+    const configStyleReason = (s: string) =>
+      /^(anchor_env_disabled|anchor_runtime_disabled|auto_start_disabled|discovery_disabled|live_auth_not_ready|entry_strategy_not_enabled)$/.test(
+        s
+      );
+
+    let headline: string | null = null;
+    if (running) {
+      const blockL = (block ?? "").trim();
+      const skipL = (skip ?? "").trim();
+
+      if (skipL === "book_refresh_in_flight") {
+        headline = "Waiting for books: book_refresh_in_flight";
+      } else if (isAnchor && ancCat) {
+        headline = `Anchor waiting: ${ancCat}`;
+      } else if (blockL) {
+        headline = configStyleReason(blockL)
+          ? `Bot is running but blocked by config: ${blockL}`
+          : `Bot is running but blocked: ${blockL}`;
+      } else if (skipL && informationalSkip(skipL)) {
+        headline = ancNorm ? "Anchor: running on normal cadence (fast lane off)" : null;
+      } else if (skipL) {
+        headline = configStyleReason(skipL)
+          ? `Bot is running but blocked by config: ${skipL}`
+          : `Bot is running but waiting: ${skipL}`;
+      } else if (status?.autoTrading === false) {
+        headline = "Bot is running but auto-trading is off.";
+      }
+    }
+    return { headline, skip, block, diags, isAnchor, ancCat, ancReason, ancNorm };
+  }, [
+    status?.autoTrading,
+    status?.lastAutoTradeSkipReason,
+    status?.running,
+    tradingState?.entryStrategy?.effective,
+    tradingState?.liveEngine
+  ]);
+
   return (
     <div
       className="flex min-h-[100dvh] flex-col pb-44 text-slate-200"
@@ -2093,6 +2362,7 @@ export function App() {
     >
       <CopyProTopBar
         wsConnected={wsConnected}
+        restApiReachable={restApiReachable}
         running={Boolean(status?.running)}
         isLoggedIn={isLoggedIn}
         isAuthenticating={isAuthenticating}
@@ -2456,40 +2726,205 @@ export function App() {
             {!tradingState ? (
               <p className="text-xs text-slate-500">Loading…</p>
             ) : (
-              <ul className="space-y-1.5 text-xs text-slate-300">
-                <li>
-                  <span className="text-slate-500">Backend:</span>{" "}
-                  {wsConnected ? <span className="text-emerald-400">OK</span> : <span className="text-red-400">Disconnected</span>}
-                </li>
-                <li>
-                  <span className="text-slate-500">CLOB L2 authenticated:</span>{" "}
-                  {tradingState.clobAuthenticated ? (
-                    <span className="text-emerald-400">Yes</span>
-                  ) : tradingState.executionMode === "LIVE" ? (
-                    <span className="text-amber-400">No (check keys / restart)</span>
-                  ) : (
-                    <span className="text-slate-500">N/A (paper)</span>
-                  )}
-                </li>
-                <li>
-                  <span className="text-slate-500">Auto-discover 5m market:</span>{" "}
-                  {tradingState.autoDiscoverEnabled ? (
-                    <span className="text-emerald-400">On</span>
-                  ) : (
-                    <span className="text-slate-400">Off (manual token IDs)</span>
-                  )}
-                </li>
-                <li>
-                  <span className="text-slate-500">Token IDs (UP / DOWN):</span>{" "}
-                  {tradingState.market.tokenIdUp && tradingState.market.tokenIdDown ? (
-                    <span className="break-all font-mono text-[10px] text-sky-300/90">
-                      {tradingState.market.tokenIdUp.slice(0, 10)}… / {tradingState.market.tokenIdDown.slice(0, 10)}…
+              <>
+                {tradingState.liveReadiness ? (
+                  <p
+                    className={
+                      "rounded-md border px-2.5 py-2 text-xs font-medium leading-snug " +
+                      (tradingState.liveReadiness.level === "full"
+                        ? "border-emerald-700/50 bg-emerald-950/35 text-emerald-100"
+                        : tradingState.liveReadiness.level === "partial"
+                          ? "border-amber-600/45 bg-amber-950/45 text-amber-100"
+                          : "border-rose-700/50 bg-rose-950/40 text-rose-100")
+                    }
+                  >
+                    <span className="font-semibold text-slate-200/95">
+                      {tradingState.liveReadiness.level === "full"
+                        ? "Ready"
+                        : tradingState.liveReadiness.level === "partial"
+                          ? "Partial"
+                          : "Degraded"}
+                      :{" "}
                     </span>
-                  ) : (
-                    <span className="text-slate-500">—</span>
-                  )}
-                </li>
-              </ul>
+                    {tradingState.liveReadiness.summary}
+                  </p>
+                ) : null}
+                {tradingState.executionEligibility?.selectedEligible === false ? (
+                  <p className="rounded-md border border-amber-600/40 bg-amber-950/35 px-2.5 py-2 text-[11px] font-medium leading-snug text-amber-100">
+                    {tradingState.entryStrategy?.effective === "anchor" &&
+                    tradingState.anchorReadiness?.anchorConfigured ? (
+                      <>
+                        Anchor is enabled in <code className="text-slate-400">.env</code>, but live orders are
+                        blocked:{" "}
+                        <span className="text-amber-50">
+                          {tradingState.executionEligibility.primaryBlockedReason ||
+                            tradingState.executionEligibility.blockedReasons.join("; ") ||
+                            "unknown"}
+                        </span>
+                        . Set <code className="text-slate-400">ANCHOR_LIVE_EXECUTOR_AVAILABLE=true</code>,{" "}
+                        <code className="text-slate-400">DRY_RUN=false</code>, and ensure LIVE mode with CLOB auth
+                        when you want real execution.
+                      </>
+                    ) : (
+                      <>
+                        Bot is running and receiving market data, but current strategy configuration cannot place
+                        orders.
+                        {tradingState.executionEligibility.primaryBlockedReason ||
+                        tradingState.executionEligibility.blockedReasons.length > 0 ? (
+                          <span className="mt-1 block text-amber-200/90">
+                            {tradingState.executionEligibility.primaryBlockedReason ||
+                              tradingState.executionEligibility.blockedReasons.join("; ")}
+                          </span>
+                        ) : null}
+                      </>
+                    )}
+                  </p>
+                ) : null}
+                {tradingState.anchorReadiness && tradingState.entryStrategy?.effective === "anchor" ? (
+                  <div className="rounded-md border border-slate-600/55 bg-slate-900/55 px-2.5 py-2 text-[11px] leading-snug text-slate-300">
+                    <div className="text-xs font-semibold text-slate-200">Anchor status</div>
+                    <p className="mt-1">{tradingState.anchorReadiness.anchorStatusSummary}</p>
+                    {tradingState.anchorReadiness.liveExecutionBanner ? (
+                      <p
+                        className={
+                          "mt-2 rounded border px-2 py-1.5 text-[11px] " +
+                          (tradingState.anchorReadiness.liveExecutionBanner.indicator === "green"
+                            ? "border-emerald-700/50 bg-emerald-950/40 text-emerald-100"
+                            : "border-amber-600/45 bg-amber-950/45 text-amber-100")
+                        }
+                      >
+                        {tradingState.anchorReadiness.liveExecutionBanner.text}
+                      </p>
+                    ) : null}
+                    <p className="mt-2 text-[11px] text-slate-400">
+                      <span className="text-slate-500">Live execution: </span>
+                      {tradingState.anchorReadiness.liveExecutionAvailable ? (
+                        <span className="font-medium text-emerald-400">Available (real CLOB path)</span>
+                      ) : (
+                        <span className="font-medium text-amber-300">
+                          Not available
+                          {tradingState.anchorReadiness.liveExecutionReason
+                            ? ` — ${tradingState.anchorReadiness.liveExecutionReason}`
+                            : ""}
+                        </span>
+                      )}
+                    </p>
+                    {tradingState.anchorReadiness.anchorDiagnostics.length > 0 ? (
+                      <ul className="mt-1.5 list-disc space-y-1 pl-4 text-slate-400">
+                        {tradingState.anchorReadiness.anchorDiagnostics.map((line, i) => (
+                          <li key={i}>{line}</li>
+                        ))}
+                      </ul>
+                    ) : null}
+                  </div>
+                ) : null}
+                {botIdleReadiness.headline ? (
+                  <p className="rounded-md border border-amber-600/45 bg-amber-950/50 px-2.5 py-2 text-xs font-semibold leading-snug text-amber-100">
+                    {botIdleReadiness.headline}
+                  </p>
+                ) : null}
+                <ul className="space-y-1.5 text-xs text-slate-300">
+                  <li>
+                    <span className="text-slate-500">REST / API:</span>{" "}
+                    {restApiReachable ? (
+                      <span className="text-emerald-400">Connected</span>
+                    ) : (
+                      <span className="text-red-400">Unreachable</span>
+                    )}
+                  </li>
+                  <li>
+                    <span className="text-slate-500">Live stream (WS):</span>{" "}
+                    {wsConnected ? (
+                      <span className="text-emerald-400">Online</span>
+                    ) : restApiReachable ? (
+                      <span
+                        className="text-amber-300"
+                        title={`Target ${wsUrlHint} — same port as REST (:${apiPortHint}) in the default server build; charts use REST fallback when WS is down.`}
+                      >
+                        Offline (REST polling)
+                      </span>
+                    ) : (
+                      <span className="text-slate-500">—</span>
+                    )}
+                  </li>
+                  <li className="text-[11px] leading-snug text-slate-400">
+                    <span className="text-slate-500">Last auto-trade skip:</span>{" "}
+                    <span className="font-mono text-slate-300">{botIdleReadiness.skip ?? "—"}</span>
+                  </li>
+                  {botIdleReadiness.isAnchor ? (
+                    <li className="text-[11px] leading-snug text-slate-400">
+                      <span className="text-slate-500">Anchor last evaluation:</span>{" "}
+                      <span className="font-mono text-[10px] text-slate-300">
+                        {botIdleReadiness.ancCat ?? "—"}
+                      </span>
+                      {botIdleReadiness.ancReason ? (
+                        <span className="mt-0.5 block break-words text-slate-500">
+                          {botIdleReadiness.ancReason.length > 180
+                            ? `${botIdleReadiness.ancReason.slice(0, 180)}…`
+                            : botIdleReadiness.ancReason}
+                        </span>
+                      ) : null}
+                      <span className="mt-0.5 block text-slate-500">
+                        Fast lane:{" "}
+                        {tradingState.liveEngine?.anchorFastLaneEnabled ? "on" : "off"} · cadence:{" "}
+                        {tradingState.liveEngine?.anchorUsingNormalCadence
+                          ? "normal (5s)"
+                          : tradingState.liveEngine?.anchorFastLaneEnabled
+                            ? "250ms + 5s"
+                            : "—"}
+                      </span>
+                    </li>
+                  ) : null}
+                  <li className="text-[11px] leading-snug text-slate-400">
+                    <span className="text-slate-500">Market data block:</span>{" "}
+                    <span className="font-mono text-slate-300">{botIdleReadiness.block ?? "—"}</span>
+                  </li>
+                  <li className="text-[11px] leading-snug text-slate-400">
+                    <span className="text-slate-500">General diagnostics:</span>
+                    {botIdleReadiness.diags && botIdleReadiness.diags.length > 0 ? (
+                      <ul className="mt-1 list-disc space-y-1 pl-4 text-slate-400">
+                        {botIdleReadiness.diags.map((d, i) => (
+                          <li key={i}>{d}</li>
+                        ))}
+                      </ul>
+                    ) : (
+                      <span className="mt-1 block text-slate-500">—</span>
+                    )}
+                  </li>
+                  <li className="text-[11px] leading-snug text-slate-400">
+                    <span className="text-slate-500">Market stream hint:</span>{" "}
+                    <span className="font-mono text-[10px] text-slate-300">{marketStreamHint}</span>
+                  </li>
+                  <li>
+                    <span className="text-slate-500">CLOB L2 authenticated:</span>{" "}
+                    {tradingState.clobAuthenticated ? (
+                      <span className="text-emerald-400">Yes</span>
+                    ) : tradingState.executionMode === "LIVE" ? (
+                      <span className="text-amber-400">No (check keys / restart)</span>
+                    ) : (
+                      <span className="text-slate-500">N/A (paper)</span>
+                    )}
+                  </li>
+                  <li>
+                    <span className="text-slate-500">Auto-discover 5m market:</span>{" "}
+                    {tradingState.autoDiscoverEnabled ? (
+                      <span className="text-emerald-400">On</span>
+                    ) : (
+                      <span className="text-slate-400">Off (manual token IDs)</span>
+                    )}
+                  </li>
+                  <li>
+                    <span className="text-slate-500">Token IDs (UP / DOWN):</span>{" "}
+                    {tradingState.market.tokenIdUp && tradingState.market.tokenIdDown ? (
+                      <span className="break-all font-mono text-[10px] text-sky-300/90">
+                        {tradingState.market.tokenIdUp.slice(0, 10)}… / {tradingState.market.tokenIdDown.slice(0, 10)}…
+                      </span>
+                    ) : (
+                      <span className="text-slate-500">—</span>
+                    )}
+                  </li>
+                </ul>
+              </>
             )}
           </div>
         </section>
@@ -2631,6 +3066,35 @@ export function App() {
                 </span>
                 {tradingState.executionMode === "LIVE" && !tradingState.liveEngine.hasLiveMarketData ? (
                   <span className="text-amber-400/90"> · books pending</span>
+                ) : null}
+                {tradingState.liveEngine.lastAutoTradeSkipReason ? (
+                  <span className="text-amber-300/90">
+                    {" "}
+                    · idle={tradingState.liveEngine.lastAutoTradeSkipReason}
+                  </span>
+                ) : null}
+                <span
+                  className={
+                    marketStreamHint === "ws_market_stale_using_rest_fallback"
+                      ? "text-amber-300/90"
+                      : "text-slate-600"
+                  }
+                  title="WebSocket market stream vs REST fallback"
+                >
+                  {" "}
+                  · {marketStreamHint}
+                </span>
+                {tradingState.liveEngine.marketDataBlockReason ? (
+                  <span className="text-rose-300/85" title="Server chart/market health">
+                    {" "}
+                    · md={tradingState.liveEngine.marketDataBlockReason}
+                  </span>
+                ) : null}
+                {tradingState.liveReadiness ? (
+                  <span className="text-slate-500" title={tradingState.liveReadiness.summary}>
+                    {" "}
+                    · readiness={tradingState.liveReadiness.level}
+                  </span>
                 ) : null}
               </span>
               <span className="text-slate-700" aria-hidden>

@@ -178,6 +178,11 @@ class Trader:
         return _mid_from_book(book)
 
     def execute_entry(self, intent: TradeIntent, sized: SizedOrder) -> Optional[OpenPosition]:
+        if not self._s.sm_enabled:
+            logger.debug(
+                "execute_entry skipped because SM_ENABLED=false (no real CLOB posting.)"
+            )
+            return None
         mid = self.current_mid(intent.token_id)
         entry_mid = mid if mid is not None else intent.candidate.best_yes_like.price
         if self._s.dry_run:

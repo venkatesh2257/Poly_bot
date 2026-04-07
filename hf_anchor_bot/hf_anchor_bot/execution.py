@@ -125,6 +125,18 @@ class DryRunExecutor:
         )
 
 
+class LiveOrderExecutor:
+    """
+    Deployment hook: replace with py-clob-client posting. Emits real-order-style logs for monitoring.
+    """
+    def execute(self, intent: ExecutionIntent) -> None:
+        print(
+            f"[EXEC live_order] {intent.action} {intent.side.value} @ {intent.ref_price:.6f} "
+            f"notional={intent.notional_usdc:.2f} type={intent.trade_type.value} "
+            f"size={intent.order_size_shares:.4f} slip_bps={intent.slippage_bps} ({intent.reason})"
+        )
+
+
 class LoggingExecutor:
     def __init__(self, inner: OrderExecutor | None = None):
         self.inner = inner
