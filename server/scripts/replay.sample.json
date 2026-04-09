@@ -1,0 +1,52 @@
+{
+  "anchor": {
+    "orderBook": {
+      "bidDepthUp": 1000,
+      "askDepthUp": 300,
+      "bidDepthDown": 200,
+      "askDepthDown": 900
+    },
+    "chainlinkPriceHistory": [70000, 70020, 70045, 70080],
+    "anchorYesPrice": 0.46,
+    "anchorNoPrice": 0.54,
+    "imbalanceHistoryUp": [0.68, 0.7, 0.73, 0.75],
+    "imbalanceHistoryDown": [0.33, 0.31, 0.29, 0.27],
+    "oracleLatestAgeMs": 4000
+  },
+  "professional": {
+    "candles": [
+      { "tOpenMs": 1, "open": 70000, "high": 70030, "low": 69990, "close": 70020 },
+      { "tOpenMs": 2, "open": 70020, "high": 70060, "low": 70010, "close": 70045 },
+      { "tOpenMs": 3, "open": 70045, "high": 70090, "low": 70040, "close": 70075 },
+      { "tOpenMs": 4, "open": 70075, "high": 70110, "low": 70070, "close": 70100 },
+      { "tOpenMs": 5, "open": 70100, "high": 70130, "low": 70095, "close": 70120 }
+    ],
+    "imbalanceHistoryUp": [0.62, 0.64, 0.66, 0.67, 0.68],
+    "ticks": [
+      {
+        "nowMs": 1,
+        "anchorUsd": 70000,
+        "spotUsd": 70090,
+        "upBidDepthShare": 0.62,
+        "downBidDepthShare": 0.35,
+        "bookBias": "UP",
+        "upMid": 0.44,
+        "downMid": 0.56,
+        "baseEntryUsd": 1,
+        "minDeviationUsd": 12
+      },
+      {
+        "nowMs": 2,
+        "anchorUsd": 70000,
+        "spotUsd": 70110,
+        "upBidDepthShare": 0.64,
+        "downBidDepthShare": 0.34,
+        "bookBias": "UP",
+        "upMid": 0.45,
+        "downMid": 0.55,
+        "baseEntryUsd": 1,
+        "minDeviationUsd": 12
+      }
+    ]
+  }
+}
