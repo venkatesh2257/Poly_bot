@@ -9,6 +9,9 @@ import { normalizeRawOrderBook } from "./paperExecution.js";
 import { executeTradesEnv, paperOnlyEnv } from "./executionFlags.js";
 
 export class WalletService {
+  private static readonly USDC_ADDRESS = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174";
+  private static readonly CTF_ADDRESS = "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045";
+
   private static initialModeFromEnv(): "SIMULATION" | "LIVE" {
     const m = String(process.env.MODE ?? "").trim().toUpperCase();
     return m === "LIVE" ? "LIVE" : "SIMULATION";
@@ -241,6 +244,20 @@ export class WalletService {
 
   getClobHostForPing(): string {
     return this.clobHost;
+  }
+
+  private reclaimWinningsEnabled(): boolean {
+    return String(process.env.AUTO_RECLAIM_WINNINGS ?? "true").toLowerCase() !== "false";
+  }
+
+  private reclaimRpcUrl(): string {
+    return (
+      process.env.POLYGON_RPC_URL ??
+      process.env.RPC_URL ??
+      process.env.POLYGON_RPC_PROXY_URL ??
+      process.env.PROXY_URL ??
+      "https://polygon-rpc.com"
+    );
   }
 
   /** Real CLOB token id for connectivity ping; null if only synthetic ids. */
@@ -886,6 +903,61 @@ export class WalletService {
   async getBalanceAllowance() {
     if (this.mode !== "LIVE" || !this.client) return { mode: "SIMULATION" };
     return this.client.getBalanceAllowance({ asset_type: AssetType.COLLATERAL });
+  }
+
+  /**
+   * Best-effort redeem of winning outcome tokens into collateral after resolution.
+   * Only supported when the server signer and funder are the same EOA; proxy/safe
+   * funders need their own reclaim flow and are skipped here.
+   */
+  async redeemWinningPosition(
+    conditionId: string
+  ): Promise<{ ok: boolean; skipped?: boolean; reason?: string; txHash?: string }> {
+    const cond = String(conditionId ?? "").trim();
+    if (!cond) return { ok: false, skipped: true, reason: "missing_condition_id" };
+    if (!this.reclaimWinningsEnabled()) {
+      return { ok: false, skipped: true, reason: "auto_reclaim_disabled" };
+    }
+    if (this.mode !== "LIVE" || paperOnlyEnv()) {
+      return { ok: false, skipped: true, reason: "not_live" };
+    }
+
+    const pkRaw = String(process.env.EVM_PRIVATE_KEY ?? "").trim();
+    const pk = pkRaw.startsWith("0x") ? pkRaw : pkRaw ? `0x${pkRaw}` : "";
+    if (!pk) return { ok: false, skipped: true, reason: "missing_private_key" };
+
+    try {
+      const provider = new ethers.JsonRpcProvider(this.reclaimRpcUrl(), this.clobChainId);
+      const signer = new ethers.Wallet(pk, provider);
+      const funder = String(this.clobFunder ?? "").trim();
+      if (funder && signer.address.toLowerCase() !== funder.toLowerCase()) {
+        return { ok: false, skipped: true, reason: "funder_differs_from_signer" };
+      }
+
+      const ctf = new ethers.Contract(
+        WalletService.CTF_ADDRESS,
+        [
+          "function redeemPositions(address collateralToken, bytes32 parentCollectionId, bytes32 conditionId, uint256[] indexSets) external"
+        ],
+        signer
+      );
+
+      const tx = await ctf.redeemPositions(
+        WalletService.USDC_ADDRESS,
+        ethers.ZeroHash,
+        cond,
+        [1, 2],
+        { gasLimit: 300000n }
+      );
+      const receipt = await tx.wait();
+      const ok = Number(receipt?.status ?? 0) === 1;
+      return ok
+        ? { ok: true, txHash: String(tx.hash ?? "") }
+        : { ok: false, reason: "redeem_tx_failed", txHash: String(tx.hash ?? "") };
+    } catch (error) {
+      const msg = error instanceof Error ? error.message : String(error);
+      return { ok: false, reason: msg.slice(0, 240) };
+    }
   }
 
   async getUserTrades() {

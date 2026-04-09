@@ -80,6 +80,23 @@ const send = (payload: unknown) => {
   });
 };
 
+async function withTimeout<T>(promise: Promise<T>, timeoutMs: number, label: string): Promise<T | undefined> {
+  let timer: NodeJS.Timeout | null = null;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<undefined>((resolve) => {
+        timer = setTimeout(() => {
+          console.warn(`[BOOT] ${label} timed out after ${timeoutMs}ms; continuing startup`);
+          resolve(undefined);
+        }, timeoutMs);
+      })
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
 wsServer.on("connection", (socket) => {
   socket.send(JSON.stringify({ type: "status", payload: engine.status() }));
   socket.send(JSON.stringify({ type: "trade", payload: engine.getTrades() }));
@@ -99,7 +116,7 @@ engine.onBetLog = (data) => send({ type: "betLog", payload: data });
 void (async () => {
   // Force Chainlink RPC resolve + 4-asset probe before wallet/markets (always logs on clean boot).
   try {
-    await engine.bootChainlink();
+    await withTimeout(engine.bootChainlink(), 15000, "Chainlink boot");
   } catch (e) {
     console.error("[BOOT] Chainlink boot error:", e);
   }
